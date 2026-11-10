@@ -208,11 +208,66 @@ typedef struct {
     UInt8   Reserved5;                      /* 0x43 */
 } MPRIOCFactsReply;
 
+/* MPI2_IOC_INIT_REQUEST: 0x48 bytes (mpi2_ioc.h:226-255) */
+typedef struct {
+    UInt8   WhoInit;                        /* 0x00 */
+    UInt8   Reserved1;                      /* 0x01 */
+    UInt8   ChainOffset;                    /* 0x02 */
+    UInt8   Function;                       /* 0x03 */
+    UInt16  Reserved2;                      /* 0x04 */
+    UInt8   Reserved3;                      /* 0x06 */
+    UInt8   MsgFlags;                       /* 0x07 */
+    UInt8   VP_ID;                          /* 0x08 */
+    UInt8   VF_ID;                          /* 0x09 */
+    UInt16  Reserved4;                      /* 0x0A */
+    UInt16  MsgVersion;                     /* 0x0C */
+    UInt16  HeaderVersion;                  /* 0x0E */
+    UInt32  Reserved5;                      /* 0x10 */
+    UInt16  ConfigurationFlags;             /* 0x14 */
+    UInt8   HostPageSize;                   /* 0x16 */
+    UInt8   HostMSIxVectors;                /* 0x17 */
+    UInt16  Reserved8;                      /* 0x18 */
+    UInt16  SystemRequestFrameSize;         /* 0x1A */
+    UInt16  ReplyDescriptorPostQueueDepth;  /* 0x1C */
+    UInt16  ReplyFreeQueueDepth;            /* 0x1E */
+    UInt32  SenseBufferAddressHigh;         /* 0x20 */
+    UInt32  SystemReplyAddressHigh;         /* 0x24 */
+    UInt64  SystemRequestFrameBaseAddress;  /* 0x28 */
+    UInt64  ReplyDescriptorPostQueueAddress;/* 0x30 */
+    UInt64  ReplyFreeQueueAddress;          /* 0x38 */
+    UInt64  TimeStamp;                      /* 0x40 */
+} MPRIOCInitRequest;
+
+/* MPI2_IOC_INIT_REPLY: 0x14 bytes (mpi2_ioc.h:296-313) */
+typedef struct {
+    UInt8   WhoInit;        /* 0x00 */
+    UInt8   Reserved1;      /* 0x01 */
+    UInt8   MsgLength;      /* 0x02 */
+    UInt8   Function;       /* 0x03 */
+    UInt16  Reserved2;      /* 0x04 */
+    UInt8   Reserved3;      /* 0x06 */
+    UInt8   MsgFlags;       /* 0x07 */
+    UInt8   VP_ID;          /* 0x08 */
+    UInt8   VF_ID;          /* 0x09 */
+    UInt16  Reserved4;      /* 0x0A */
+    UInt16  Reserved5;      /* 0x0C */
+    UInt16  IOCStatus;      /* 0x0E */
+    UInt32  IOCLogInfo;     /* 0x10 */
+} MPRIOCInitReply;
+
 #pragma pack(pop)
 
 static_assert(sizeof(MPRIOCFactsRequest) == 0x0C, "IOC Facts request layout");
 static_assert(sizeof(MPRIOCFactsReply) == 0x44, "IOC Facts reply layout");
 static_assert(offsetof(MPRIOCFactsReply, IOCStatus) == 0x0E, "IOCStatus offset");
 static_assert(offsetof(MPRIOCFactsReply, IOCCapabilities) == 0x1C, "IOCCapabilities offset");
+static_assert(sizeof(MPRIOCInitRequest) == 0x48, "IOC Init request layout");
+static_assert(sizeof(MPRIOCInitReply) == 0x14, "IOC Init reply layout");
+static_assert(offsetof(MPRIOCInitRequest, SystemRequestFrameBaseAddress) == 0x28,
+              "request frame base offset");
+static_assert(offsetof(MPRIOCInitRequest, ReplyDescriptorPostQueueAddress) == 0x30,
+              "reply post queue offset");
+static_assert(offsetof(MPRIOCInitRequest, ReplyFreeQueueAddress) == 0x38,
+              "reply free queue offset");
 
 #endif /* MPR_MPI2_MIN_H */

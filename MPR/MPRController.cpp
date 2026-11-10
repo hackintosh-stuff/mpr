@@ -1,6 +1,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/OSByteOrder.h>
+#include <kern/task.h>
 #include <string.h>
 #include "MPRController.h"
 #include "MPI/mpi2_min.h"
@@ -23,6 +24,14 @@ OSDefineMetaClassAndStructors(MPRController, IOService)
 #define MPR_READY_TRIES         60
 #define MPR_ACK_ITERATIONS      4000
 #define MPR_DBINT_ITERATIONS    4000
+
+/* M1-b queue geometry. The reply free/post queues must hold one unused entry
+ * and be a multiple of 16 (mpr.c:1379-1380); IOC Init advertises the same
+ * depths and the request frame size in 32-bit words (mpr.c:1264-1266). */
+#define MPR_M1B_REPLY_FRAMES    128
+#define MPR_M1B_REQUEST_FRAMES  128
+#define MPR_M1B_STATE_TRIES     1000
+#define MPR_DMA_LOW_MASK        0x00000000FFFFFFFFULL
 
 struct MPRRegisterInfo
 {
@@ -407,11 +416,20 @@ MPRController::getIOCFacts(void)
           (unsigned int)facts.MaxReplyDescriptorPostQueueDepth,
           (unsigned int)facts.IOCRequestFrameSize);
 
-    return (facts.Function == MPI2_FUNCTION_IOC_FACTS) &&
-           ((facts.IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS);
+    ok = (facts.Function == MPI2_FUNCTION_IOC_FACTS) &&
+         ((facts.IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS);
+    if (ok) {
+        /* Keep the geometry for M1-b; both frame sizes are in 32-bit words. */
+        fRequestFrameSize = (UInt32)facts.IOCRequestFrameSize * 4;
+        fReplyFrameSize   = (UInt32)facts.ReplyFrameSize * 4;
+        fRequestCredit    = facts.RequestCredit;
+        fMaxReplyDepth    = facts.MaxReplyDescriptorPostQueueDepth;
+        fFactsValid       = true;
+    }
+    return ok;
 }
 
-void
+bool
 MPRController::runM1a(void)
 {
     UInt32 initialState, finalState;
@@ -423,13 +441,13 @@ MPRController::runM1a(void)
     if (!transitionToReady()) {
         setProperty("MPRM1aFailure", "cannot reach READY");
         setProperty("MPRM1aState", "failed-ready");
-        return;
+        return false;
     }
     setProperty("MPRM1aReachedReady", true);
 
     if (!getIOCFacts()) {
         setProperty("MPRM1aState", "failed-facts");
-        return;
+        return false;
     }
 
     finalState = readReg(MPI2_DOORBELL_OFFSET) & MPI2_IOC_STATE_MASK;
@@ -437,6 +455,229 @@ MPRController::runM1a(void)
     setProperty("MPRM1aState", "ok");
     IOLog("MPR M1a: completed, IOC state after IOC Facts = 0x%08x\n",
           (unsigned int)finalState);
+    return true;
+}
+
+/* ------------------------------------------------------------------------ */
+/* M1-b: synchronous IOC Init with a low-4GB, physically contiguous pool.    */
+/* No interrupts, no config pages and no I/O: the only hardware effects are  */
+/* the IOC Init message and the two reply-index registers (mpr.c:1231-1289). */
+
+static UInt32
+mprRoundUp16(UInt32 value)
+{
+    return (value + 15U) & ~15U;
+}
+
+bool
+MPRController::allocateQueueMemory(void)
+{
+    IOByteCount segLength;
+    UInt32      queueBytes, replyBytes, requestBytes;
+    UInt8      *queue;
+    UInt32     *freeQueue;
+    UInt64     *postQueue;
+    UInt32      i;
+
+    if (!fFactsValid || fReplyFrameSize == 0 || fRequestFrameSize == 0) {
+        setProperty("MPRM1bFailure", "no usable IOC Facts geometry");
+        return false;
+    }
+
+    fFqDepth        = mprRoundUp16(MPR_M1B_REPLY_FRAMES + 1);
+    fPqDepth        = fFqDepth;
+    fRequestCount   = MPR_M1B_REQUEST_FRAMES;
+    fReplyFreeIndex = MPR_M1B_REPLY_FRAMES;
+
+    queueBytes   = fFqDepth * 4 + fPqDepth * 8;
+    replyBytes   = fReplyFrameSize * fFqDepth;
+    requestBytes = fRequestFrameSize * fRequestCount;
+
+    if (fRequestCount > fRequestCredit || fFqDepth > fMaxReplyDepth) {
+        setProperty("MPRM1bFailure", "geometry exceeds IOC credit");
+        return false;
+    }
+
+    fQueueBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        queueBytes, MPR_DMA_LOW_MASK);
+    fReplyBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        replyBytes, MPR_DMA_LOW_MASK);
+    fRequestBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        requestBytes, MPR_DMA_LOW_MASK);
+
+    if (fQueueBuffer == NULL || fReplyBuffer == NULL || fRequestBuffer == NULL) {
+        setProperty("MPRM1bFailure", "DMA pool allocation failed");
+        return false;
+    }
+
+    fFreePhys = fQueueBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+    if (fFreePhys == 0 || segLength < queueBytes) {
+        setProperty("MPRM1bFailure", "queue pool is not physically contiguous");
+        return false;
+    }
+    fPostPhys = fFreePhys + (UInt64)fFqDepth * 4;
+
+    fReplyPhys = fReplyBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+    if (fReplyPhys == 0 || segLength < replyBytes) {
+        setProperty("MPRM1bFailure", "reply pool is not physically contiguous");
+        return false;
+    }
+
+    fRequestPhys = fRequestBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+    if (fRequestPhys == 0 || segLength < requestBytes) {
+        setProperty("MPRM1bFailure", "request pool is not physically contiguous");
+        return false;
+    }
+
+    if ((fFreePhys + queueBytes) > (MPR_DMA_LOW_MASK + 1) ||
+        (fReplyPhys + replyBytes) > (MPR_DMA_LOW_MASK + 1) ||
+        (fRequestPhys + requestBytes) > (MPR_DMA_LOW_MASK + 1)) {
+        setProperty("MPRM1bFailure", "DMA pool crosses the 4 GB boundary");
+        return false;
+    }
+
+    queue = (UInt8 *)fQueueBuffer->getBytesNoCopy();
+    if (queue == NULL) {
+        setProperty("MPRM1bFailure", "queue pool has no virtual address");
+        return false;
+    }
+
+    memset(queue, 0, queueBytes);
+    freeQueue = (UInt32 *)queue;
+    postQueue = (UInt64 *)(queue + fFqDepth * 4);
+
+    /* Unused post entries are 0xff; each free entry carries the low 32 bits
+     * of its reply frame address (mpr.c:1691-1706). */
+    memset(postQueue, 0xFF, fPqDepth * 8);
+    for (i = 0; i < fFqDepth; i++) {
+        freeQueue[i] = (UInt32)(fReplyPhys + (UInt64)i * fReplyFrameSize);
+    }
+
+    setProperty("MPRQueueFreeDepth", (unsigned long long)fFqDepth, 32);
+    setProperty("MPRQueuePostDepth", (unsigned long long)fPqDepth, 32);
+    setProperty("MPRRequestCount",   (unsigned long long)fRequestCount, 32);
+    setProperty("MPRQueuePhys",      fFreePhys, 64);
+    setProperty("MPRReplyPhys",      fReplyPhys, 64);
+    setProperty("MPRRequestPhys",    fRequestPhys, 64);
+    return true;
+}
+
+void
+MPRController::freeQueueMemory(void)
+{
+    if (fQueueBuffer != NULL) {
+        fQueueBuffer->release();
+        fQueueBuffer = NULL;
+    }
+    if (fReplyBuffer != NULL) {
+        fReplyBuffer->release();
+        fReplyBuffer = NULL;
+    }
+    if (fRequestBuffer != NULL) {
+        fRequestBuffer->release();
+        fRequestBuffer = NULL;
+    }
+    fFreePhys = fPostPhys = fReplyPhys = fRequestPhys = 0;
+}
+
+bool
+MPRController::sendIOCInit(void)
+{
+    union {
+        MPRIOCInitRequest request;
+        UInt32             words[sizeof(MPRIOCInitRequest) / 4];
+    } out;
+    union {
+        MPRIOCInitReply reply;
+        UInt16          words[sizeof(MPRIOCInitReply) / 2];
+    } in;
+    MPRIOCInitReply answer;
+    UInt16          status;
+    unsigned int    retry;
+    bool            ok = false;
+
+    bzero(&out, sizeof(out));
+    out.request.WhoInit                         = MPI2_WHOINIT_HOST_DRIVER;
+    out.request.Function                        = MPI2_FUNCTION_IOC_INIT;
+    out.request.MsgVersion                      = MPI2_VERSION;
+    out.request.HeaderVersion                   = MPI2_HEADER_VERSION;
+    out.request.SystemRequestFrameSize          = (UInt16)(fRequestFrameSize / 4);
+    out.request.ReplyDescriptorPostQueueDepth   = (UInt16)fPqDepth;
+    out.request.ReplyFreeQueueDepth             = (UInt16)fFqDepth;
+    out.request.SenseBufferAddressHigh          = 0;
+    out.request.SystemReplyAddressHigh          = 0;
+    out.request.SystemRequestFrameBaseAddress   = fRequestPhys;
+    out.request.ReplyDescriptorPostQueueAddress = fPostPhys;
+    out.request.ReplyFreeQueueAddress           = fFreePhys;
+    out.request.HostPageSize                    = MPR_HOST_PAGE_SIZE_4K;
+    out.request.HostMSIxVectors                 = 0;
+    out.request.TimeStamp                       = 0;
+
+    for (retry = 0; retry < 3 && !ok; retry++) {
+        bzero(&in, sizeof(in));
+        ok = handshake(out.words, sizeof(out.words),
+                       in.words, sizeof(in.words));
+        if (!ok) {
+            IODelay(1000);
+        }
+    }
+    if (!ok) {
+        setProperty("MPRM1bFailure", "IOC Init handshake failed");
+        return false;
+    }
+
+    memcpy(&answer, in.words, sizeof(answer));
+    status = (UInt16)(answer.IOCStatus & MPI2_IOCSTATUS_MASK);
+    setProperty("MPRIOCInitStatus",  (unsigned long long)status, 16);
+    setProperty("MPRIOCInitLogInfo", (unsigned long long)answer.IOCLogInfo, 32);
+    IOLog("MPR M1b: IOC Init status=0x%04x loginfo=0x%08x\n",
+          (unsigned int)status, (unsigned int)answer.IOCLogInfo);
+
+    return status == MPI2_IOCSTATUS_SUCCESS;
+}
+
+bool
+MPRController::runM1b(void)
+{
+    UInt32 state = MPI2_IOC_STATE_RESET;
+    UInt32 tries;
+
+    if (!allocateQueueMemory()) {
+        setProperty("MPRM1bState", "failed-alloc");
+        return false;
+    }
+    if (!sendIOCInit()) {
+        setProperty("MPRM1bState", "failed-iocinit");
+        return false;
+    }
+
+    state = readReg(MPI2_DOORBELL_OFFSET) & MPI2_IOC_STATE_MASK;
+    for (tries = 0; tries < MPR_M1B_STATE_TRIES &&
+                    state != MPI2_IOC_STATE_OPERATIONAL; tries++) {
+        IODelay(1000);
+        state = readReg(MPI2_DOORBELL_OFFSET) & MPI2_IOC_STATE_MASK;
+    }
+    setProperty("MPRIOCState", (unsigned long long)state, 32);
+
+    if (state != MPI2_IOC_STATE_OPERATIONAL) {
+        setProperty("MPRM1bState", "failed-not-operational");
+        return false;
+    }
+
+    /* The IOC resets these indices during the state transition, so program
+     * them only after OPERATIONAL is observed (mpr.c:700-712). */
+    writeReg(MPI2_REPLY_FREE_HOST_INDEX_OFFSET, fReplyFreeIndex);
+    writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, 0);
+    setProperty("MPRReplyFreeHostIndex", (unsigned long long)fReplyFreeIndex, 32);
+    setProperty("MPRReplyPostHostIndex", 0ULL, 32);
+    setProperty("MPRM1bState", "ok");
+    IOLog("MPR M1b: IOC OPERATIONAL, freeDepth=%u postDepth=%u requests=%u\n",
+          (unsigned int)fFqDepth, (unsigned int)fPqDepth,
+          (unsigned int)fRequestCount);
+    return true;
 }
 
 bool
@@ -475,21 +716,26 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M1a");
-    setProperty("MPRBuild", "0.2.0");
+    setProperty("MPRStage", "M1b");
+    setProperty("MPRBuild", "0.3.0");
 
-    /* Failures inside M1-a are recorded in IORegistry and never panic the
-     * machine or prevent the kext from loading. No DMA, no IOC Init, no
-     * interrupts and no config requests are issued at this stage. */
-    runM1a();
+    /* Failures inside M1-a/M1-b are recorded in IORegistry and never panic the
+     * machine or prevent the kext from loading. M1-b issues IOC Init only:
+     * no interrupts, no config pages and no I/O requests. */
+    if (runM1a()) {
+        runM1b();
+    } else {
+        setProperty("MPRM1bState", "skipped-m1a-failed");
+    }
 
-    IOLog("MPR M1a: start complete\n");
+    IOLog("MPR M1b: start complete\n");
     return true;
 }
 
 void
 MPRController::stop(IOService *provider)
 {
+    freeQueueMemory();
     if (fMMIO != NULL) {
         fMMIO->release();
         fMMIO = NULL;

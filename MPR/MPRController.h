@@ -3,6 +3,7 @@
 
 #include <IOKit/IOService.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/c++/OSMetaClass.h>
 
 class IOPCIDevice;
@@ -16,6 +17,24 @@ private:
     IOMemoryMap      *fMMIO;
     volatile UInt32  *fRegs;
 
+    /* M1-b: IOC Init control structures, all in low 4 GB physical memory. */
+    IOBufferMemoryDescriptor *fQueueBuffer;
+    IOBufferMemoryDescriptor *fReplyBuffer;
+    IOBufferMemoryDescriptor *fRequestBuffer;
+    UInt64           fFreePhys;
+    UInt64           fPostPhys;
+    UInt64           fReplyPhys;
+    UInt64           fRequestPhys;
+    UInt32           fFqDepth;
+    UInt32           fPqDepth;
+    UInt32           fRequestCount;
+    UInt32           fReplyFreeIndex;
+    UInt32           fRequestFrameSize;
+    UInt32           fReplyFrameSize;
+    UInt32           fRequestCredit;
+    UInt32           fMaxReplyDepth;
+    bool             fFactsValid;
+
     UInt32 readReg(UInt32 offset);
     void   writeReg(UInt32 offset, UInt32 value);
 
@@ -27,7 +46,12 @@ private:
     bool   handshake(const UInt32 *request, UInt32 requestBytes,
                      UInt16 *replyWords, UInt32 replyBytes);
     bool   getIOCFacts(void);
-    void   runM1a(void);
+    bool   runM1a(void);
+
+    bool   allocateQueueMemory(void);
+    void   freeQueueMemory(void);
+    bool   sendIOCInit(void);
+    bool   runM1b(void);
 
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
