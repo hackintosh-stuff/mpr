@@ -322,7 +322,9 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 
 **校验**：同目录备份 `config.plist.bak_sata_internal_20261111`；`diff` 唯一差异为上述 6 行插入；`plutil -lint OK`；CR=0；SHA-256 改前 `73a1ea3de30b26ef0f225068a60224314ab656b47f9b77015b3ea6c6f74b8e7b`、改后 `71b96d2bf1415aa8e04a0b103181055f03b042dce6b0d84e7f5dd15bb857954f`。ESP 已卸载。
 
-**待验证**：重启后须同时满足名称 `SanDisk SD8SNAT-128G-1006`、`Device Location: Internal`、`128.0 GB`，并复核 `AHCI-Built-In=Yes` / `Physical Interconnect Location=Internal`。任一不符即停止，不得部署 M1-a、不得写 ESP；回滚只需用备份恢复 `config.plist`。
+**已验证（2026-11-11 重启后）**：`diskutil list` 标为 `(internal, physical)`；`diskutil info` 同时满足名称 `SanDisk SD8SNAT-128G-1006`、`Device Location: Internal`、`Disk Size: 128.0 GB (128035676160 B)`。控制器出现 `built-in=<01000000>`、`AHCI-Built-In=Yes`，`IOAHCIDevice` / `AppleAHCIDiskDriver` / `IOAHCIBlockStorageDevice` 的 `Physical Interconnect Location` 全部为 `Internal`。`com.ling.MPR (0.1.0)` 重启后仍加载，无新增 panic。**部署目标三要素已满足。**
+
+**副作用与约束**：注入生效后 `diskutil info` 的 `Protocol` 由 `SATA` 变为 `PCI`（Apple PCH 驱动把内置端口的 `Physical Interconnect` 标为 PCI），不影响读写与启动；后续定位脚本不得硬编码总线协议，只按设备名 + `Device Location` + 容量三项判定。旧的 M1-a 部署脚本仍含基于设备编号的判定，重写并复核前不得使用。回滚只需用备份恢复 `config.plist`。
 
 **暂停点：以下步骤需要新的部署/重启授权，按用户要求在此停止。**
 
