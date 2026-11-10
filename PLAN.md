@@ -312,6 +312,18 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 
 **当前状态**：空壳 kext 已在 macOS 真机加载并命中 PCI 匹配字典，BAR1 可读；它不写硬件寄存器、不发 DMA、不注册服务。SAS3008 已接 1 块测试盘，Debian 下由 `mpt3sas` 枚举为 `/dev/sdb`（`PCCOOLER SSD T200 240GB`、GPT/Windows 布局、**无重要数据**），该盘**允许破坏性写入**；macOS 侧尚未由本驱动枚举。首版验收范围限定 **STP/SATA 直连**，SAS SSP / expander 当前无测试条件、不列入退出条件。按 §6 的 M0 退出条件，空 kext 卸载验证仍未完成；ESP 上保留 `config.plist.bak_mpr-m0_20261111` 备份，回滚路径未实测。
 
+### 9.1 部署前置条件：内置 SATA 盘被误报为 External（修复已写入，待重启验证）
+
+**现象**：系统盘 `SanDisk SD8SNAT-128G-1006`（128.0 GB、SATA）被 `diskutil info` 报为 `Device Location: External`，不满足部署目标三要素；M1-a 的 ESP 写入与重启验证因此暂停。
+
+**根因**：该盘挂在 AMD FCH SATA 控制器 `pci1022,7901`（`43:00.0`）的 `PRT7@7` 端口，控制器由 `AMDSata.kext`（RehabMan `SATA-unsupported` 注入器）匹配 `AppleIntelPchSeriesAHCI`。控制器位于多级 PCI 桥之后，IODeviceTree 中缺 `built-in` 属性；`AppleAHCI::start` 据此把控制器与端口的 `AHCI-Built-In` 置为 `No`，沿 `IOAHCIDevice` → `AppleAHCIDiskDriver` → `IOAHCIBlockStorageDevice` 把 `Physical Interconnect Location` 设为 `External`，最终 `IOMediaIcon=External.icns`。判据由 BootKC 中 `AppleAHCI::start` 的字符串链 `built-in | IOPCIEjectable | sata-express | AHCI-Ejectable | AHCI-Built-In` 确认。
+
+**修复**：在目标盘 ESP 的 `config.plist` 中，对 `DeviceProperties > Add` 的 `PciRoot(0x0)/Pci(0x1,0x2)/Pci(0x0,0x0)/Pci(0x9,0x0)/Pci(0x0,0x0)` 注入 `built-in`（Data `01000000`）。路径由实时 `DeviceTreePath` 生成，目标盘按设备名 + 容量 + 总线协议动态定位，显式排除 USB 安装/救援盘的 EFI；不使用设备编号判定。
+
+**校验**：同目录备份 `config.plist.bak_sata_internal_20261111`；`diff` 唯一差异为上述 6 行插入；`plutil -lint OK`；CR=0；SHA-256 改前 `73a1ea3de30b26ef0f225068a60224314ab656b47f9b77015b3ea6c6f74b8e7b`、改后 `71b96d2bf1415aa8e04a0b103181055f03b042dce6b0d84e7f5dd15bb857954f`。ESP 已卸载。
+
+**待验证**：重启后须同时满足名称 `SanDisk SD8SNAT-128G-1006`、`Device Location: Internal`、`128.0 GB`，并复核 `AHCI-Built-In=Yes` / `Physical Interconnect Location=Internal`。任一不符即停止，不得部署 M1-a、不得写 ESP；回滚只需用备份恢复 `config.plist`。
+
 **暂停点：以下步骤需要新的部署/重启授权，按用户要求在此停止。**
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
