@@ -1,9 +1,9 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.2（2026-11-10；依据 BootKernelExtensions.kc 反编译结果修订）
-目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA
+状态：草案 v0.3（2026-11-10；完成无硬件预核查，等待接入 SAS3008）
+目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**当前未接入**）
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`
-目标平台：macOS Tahoe 26（x86_64，MSI X570 测试机），基于 `MacKernelSDK` 的 IOKit kext。工作区记录的内核版本为 Darwin 25.6.0，而本次反编译的 BootKC 属于 26.7.x（KC 内 kext `DTPlatformVersion=26.7.1` / `DTSDKBuild=25G325`，分析文档标注 26.7.2 / 25G332）；以现场 `uname -a` / `kextstat` 为准，系统升级后需重取 KC。
+目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
 
 本文件只描述计划，不含实现代码。参考源码引用以拉取到 `reference/` 的固定 commit 为准；内核侧事实来自 `C:\Users\ling\OneDrive\Documents\Agent\Hackintosh\ida\BootKernelExtensions.kc` 的 IDA 反编译/符号表（见 §4.0）。下文 `xxx.c:NNN` 形式的行号，FreeBSD 侧相对 `reference/freebsd/sys/dev/mpr/`，Linux 侧相对 `reference/linux/drivers/scsi/mpt3sas/`，SDK 侧相对 `MacKernelSDK/`。
 
@@ -126,6 +126,20 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 6. **`OSBundleLibraries` 的真实样例**：KC 的 prelink Info.plist 中 Apple kext 声明 `com.apple.iokit.IOPCIFamily = 1.1`、`com.apple.kpi.iokit/libkern/mach = 8.0/9.0` 等；这些是 Apple 内部 kext 的历史版本，只作为「依赖键长什么样」的参考，第三方 kext 的版本仍以现场 `kextstat`/KPI 为准。
 7. **资料边界**：`ionvme-symbol-analysis.md` §4/§5 的 Lilu `solveSymbol` / Samsung 990 EVO 结论与本项目无关且已在别处被推翻，本计划只取其 §1–§3 的寄存器/命令/反编译事实；KC 里多数符号是 names 而非 IDA 已识别函数（`lookup_funcs` 对多数 vtable 槽返回 "Not a function"，部分 `decompile` 也因此失败），故 ABI 核对以**符号表 + vtable 原始字节**为准，不依赖 IDA 的函数识别。
 
+#### 4.0.1 无硬件预核查结果（2026-11-10）
+
+以下项目均在不接入 SAS3008 的条件下完成，可直接作为 M0 的输入：
+
+| 核查项 | 方法 | 结论 |
+|---|---|---|
+| 目标机系统版本 | `ssh ling@192.168.50.204` → `uname -a` / `sw_vers` | `Darwin 25.6.0` / `macOS 26.7.2` / `25G332`，与 KC 分析文档一致。v0.2 中「Darwin 25.6.0 与 26.7.x 不一致」是误判，二者是同一系统 |
+| family / KPI 版本 | 现场 `kextstat` | `com.apple.iokit.IOPCIFamily 2.9`、`IOStorageFamily 2.1`、`IOSCSIArchitectureModelFamily 545.100.10`、`IOSCSIBlockCommandsDevice 545.100.10`、`SCSITaskUserClient 545.100.10`；`com.apple.kpi.{iokit,libkern,mach,bsd} 25.6.0`。`OSBundleLibraries` 填的是最低要求版本，不应照抄 KC prelink plist 里的 1.1 / 8.0 / 9.0 等历史值 |
+| `IOSCSIParallelFamily` 运行时状态 | `kextstat \| grep -c IOSCSIParallelFamily` | **0，未加载**。该 family 存在于 BootKC 二进制，但本机无 SPI 硬件故不 attach；进一步说明路线 B 依赖一个运行时不加载的私有 family |
+| **vtable ABI 一致性（R1 核心）** | `ida/kc_storage_vtable_check.py` 离线解析 KC fileset symtab，对 vtable 槽做 chained-fixup 解码（自检：槽 2 raw `0x40000002a6c504` → `0xffffff8002b6c504`），再与 SDK 头 29 个 `virtual` 声明逐项比对 | **完全一致**。`IOBlockStorageDevice` 自有方法从槽 268 起连续排列：`doEjectMedia`268 / `doFormatMedia`269 / `doGetFormatCapacities`270 / `doLockUnlockMedia`271 / `doSynchronizeCache`272 / `getVendorString`273 … `reportWriteProtection`284 / `getWriteCacheState`285 / `setWriteCacheState`286 / **`doAsyncReadWrite`287** / `requestIdle`288 / `doDiscard`289 / `doUnmap`290 / `doSetPriority`291 / `doSynchronize`292 / `doGetProvisionStatus`293；覆写的继承方法 `init`/`getProperty`/`setProperties` 在槽 75/87/98。槽 294–321 = `_RESERVEDIOBlockStorageDevice4..31`（28 个），与 SDK 头 `OSMetaClassDeclareReservedUnused(...,4..31)` 及 `Used(...,0..3)` 完全对应。`AppleVirtIOBlockStorageDevice` 与 `IONVMeBlockStorageDevice` 两套子类在相同槽索引覆写同名方法（268/270/277/287/290 交叉验证通过）。**结论：macOS 11 SDK 的 `IOBlockStorageDevice.h` 可用于 26.7.2 内核编译，R1 的 ABI 风险关闭** |
+| PCI 匹配键 | `MacKernelSDK/Headers/IOKit/pci/IOPCIDevice.h:324-356` | `IOPCIPrimaryMatch` 匹配 config 0x00 的 vendor+device，格式 `0x<device><vendor>`（示例 `0x00261011` = dev 0x0026 / vendor 0x1011），可带 `&mask`。SAS3008 用 `0x00971000` 正确 |
+
+> 复现：`py -3 C:\Users\ling\OneDrive\Documents\Agent\Hackintosh\ida\kc_storage_vtable_check.py`（脚本位于工作区 `ida/`，与 `reference/` 一样不入库）。系统升级后重跑该脚本即可回归 ABI。
+
 ### 4.1 MacKernelSDK 提供什么
 
 存在（`MacKernelSDK/Headers/`）：`IOKit/pci/IOPCIDevice.h`（config 读写、`findPCICapability`、BAR 映射）、`IOKit/IOBufferMemoryDescriptor.h`、`IOKit/IODMACommand.h`（`gen64IOVMSegments`、`kIODMACommandOutputLittle64`）、`IOKit/IOMemoryDescriptor.h`（`IOMemoryMap`）、`IOWorkLoop`/`IOCommandGate`/`IOInterruptEventSource`/`IOFilterInterruptEventSource`/`IOTimerEventSource`/`IOCommandPool`/`IOLocks`、libkern 集合与字节序、`IOKit/storage/IOBlockStorageDevice.h` 及 `IOStorage`/`IOMedia`/`IOBlockStorageDriver`、`IOKit/storage/IOStorageProtocolCharacteristics.h`（`Physical Interconnect = "SAS"`）、以及 `IOKit/scsi/` 下的 `SCSITask.h`、`IOSCSIProtocolInterface.h`、`IOSCSIPeripheralDeviceNub.h`、各 `SCSICmds_*.h`（CDB 定义可用）。
@@ -203,7 +217,7 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 
 | 阶段 | 目标与交付 | 验收方式 | 退出条件 |
 |---|---|---|---|
-| **M0 环境** | 确认目标机 SAS3008 的 PCI ID/固件模式/BAR；Xcode 工程接入 MacKernelSDK（`KERNEL_EXTENSION_HEADER_SEARCH_PATHS`、`KERNEL_FRAMEWORK_HEADERS`）；最小 kext 能加载并匹配；**用 KC 的 `__ZTV20IOBlockStorageDevice` / `__ZTV29AppleVirtIOBlockStorageDevice` 核对 SDK 头 vtable 槽位与保留槽，并确定 `OSBundleLibraries` 版本**（§4.2） | `ioreg -l -p IODeviceTree`、`kmutil showloaded`、`kextstat`、`log show --predicate 'process == "kernel"'`；最小 kext 的 `start` 成功打印；产出 vtable 逐槽比对表 | 空 kext 稳定加载/卸载，PCI 匹配字典命中；vtable 与 SDK 头一致（或已补齐头），KPI 版本结论明确 |
+| **M0 环境** | 确认目标机 SAS3008 的 PCI ID/固件模式/BAR；Xcode 工程接入 MacKernelSDK（`KERNEL_EXTENSION_HEADER_SEARCH_PATHS`、`KERNEL_FRAMEWORK_HEADERS`）；最小 kext 能加载并匹配；**用 KC 的 `__ZTV20IOBlockStorageDevice` / `__ZTV29AppleVirtIOBlockStorageDevice` 核对 SDK 头 vtable 槽位与保留槽，并确定 `OSBundleLibraries` 版本**（§4.2）。**其中 vtable / KPI / 系统版本 / PCI 匹配键核查已于 2026-11-10 无硬件完成，见 §4.0.1；剩余 PCI 探测与最小 kext 加载需接入 SAS3008** | `ioreg -l -p IODeviceTree`、`kmutil showloaded`、`kextstat`、`log show --predicate 'process == "kernel"'`；最小 kext 的 `start` 成功打印；产出 vtable 逐槽比对表 | 空 kext 稳定加载/卸载，PCI 匹配字典命中；vtable 与 SDK 头一致（已核实），KPI 版本结论明确 |
 | **M1 寄存器与 IOC** | MMIO dump、diag reset → READY、IOC Facts、按 Facts 计算队列几何、分配 DMA 池、IOC Init → OPERATIONAL（先轮询，不开中断） | 用户态诊断工具读 Doorbell/`IOCState`，对比参考驱动的 Facts 字段；寄存器 dump 与 `mpi2.h` 常量一致 | 无需中断即可收发一条同步 config 请求（如读 Manufacturing Page0）；IOC 保持在 OPERATIONAL |
 | **M2 中断与事件** | 单 MSI/MSI-X 向量 + `IOFilterInterruptEventSource`、reply descriptor 解析、EventNotification、PortEnable、固件事件队列 | 能看到 `SAS_DISCOVERY`/拓扑事件；`mpr_user`-style config page 读取成功；连续 10 分钟无丢失 reply | reply queue 与 Host Index 回写无泄漏；事件队列不丢不重 |
 | **M3 单盘只读** | 目标表 → 第一个 `IOBlockStorageDevice` nub（实现参照 §4.0 的 `AppleVirtIOBlockStorageDevice`）；INQUIRY / READ CAPACITY(16) / READ(16)；`IOMedia` 出现 | `diskutil list`、`ioreg -r -c IOMedia`、`dd if=/dev/rdiskN of=/dev/null bs=1m count=1024` 无错；只读挂载可列目录 | 1 GB 顺序读回读数据一致，无 kernel panic、无 DMA 越界 |
@@ -230,7 +244,7 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 
 | # | 风险 | 影响 | 缓解 / 验证 |
 |---|---|---|---|
-| R1 | **已降级**：family 不存在/不可链接的风险已由 BootKC 实证排除（§4.0）；剩余是 MacKernelSDK（macOS 11）头与 26.7 内核 `IOBlockStorageDevice` vtable/保留槽不一致，或 `OSBundleLibraries` 版本不匹配 | 子类 vtable 错位 → 加载即 panic | M0 读 `__ZTV20IOBlockStorageDevice` (@`0xffffff8002b70450`) 与 Apple 子类 vtable 的原始槽位，与 SDK 头逐项比对；不一致则补 SDK 头 / 调整部署目标，再用最小 kext 验证 |
+| R1 | **已关闭**：family 不存在/不可链接（§4.0 实证排除）与 MacKernelSDK（macOS 11）头 ↔ 26.7.2 内核 `IOBlockStorageDevice` vtable/保留槽不一致，曾担心子类 vtable 错位导致加载即 panic | 曾列为路线 A 首要阻塞 | 2026-11-10 已用 KC 离线逐槽核对（§4.0.1：方法槽 268–293、保留槽 294–321、两套 Apple 子类交叉验证）确认一致；系统大版本升级后重跑 `ida/kc_storage_vtable_check.py` 回归 |
 | R2 | SAS3008 处于 IR 固件模式或固件版本过旧，事件/能力字段不同 | 初始化失败或发现不到盘 | 先读 Manufacturing Page0/IOC Facts 记录固件版本，按 IT 模式验收；IR 模式明确拒绝 |
 | R3 | MSI-X 中断源索引与 `IOPCIDevice` 的 `intIndex` 语义不一致 | 收不到中断 | M1 先轮询；M2 逐个 index 试，读 `getInterruptType` 的 `kIOInterruptTypePCIMessaged` 位；必要时回退 INTx |
 | R4 | 低 4GB / 4GB boundary / 63 位 DMA 约束在 macOS 上难以保证 | 固件写错地址、静默数据损坏 | 池化分配 + 物理地址校验 + 失败回退 32 位 SGE；M3 用数据校验和验证 |
@@ -242,7 +256,7 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 | R10 | 启动盘与系统卷依赖 | 盘符/启动顺序变化 | 首版不做启动盘；测试机保留内部 SATA 系统盘 |
 | R11 | UNMAP/TRIM 触发某些 SSD 固件缺陷 | 掉盘 | 已有同工作区 Optane TRIM 掉盘经验，默认先禁用 UNMAP，验证设备后再开 |
 | R12 | 单中断向量性能上限 | 吞吐低 | 首版接受；M7 再按 Linux `mpt3sas_base.c:3212-3501` 做多队列 |
-| R13 | 内核缓存与目标机系统版本漂移（工作区记录 Darwin 25.6.0、KC 为 26.7.x，KC 内 kext 还有 26.7.1/25G325 与 26.7.2/25G332 之别） | 按旧 vtable/符号做的设计在新内核上失效 | 以现场 `uname -a`/`kextstat` 为准；每次系统升级重取 BootKC 并重做 §4.2 的 vtable 核对；不把 KC 地址写进代码 |
+| R13 | 系统升级后内核缓存与目标机版本漂移 | 按旧 vtable/符号做的设计在新内核上失效 | 现场已确认目标机 = 26.7.2 / 25G332 / Darwin 25.6.0，与 KC 分析文档一致；KC 内 26.7.1 / 25G325 只是部分 kext 的构建批次。系统升级后重取 BootKC 并重跑 §4.0.1 的脚本；不把 KC 地址写进代码 |
 
 需要用户决策的未决项：
 
@@ -252,14 +266,24 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 4. 测试盘是否允许破坏性写入？是否需要只读验收阶段（M3）作为硬门槛？
 5. 诊断用户态工具是放在本仓库，还是借用现有工具链？
 6. 是否需要签名/发布级打包，还是仅测试机开发签名？
-7. 目标机是否固定到与 BootKC 一致的 26.7.x 构建？（影响 §4.0 的 ABI 核对结果与 M0 结论的有效期）
+7. 目标机是否锁定 26.7.2 / 25G332？（现场已确认；升级会触发 §4.0.1 的 ABI 回归）
 
 ---
 
-## 9. 下一步（M0 具体动作）
+## 9. 当前进度与暂停点（2026-11-10）
 
-1. 在目标机上确认 SAS3008 的 PCI 配置空间、BAR、当前固件模式与 `IOPCIDevice` 匹配字典（不要沿用历史磁盘/设备号），并核对 `uname -a` / `kextstat` 与 §2 的 KC 版本。
-2. 建立 kext Xcode 工程与 `Info.plist`：`IOProviderClass=IOPCIDevice`、`IOPCIPrimaryMatch` 匹配 `0x1000:0x0097`、`OSBundleLibraries` 声明实际需要的 KPI/系统 family；上传前确认 LF。
-3. 写空壳 `MPRController::probe/start`，只做 `setMemoryEnable`/`setBusMasterEnable` + BAR 映射 + 寄存器 dump；同时按 §4.2 用 KC vtable 核对 SDK 头，确认 `OSBundleLibraries` 版本。
-4. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite`（BootKC `com.apple.driver.AppleVirtIO:__text`）作为 `MPRBlockDev` 的实现模板；从 FreeBSD `mpi/*.h` 裁剪出 SAS3008 所需的 MPI2.5 结构，落到 `MPI/`，保留版权头；建立与 `reference/` 的差异记录。
-5. 按 §6 的 M1 开始实现 IOC 初始化（轮询优先），每一步都用诊断工具与参考源码的字段定义交叉核对。
+**已完成（不依赖 SAS3008）**，详见 §4.0.1：
+
+1. 现场确认目标机系统版本、已加载 family / KPI 版本，以及 `IOSCSIParallelFamily` 运行时未加载。
+2. 用 `ida/kc_storage_vtable_check.py` 完成 `IOBlockStorageDevice` vtable 与 MacKernelSDK 头的逐槽 ABI 核对（方法槽 268–293、保留槽 294–321、两套 Apple 子类交叉验证），**R1 已关闭**。
+3. 确认 `IOPCIPrimaryMatch` 格式与 `0x00971000` 写法；确认 `OSBundleLibraries` 不应照抄 KC prelink plist 的历史版本。
+4. 复核 FreeBSD / Linux 参考源码基线、许可与 MPI 可复用清单（§2、§3、§7）。
+
+**暂停点：以下步骤都需要 SAS3008 实际接入，按用户要求在此停止；未执行任何部署、重启或写盘操作。**
+
+1. 在目标机上确认 SAS3008 的 PCI 配置空间、BAR、固件 IT/IR 模式，验证 `IOPCIPrimaryMatch=0x00971000` 命中（`ioreg`、`system_profiler SPPCIDataType`）；不要沿用历史设备号。
+2. 建立 kext Xcode 工程与 `Info.plist`（`IOProviderClass=IOPCIDevice`、`IOPCIPrimaryMatch=0x00971000`、`OSBundleLibraries` 按 §4.0.1 的现场版本取最低要求值），上传前确认 LF；写空壳 `MPRController::probe/start`（`setMemoryEnable`/`setBusMasterEnable` + BAR 映射 + 寄存器 dump）并在真机验证加载。
+3. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
+4. 进入 M1：MMIO dump、diag reset → READY、IOC Facts、队列几何、IOC Init。
+
+**恢复条件**：SAS3008 已插入并确认目标机可正常启动；用户授权 kext 部署及必要的重启。在此之前不再推进。
