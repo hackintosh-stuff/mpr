@@ -308,7 +308,7 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 6. SAS3008 已接入：IORegistry 确认 `0x1000:0x0097` / `pciclass,010700` / `pci1000,97`。BAR0 为 I/O；BAR1/BAR2 组成 **64-bit** MMIO（配置偏移 `0x14`，64 KB），BAR3/BAR4 为 64-bit MMIO（`0x1c`，256 KB）。物理地址随启动分配：macOS 侧 `0xFC440000` / `0xFC400000`，Debian 侧 `0xfc540000` / `0xfc500000`，代码不得硬编码。`IOPCIPrimaryMatch=0x00971000` 命中，系统正常启动且 macOS 侧原本无驱动接管。
 7. 建立 kext 工程（`MPR/`、`MPR.xcodeproj/`、`tools/build-noxcode.sh`）与 `Info.plist`，写空壳 `MPRController::probe/start`（PCI 使能、BAR1 映射、7 个 MPI2 系统接口寄存器只读 dump 到 IORegistry）。目标机只有 Command Line Tools，构建走无 Xcode 链路：`clang++` + MacKernelSDK + `ld -kext` + ad-hoc 签名。
 8. 按 §5 / `AGENTS.md` 只写内部 SATA 盘的 ESP：`EFI/OC/Kexts/MPR.kext` + `Kernel > Add` 条目；改前同目录备份 `config.plist`、`plutil -lint`、确认唯一差异为新增条目；重启后 `com.ling.MPR (0.1.0)` 加载、`ioreg -r -c MPRController` 出现且寄存器可读。**M0 的「最小 kext 加载并匹配」验收项通过**。
-9. 在 Debian 救援环境完成 SAS3008 与测试盘的只读核查（`ida/m1_hardware_check.md`）：PCI 配置空间 / MSI-X、固件与 IOC 队列几何、SAS 拓扑、盘身份与分区布局。固件镜像为 **IR**（`IOCCapabilities` 含 `INTEGRATED_RAID`），但 `Protocol=(Initiator)` 且未枚举 IR 卷，当前直通运行；测试盘为 **SATA SSD 走 STP**，不是 SAS SSP。
+9. 在 Debian 救援环境完成 SAS3008 与测试盘的只读核查：PCI 配置空间 / MSI-X、固件与 IOC 队列几何、SAS 拓扑、盘身份与分区布局。固件镜像为 **IR**（`IOCCapabilities` 含 `INTEGRATED_RAID`），但 `Protocol=(Initiator)` 且未枚举 IR 卷，当前直通运行；测试盘为 **SATA SSD 走 STP**，不是 SAS SSP。
 
 **当前状态**：空壳 kext 已在 macOS 真机加载并命中 PCI 匹配字典，BAR1 可读；它不写硬件寄存器、不发 DMA、不注册服务。SAS3008 已接 1 块测试盘，Debian 下由 `mpt3sas` 枚举为 `/dev/sdb`（`PCCOOLER SSD T200 240GB`、GPT/Windows 布局、**无重要数据**），该盘**允许破坏性写入**；macOS 侧尚未由本驱动枚举。首版验收范围限定 **STP/SATA 直连**，SAS SSP / expander 当前无测试条件、不列入退出条件。按 §6 的 M0 退出条件，空 kext 卸载验证仍未完成；ESP 上保留 `config.plist.bak_mpr-m0_20261111` 备份，回滚路径未实测。
 
