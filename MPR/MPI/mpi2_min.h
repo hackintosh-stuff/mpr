@@ -1,0 +1,218 @@
+/*-
+ * Copyright 2000-2020 Broadcom Inc. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the author nor the names of any co-contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * Broadcom Inc. (LSI) MPT-Fusion Host Adapter FreeBSD
+ */
+
+/*
+ * mpi2_min.h - minimal MPI2.5 system-interface subset for the M1-a stage.
+ *
+ * Values and structure layouts are transcribed from FreeBSD
+ * sys/dev/mpr/mpi/{mpi2.h,mpi2_ioc.h} at the fixed reference commit in
+ * PLAN.md section 2. Only the registers, bits and messages needed to reach
+ * IOC state READY and issue IOC Facts are included. All structures are
+ * packed and their sizes are asserted below; do not rely on host ABI types
+ * (the original U32 typedef becomes "unsigned long" outside FreeBSD).
+ */
+
+#ifndef MPR_MPI2_MIN_H
+#define MPR_MPI2_MIN_H
+
+#include <IOKit/IOTypes.h>
+#include <stddef.h>
+
+/* System interface register offsets (mpi2.h:226-255, :260-388) */
+#define MPI2_DOORBELL_OFFSET                  0x00
+#define MPI2_WRITE_SEQUENCE_OFFSET            0x04
+#define MPI2_HOST_DIAGNOSTIC_OFFSET           0x08
+#define MPI2_DIAG_RW_DATA_OFFSET              0x10
+#define MPI2_DIAG_RW_ADDRESS_LOW_OFFSET       0x14
+#define MPI2_DIAG_RW_ADDRESS_HIGH_OFFSET      0x18
+#define MPI2_HOST_INTERRUPT_STATUS_OFFSET     0x30
+#define MPI2_HOST_INTERRUPT_MASK_OFFSET       0x34
+#define MPI2_DCR_DATA_OFFSET                  0x38
+#define MPI2_DCR_ADDRESS_OFFSET               0x3C
+#define MPI2_REPLY_FREE_HOST_INDEX_OFFSET     0x48
+#define MPI2_REPLY_POST_HOST_INDEX_OFFSET     0x6C
+#define MPI2_HCB_SIZE_OFFSET                  0x74
+#define MPI2_HCB_ADDRESS_LOW_OFFSET           0x78
+#define MPI2_HCB_ADDRESS_HIGH_OFFSET          0x7C
+#define MPI2_SCRATCHPAD0_OFFSET               0xB0
+#define MPI2_SCRATCHPAD1_OFFSET               0xB4
+#define MPI2_SCRATCHPAD2_OFFSET               0xB8
+#define MPI2_SCRATCHPAD3_OFFSET               0xBC
+#define MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET  0xC0
+#define MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET 0xC4
+#define MPI2_ATOMIC_REQUEST_DESCRIPTOR_OFFSET    0xC8
+
+/* Doorbell bits (mpi2.h:263-273) */
+#define MPI2_DOORBELL_USED                    0x08000000U
+#define MPI2_DOORBELL_WHO_INIT_MASK           0x07000000U
+#define MPI2_DOORBELL_WHO_INIT_SHIFT          24
+#define MPI2_DOORBELL_FAULT_CODE_MASK         0x0000FFFFU
+#define MPI2_DOORBELL_DATA_MASK               0x0000FFFFU
+#define MPI2_DOORBELL_FUNCTION_MASK           0xFF000000U
+#define MPI2_DOORBELL_FUNCTION_SHIFT          24
+#define MPI2_DOORBELL_ADD_DWORDS_MASK         0x00FF0000U
+#define MPI2_DOORBELL_ADD_DWORDS_SHIFT        16
+
+/* WriteSequence unlock keys, 7 writes (mpi2.h:279-286, mpr.c:122) */
+#define MPI2_WRSEQ_FLUSH_KEY_VALUE            0x00
+#define MPI2_WRSEQ_1ST_KEY_VALUE              0x0F
+#define MPI2_WRSEQ_2ND_KEY_VALUE              0x04
+#define MPI2_WRSEQ_3RD_KEY_VALUE              0x0B
+#define MPI2_WRSEQ_4TH_KEY_VALUE              0x02
+#define MPI2_WRSEQ_5TH_KEY_VALUE              0x07
+#define MPI2_WRSEQ_6TH_KEY_VALUE              0x0D
+
+/* HostDiagnostic bits (mpi2.h:293-315); note the MPI2_DIAG_ prefix */
+#define MPI2_DIAG_BOOT_DEVICE_SELECT_MASK     0x00001800U
+#define MPI2_DIAG_HCB_MODE                    0x00000100U
+#define MPI2_DIAG_DIAG_WRITE_ENABLE           0x00000080U
+#define MPI2_DIAG_RESET_HISTORY               0x00000020U
+#define MPI2_DIAG_DIAG_RW_ENABLE              0x00000010U
+#define MPI2_DIAG_RESET_ADAPTER               0x00000004U
+#define MPI2_DIAG_HOLD_IOC_RESET              0x00000002U
+#define MPI2_DIAG_CLEAR_FLASH_BAD_SIG         0x00000400U
+#define MPI2_HCB_SIZE_HCB_ENABLE              0x00000001U
+
+/* HostInterruptStatus / Mask bits (mpi2.h:327-343) */
+#define MPI2_HIS_SYS2IOC_DB_STATUS            0x80000000U
+#define MPI2_HIS_RESET_IRQ_STATUS             0x40000000U
+#define MPI2_HIS_REPLY_DESCRIPTOR_INTERRUPT   0x00000008U
+#define MPI2_HIS_IOC2SYS_DB_STATUS            0x00000001U
+#define MPI2_HIM_REPLY_INT_MASK               0x00000008U
+#define MPI2_HIM_IOC2SYS_DB_MASK              0x00000001U
+
+/* IOC states are in Doorbell bits [31:28] (mpi2.h:208-214) */
+#define MPI2_IOC_STATE_RESET                  0x00000000U
+#define MPI2_IOC_STATE_READY                  0x10000000U
+#define MPI2_IOC_STATE_OPERATIONAL            0x20000000U
+#define MPI2_IOC_STATE_FAULT                  0x40000000U
+#define MPI2_IOC_STATE_MASK                   0xF0000000U
+#define MPI2_IOC_STATE_SHIFT                  28
+
+/* MPI function codes (mpi2.h:663-699) */
+#define MPI2_FUNCTION_IOC_INIT                0x02
+#define MPI2_FUNCTION_IOC_FACTS               0x03
+#define MPI2_FUNCTION_CONFIG                  0x04
+#define MPI2_FUNCTION_PORT_ENABLE             0x06
+#define MPI2_FUNCTION_EVENT_NOTIFICATION      0x07
+#define MPI2_FUNCTION_IOC_MESSAGE_UNIT_RESET  0x40
+#define MPI2_FUNCTION_HANDSHAKE               0x42
+
+/* WhoInit (mpi2_ioc.h:258-263) */
+#define MPI2_WHOINIT_NOT_READY                0x00
+#define MPI2_WHOINIT_ROM_BIOS                 0x02
+#define MPI2_WHOINIT_PCI_PEER                 0x03
+#define MPI2_WHOINIT_HOST_DRIVER              0x04
+#define MPI2_WHOINIT_MANUFACTURER             0x05
+
+/* IOCStatus (mpi2.h:708-724) */
+#define MPI2_IOCSTATUS_MASK                   0x7FFF
+#define MPI2_IOCSTATUS_SUCCESS                0x0000
+
+/* MPI and header versions (mpi2.h:177, :194-200) */
+#define MPI2_VERSION                          0x0200
+#define MPI2_VERSION_02_05                    0x0205
+#define MPI2_HEADER_VERSION                   0x3400
+
+/* IOC Init HostPageSize is a power-of-two exponent (mprvar.h:66) */
+#define MPR_HOST_PAGE_SIZE_4K                 12
+
+/* Default reply layout (mpi2.h:843-858) */
+#define MPI2_DEFAULT_REPLY_MSG_LENGTH_OFF     0x02
+#define MPI2_DEFAULT_REPLY_FUNCTION_OFF       0x03
+#define MPI2_DEFAULT_REPLY_IOCSTATUS_OFF      0x0E
+
+#pragma pack(push, 1)
+
+/* MPI2_IOC_FACTS_REQUEST: 0x0C bytes (mpi2_ioc.h:320-332) */
+typedef struct {
+    UInt16  Reserved1;      /* 0x00 */
+    UInt8   ChainOffset;    /* 0x02 */
+    UInt8   Function;       /* 0x03 */
+    UInt16  Reserved2;      /* 0x04 */
+    UInt8   Reserved3;      /* 0x06 */
+    UInt8   MsgFlags;       /* 0x07 */
+    UInt8   VP_ID;          /* 0x08 */
+    UInt8   VF_ID;          /* 0x09 */
+    UInt16  Reserved4;      /* 0x0A */
+} MPRIOCFactsRequest;
+
+/* MPI2_IOC_FACTS_REPLY: 0x44 bytes (mpi2_ioc.h:335-378) */
+typedef struct {
+    UInt16  MsgVersion;                     /* 0x00 */
+    UInt8   MsgLength;                      /* 0x02 */
+    UInt8   Function;                       /* 0x03 */
+    UInt16  HeaderVersion;                  /* 0x04 */
+    UInt8   IOCNumber;                      /* 0x06 */
+    UInt8   MsgFlags;                       /* 0x07 */
+    UInt8   VP_ID;                          /* 0x08 */
+    UInt8   VF_ID;                          /* 0x09 */
+    UInt16  Reserved1;                      /* 0x0A */
+    UInt16  IOCExceptions;                  /* 0x0C */
+    UInt16  IOCStatus;                      /* 0x0E */
+    UInt32  IOCLogInfo;                     /* 0x10 */
+    UInt8   MaxChainDepth;                  /* 0x14 */
+    UInt8   WhoInit;                        /* 0x15 */
+    UInt8   NumberOfPorts;                  /* 0x16 */
+    UInt8   MaxMSIxVectors;                 /* 0x17 */
+    UInt16  RequestCredit;                  /* 0x18 */
+    UInt16  ProductID;                      /* 0x1A */
+    UInt32  IOCCapabilities;                /* 0x1C */
+    UInt32  FWVersion;                      /* 0x20 (MPI2_VERSION_UNION.Word) */
+    UInt16  IOCRequestFrameSize;            /* 0x24 */
+    UInt16  IOCMaxChainSegmentSize;         /* 0x26 */
+    UInt16  MaxInitiators;                  /* 0x28 */
+    UInt16  MaxTargets;                     /* 0x2A */
+    UInt16  MaxSasExpanders;                /* 0x2C */
+    UInt16  MaxEnclosures;                  /* 0x2E */
+    UInt16  ProtocolFlags;                  /* 0x30 */
+    UInt16  HighPriorityCredit;             /* 0x32 */
+    UInt16  MaxReplyDescriptorPostQueueDepth; /* 0x34 */
+    UInt8   ReplyFrameSize;                 /* 0x36 */
+    UInt8   MaxVolumes;                     /* 0x37 */
+    UInt16  MaxDevHandle;                   /* 0x38 */
+    UInt16  MaxPersistentEntries;           /* 0x3A */
+    UInt16  MinDevHandle;                   /* 0x3C */
+    UInt8   CurrentHostPageSize;            /* 0x3E */
+    UInt8   Reserved4;                      /* 0x3F */
+    UInt8   SGEModifierMask;                /* 0x40 */
+    UInt8   SGEModifierValue;               /* 0x41 */
+    UInt8   SGEModifierShift;               /* 0x42 */
+    UInt8   Reserved5;                      /* 0x43 */
+} MPRIOCFactsReply;
+
+#pragma pack(pop)
+
+static_assert(sizeof(MPRIOCFactsRequest) == 0x0C, "IOC Facts request layout");
+static_assert(sizeof(MPRIOCFactsReply) == 0x44, "IOC Facts reply layout");
+static_assert(offsetof(MPRIOCFactsReply, IOCStatus) == 0x0E, "IOCStatus offset");
+static_assert(offsetof(MPRIOCFactsReply, IOCCapabilities) == 0x1C, "IOCCapabilities offset");
+
+#endif /* MPR_MPI2_MIN_H */
