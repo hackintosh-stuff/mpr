@@ -326,7 +326,15 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 
 **副作用与约束**：注入生效后 `diskutil info` 的 `Protocol` 由 `SATA` 变为 `PCI`（Apple PCH 驱动把内置端口的 `Physical Interconnect` 标为 PCI），不影响读写与启动；后续定位脚本不得硬编码总线协议，只按设备名 + `Device Location` + 容量三项判定。旧的 M1-a 部署脚本仍含基于设备编号的判定，重写并复核前不得使用。回滚只需用备份恢复 `config.plist`。
 
-**暂停点：以下步骤需要新的部署/重启授权，按用户要求在此停止。**
+### 9.2 M1-a 部署（2026-11-11，待重启验证）
+
+识别问题修复后，按设备名 + `Device Location` + 容量 + ESP 分区 UUID 动态定位目标 ESP（不使用设备编号判定，显式排除 USB 安装/救援盘的 EFI）。把 `EFI/OC/Kexts/MPR.kext` 由 M0 `0.1.0` 替换为 M1-a `0.2.0`，备份 `MPR.kext.bak_m0_20261111`。`config.plist` 未改（SHA-256 仍为 `71b96d2bf1415aa8e04a0b103181055f03b042dce6b0d84e7f5dd15bb857954f`），`Kernel > Add` 的 MPR 条目保持启用；部署后 `plutil -lint`、`codesign --verify --strict` 通过，ESP 已卸载并重新只读挂载复核。
+
+部署脚本改为按三项条件定位，旧脚本中基于 `disk0` / `disk0s1` 的判定已全部移除。
+
+**待验证**：重启后 `com.ling.MPR (0.2.0)` 加载，`ioreg -r -c MPRController -l -w0` 中 `MPRStage=M1a`、`MPRBuild=0.2.0`、`MPRM1a*` / `MPRFacts*` 属性可读，并与 Debian 侧 IOC Facts / 队列几何对照；无新增 panic。
+
+**后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
 2. 进入 M1：MMIO dump、diag reset → READY、IOC Facts、队列几何、IOC Init；用 Debian 侧队列几何与固件版本作对照，必要时读 Manufacturing Page0 确认固件镜像字符串。每轮改 kext 都需要部署与重启授权，并重复 §5 的 ESP 备份 / `plutil -lint` / 唯一差异校验。
