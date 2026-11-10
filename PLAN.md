@@ -1,8 +1,8 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.3（2026-11-10；完成无硬件预核查，等待接入 SAS3008）
+状态：草案 v0.4（2026-11-10；完成无硬件预核查与路线 B 复核，等待接入 SAS3008）
 目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**当前未接入**）
-参考驱动：FreeBSD `mpr`、Linux `mpt3sas`
+参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
 
 本文件只描述计划，不含实现代码。参考源码引用以拉取到 `reference/` 的固定 commit 为准；内核侧事实来自 `C:\Users\ling\OneDrive\Documents\Agent\Hackintosh\ida\BootKernelExtensions.kc` 的 IDA 反编译/符号表（见 §4.0）。下文 `xxx.c:NNN` 形式的行号，FreeBSD 侧相对 `reference/freebsd/sys/dev/mpr/`，Linux 侧相对 `reference/linux/drivers/scsi/mpt3sas/`，SDK 侧相对 `MacKernelSDK/`。
@@ -24,7 +24,7 @@
 - IR/RAID 卷、SES 机箱管理、NVMe/PCIe enclosure、Tri-Mode、固件升级、启动盘引导。
 - Apple Silicon、dext/DriverKit、多队列高 IOPS 优化、中断合并、WarpDrive。
 - 兼容 SAS2（`mps`/`0x0072`）与 MPI26/GEN35/SEA 分支（SAS3416 等）。
-- 接入 `IOSCSIParallelInterfaceController` / macOS SCSI 应用层栈（见 §4.2 路线 B）。
+- 接入 `IOSCSIParallelInterfaceController` / macOS SCSI 应用层栈（路线 B 已复核为技术可行，但列为 M7+ 备选，见 §4.0.2、§4.2）。
 
 ### 1.3 驱动形态
 
@@ -38,10 +38,11 @@
 |---|---|
 | FreeBSD 参考 | `freebsd/freebsd-src` `main`，commit `e56090afb68b6c036d6b54c7b66d762d98bd96d0`（2026-11-10）；`sys/dev/mpr/` 13 个文件 + `mpi/` 13 个文件 |
 | Linux 参考 | `torvalds/linux` `master`，commit `b3dfbde62cf1981c4638939c159dfd087b7a72e9`（2026-11-10）；`drivers/scsi/mpt3sas/` 16 个文件 + `mpi/` 10 个文件 |
-| 合计 | 52 个文件，2,664,265 字节，逐文件按 GitHub Contents API 的 `size` 校验；固定 commit 的 `raw.githubusercontent.com` 下载 |
+| 合计（FreeBSD + Linux） | 52 个文件，2,664,265 字节，逐文件按 GitHub Contents API 的 `size` 校验；固定 commit 的 `raw.githubusercontent.com` 下载 |
 | MacKernelSDK | git 子模块 `3f750085caa17ec3a7880f11c11bf4f48cd6a164`（2026-09-23），基于 macOS 11 / Xcode 12.0 SDK，补充 `xnu-8019.80.24` 头文件 |
-| 内核缓存反编译 | `ida/BootKernelExtensions.kc` 67,600,384 B（MD5 `b9da5eafcd90e439ae7c55c1ca8ddf33`）、`BootKernelExtensions.kc.i64`、survey 缓存 `.ida-mcp-survey.json`、`ionvme-symbol-analysis.md`；KC 基址 `0xffffff8000200000`，209 个 bundle / 2396 段 / 117,470 函数（111,780 已命名）/ 136,888 字符串 |
-| 许可 | FreeBSD `mpr`：BSD-2-Clause（Yahoo!/LSI/Avago/Broadcom 版权，`mpr.c:1-12`）；Linux `mpt3sas`：GPL-2.0（`mpt3sas_base.c:10-12`） |
+| Apple OSS `IOSCSIParallelFamily` | `apple-oss-distributions/IOSCSIParallelFamily` tag `IOSCSIParallelFamily-352` / commit `560f74ab0c6f5d9aa6c99675d8e95986b202144d`（2026-04-21 推送，与 `main` HEAD 相同）；codeload tarball 261,914 B、86 个文件；落在 `reference/IOSCSIParallelFamily/`，只读参考、不参与构建 |
+| 内核缓存反编译 | `ida/BootKernelExtensions.kc` 67,600,384 B（MD5 `b9da5eafcd90e439ae7c55c1ca8ddf33`）、`BootKernelExtensions.kc.i64`、survey 缓存 `.ida-mcp-survey.json`、`ionvme-symbol-analysis.md`；KC 基址 `0xffffff8000200000`，209 个 bundle / 2396 段 / 117,470 函数（111,780 已命名）/ 136,888 字符串。离线核对脚本 `ida/kc_storage_vtable_check.py`（路线 A）、`ida/kc_spi_routeb_check.py`（路线 B） |
+| 许可 | FreeBSD `mpr`：BSD-2-Clause（Yahoo!/LSI/Avago/Broadcom 版权，`mpr.c:1-12`）；Linux `mpt3sas`：GPL-2.0（`mpt3sas_base.c:10-12`）；Apple OSS `IOSCSIParallelFamily`：APSL 2.0（`APPLE_LICENSE`） |
 | 版本控制 | `MacKernelSDK` 是子模块；`reference/` 被 `.gitignore` 的 `/reference/` 忽略，**不入库**；`ida/` 位于工作区根目录，同样不入库、不参与构建。本节的 commit 与 MD5 是唯一复现依据 |
 
 目录布局：
@@ -53,9 +54,10 @@ mpr/
   reference/                          (gitignored, 只读参考)
     freebsd/sys/dev/mpr/  + mpi/
     linux/drivers/scsi/mpt3sas/  + mpi/
+    IOSCSIParallelFamily/           (Apple OSS, APSL 2.0)
 ```
 
-复现拉取：对两个 commit 分别用 `https://api.github.com/repos/<repo>/contents/<path>?ref=<sha>` 递归列目录，再从 `https://raw.githubusercontent.com/<repo>/<sha>/<path>` 取文件；本机访问 GitHub 需走 `http://127.0.0.1:10808` 代理。不要用移动分支的 `HEAD` 作为基线。
+复现拉取：对 FreeBSD / Linux 两个 commit 分别用 `https://api.github.com/repos/<repo>/contents/<path>?ref=<sha>` 递归列目录，再从 `https://raw.githubusercontent.com/<repo>/<sha>/<path>` 取文件；Apple OSS 仓库用 `https://codeload.github.com/apple-oss-distributions/IOSCSIParallelFamily/tar.gz/560f74ab0c6f5d9aa6c99675d8e95986b202144d` 取整树。本机访问 GitHub 需走 `http://127.0.0.1:10808` 代理，HTTPS 下载按工作区约束在 MCP 控制台执行。不要用移动分支的 `HEAD` 作为基线。
 
 ---
 
@@ -111,18 +113,18 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 
 ## 4. 平台映射与架构决策
 
-### 4.0 内核缓存反编译给出的实证（v0.2 新增）
+### 4.0 内核缓存反编译给出的实证
 
 分析对象 `BootKernelExtensions.kc`（macOS 26.7.x Boot KC），IDA 会话 `5c67bd08`。`ionvme-symbol-analysis.md` 已确认 **KC 内地址即链接地址/运行时地址、无 slide**（IONVMeFamily `__text` 起 `0xffffff80026bd000` 与运行时 `kextstat` 一致）；`.ida-mcp-survey.json` 给出 209 个 bundle / 2396 段 / 117,470 函数（111,780 命名）/ 136,888 字符串。本次针对存储栈复核得到：
 
-1. **系统侧 family 确实存在，且都在 BootKC 里**（survey 段名，非推测）：`com.apple.iokit.IOStorageFamily`、`com.apple.iokit.IOPCIFamily`、`com.apple.iokit.IOSCSIArchitectureModelFamily`、`com.apple.iokit.IOSCSIParallelFamily`、`com.apple.iokit.IOSCSIBlockCommandsDevice` / `IOSCSIMultimediaCommandsDevice` / `IOSCSIReducedBlockCommandsDevice`、`com.apple.iokit.SCSITaskUserClient`、`com.apple.iokit.IOAHCIBlockStorage`、`com.apple.iokit.IONVMeFamily`、`com.apple.driver.AppleVirtIO`。KC 里还有对应的 KPI bundle 标识字符串（`0xffffff800020dcc8` 起：`...IOPCIFamily`、`...IOSCSIArchitectureModelFamily`、`...IOSCSIParallelFamily`、`...IOStorageFamily`）。**因此"目标系统没有 SCSI/存储栈"是错的**；v0.1 据此否定路线 B 的理由已修正为"工具链限制"，见 §4.2。
+1. **系统侧 family 确实存在，且都在 BootKC 里**（survey 段名，非推测）：`com.apple.iokit.IOStorageFamily`、`com.apple.iokit.IOPCIFamily`、`com.apple.iokit.IOSCSIArchitectureModelFamily`、`com.apple.iokit.IOSCSIParallelFamily`、`com.apple.iokit.IOSCSIBlockCommandsDevice` / `IOSCSIMultimediaCommandsDevice` / `IOSCSIReducedBlockCommandsDevice`、`com.apple.iokit.SCSITaskUserClient`、`com.apple.iokit.IOAHCIBlockStorage`、`com.apple.iokit.IONVMeFamily`、`com.apple.driver.AppleVirtIO`。KC 里还有对应的 KPI bundle 标识字符串（`0xffffff800020dcc8` 起：`...IOPCIFamily`、`...IOSCSIArchitectureModelFamily`、`...IOSCSIParallelFamily`、`...IOStorageFamily`）。**因此"目标系统没有 SCSI/存储栈"是错的**；路线 B 的工具链与语义可行性见 §4.0.2、§4.2。
 2. **路线 A 的 ABI 基础可实证**：`__ZTV20IOBlockStorageDevice` 在 `com.apple.iokit.IOStorageFamily:__const` @ `0xffffff8002b70450`；`IOBlockStorageDevice` 的方法实体在 `IOStorageFamily:__text`（`init`、`setProperties`、`getWriteCacheState`、`setWriteCacheState`、`doLockUnlockMedia`、`reportLockability`、`reportPollRequirements`、`requestIdle`、`doDiscard`、`doUnmap`、`doSetPriority`、`doSynchronizeCache`、`doSynchronize`、`doGetProvisionStatus`，以及 `_RESERVEDIOBlockStorageDevice4..22+` 保留槽）。本次已读出该 vtable 前 256 字节的原始槽位，可与 SDK 头的虚函数顺序逐项比对。
 3. **Apple 自己有多套 `IOBlockStorageDevice` 子类可作模板**：
    - `AppleVirtIOBlockStorageDevice`（`com.apple.driver.AppleVirtIO:__text`，`__ZTV29AppleVirtIOBlockStorageDevice` @ `0xffffff8001f0d1f0`）：实现全部 14 个纯虚（`doAsyncReadWrite`/`doEjectMedia`/`doFormatMedia`/`doGetFormatCapacities`/各 `get*String`/各 `report*`），以及 `doUnmap`、`doSynchronizeCache`、`doSetPriority`、`doLockUnlockMedia`、`reportPollRequirements`，并有自己的 `start`/`stop`/`willTerminate`/`queueEventHandler`。**这是与本项目最像的「自研 transport + 块设备 nub」模板，优先级高于 NVMe/AHCI**。
    - `IONVMeBlockStorageDevice`（`IONVMeFamily:__text`）：`start`、`GetDeviceProperties`、`doAsyncReadWrite`、`CompleteAsyncRequest`、`QueueCreate/Delete`、`QueueSubmitRequest`/`QueueCompleteRequest`、`PowerDownHandler`、`SetNVMeProperties`、`ValidateEntitlement`、`doUnmap`/`doUnmapNVMe`、`getSerialNumberString` 等。
    - `IOAHCIBlockStorageDevice`（`IOAHCIBlockStorage:__text`）、`IOHDIXHDDrive*`、`AppleXsanDevice` 等同形态。
 4. **反编译实证（`IONVMeBlockStorageDevice::doUnmap` @ `0xffffff80026d0396`）**：先 `IOService::isInactive` 检查 → `kalloc_shared_data_external(4096,1)` → `IOMemoryDescriptor::withAddress(buf,0x1000,2)` → `md->prepare()` → 由 `this+0x90` 的 controller 走 `vtable[+2216]` 取 request（GetRequestFromPool）→ 挂 MD → 构造并提交 → 完成后归还池；临界区用 `AppleNVMeWorkLoop::Lock/SleepGate/Unlock/WakeupGate` 串行化。与 `ionvme-symbol-analysis.md` §3 归纳的同步命令流程（GetRequestFromPool → ResetForNewRequest → prepare → GenerateIOVMSegments → BuildCommand → ProcessSyncNVMeRequest → complete → ReturnRequestToPool）一致。**这是 macOS 侧「命令对象 + IOMemoryDescriptor + 同步/异步完成」的可核对模板**，也是 §4.3 `MPRCommand` 设计的现实参照。
-5. **`IOSCSIParallelInterfaceController` 的实体实现确实在 `com.apple.iokit.IOSCSIParallelFamily:__text`**：`GetSCSIParallelTask`、`ExecuteParallelTask`、`CompleteAbortTask*`、`ServiceInterrupt`、`FilterInterrupt`、`EnableInterrupt`、`InitializeDeviceList`、`DestroyTargetForID` 等符号齐全。系统有实现，缺的是 **SDK 侧的伞头 / KPI 依赖声明**（§4.1）。
+5. **`IOSCSIParallelInterfaceController` 的实体实现确实在 `com.apple.iokit.IOSCSIParallelFamily:__text`**：`GetSCSIParallelTask`、`ExecuteParallelTask`、`CompleteAbortTask*`、`ServiceInterrupt`、`FilterInterrupt`、`EnableInterrupt`、`InitializeDeviceList`、`DestroyTargetForID` 等符号齐全。系统有实现；SDK 侧头文件与内核 KPI 符号集均齐备（§4.0.2、§4.1）。
 6. **`OSBundleLibraries` 的真实样例**：KC 的 prelink Info.plist 中 Apple kext 声明 `com.apple.iokit.IOPCIFamily = 1.1`、`com.apple.kpi.iokit/libkern/mach = 8.0/9.0` 等；这些是 Apple 内部 kext 的历史版本，只作为「依赖键长什么样」的参考，第三方 kext 的版本仍以现场 `kextstat`/KPI 为准。
 7. **资料边界**：`ionvme-symbol-analysis.md` §4/§5 的 Lilu `solveSymbol` / Samsung 990 EVO 结论与本项目无关且已在别处被推翻，本计划只取其 §1–§3 的寄存器/命令/反编译事实；KC 里多数符号是 names 而非 IDA 已识别函数（`lookup_funcs` 对多数 vtable 槽返回 "Not a function"，部分 `decompile` 也因此失败），故 ABI 核对以**符号表 + vtable 原始字节**为准，不依赖 IDA 的函数识别。
 
@@ -132,31 +134,52 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 
 | 核查项 | 方法 | 结论 |
 |---|---|---|
-| 目标机系统版本 | `ssh ling@192.168.50.204` → `uname -a` / `sw_vers` | `Darwin 25.6.0` / `macOS 26.7.2` / `25G332`，与 KC 分析文档一致。v0.2 中「Darwin 25.6.0 与 26.7.x 不一致」是误判，二者是同一系统 |
+| 目标机系统版本 | `ssh ling@192.168.50.204` → `uname -a` / `sw_vers` | `Darwin 25.6.0` / `macOS 26.7.2` / `25G332`，与 KC 分析文档一致；`Darwin 25.6.0` 与 26.7.x 是同一系统 |
 | family / KPI 版本 | 现场 `kextstat` | `com.apple.iokit.IOPCIFamily 2.9`、`IOStorageFamily 2.1`、`IOSCSIArchitectureModelFamily 545.100.10`、`IOSCSIBlockCommandsDevice 545.100.10`、`SCSITaskUserClient 545.100.10`；`com.apple.kpi.{iokit,libkern,mach,bsd} 25.6.0`。`OSBundleLibraries` 填的是最低要求版本，不应照抄 KC prelink plist 里的 1.1 / 8.0 / 9.0 等历史值 |
-| `IOSCSIParallelFamily` 运行时状态 | `kextstat \| grep -c IOSCSIParallelFamily` | **0，未加载**。该 family 存在于 BootKC 二进制，但本机无 SPI 硬件故不 attach；进一步说明路线 B 依赖一个运行时不加载的私有 family |
+| `IOSCSIParallelFamily` 运行时状态 | `kextstat \| grep -c IOSCSIParallelFamily` | **0，未加载**。该 family 存在于 BootKC 二进制，但本机无 SPI 硬件故不 attach；路线 B 若声明依赖，需由内核把它拉起（符号集与版本见 §4.0.2） |
 | **vtable ABI 一致性（R1 核心）** | `ida/kc_storage_vtable_check.py` 离线解析 KC fileset symtab，对 vtable 槽做 chained-fixup 解码（自检：槽 2 raw `0x40000002a6c504` → `0xffffff8002b6c504`），再与 SDK 头 29 个 `virtual` 声明逐项比对 | **完全一致**。`IOBlockStorageDevice` 自有方法从槽 268 起连续排列：`doEjectMedia`268 / `doFormatMedia`269 / `doGetFormatCapacities`270 / `doLockUnlockMedia`271 / `doSynchronizeCache`272 / `getVendorString`273 … `reportWriteProtection`284 / `getWriteCacheState`285 / `setWriteCacheState`286 / **`doAsyncReadWrite`287** / `requestIdle`288 / `doDiscard`289 / `doUnmap`290 / `doSetPriority`291 / `doSynchronize`292 / `doGetProvisionStatus`293；覆写的继承方法 `init`/`getProperty`/`setProperties` 在槽 75/87/98。槽 294–321 = `_RESERVEDIOBlockStorageDevice4..31`（28 个），与 SDK 头 `OSMetaClassDeclareReservedUnused(...,4..31)` 及 `Used(...,0..3)` 完全对应。`AppleVirtIOBlockStorageDevice` 与 `IONVMeBlockStorageDevice` 两套子类在相同槽索引覆写同名方法（268/270/277/287/290 交叉验证通过）。**结论：macOS 11 SDK 的 `IOBlockStorageDevice.h` 可用于 26.7.2 内核编译，R1 的 ABI 风险关闭** |
 | PCI 匹配键 | `MacKernelSDK/Headers/IOKit/pci/IOPCIDevice.h:324-356` | `IOPCIPrimaryMatch` 匹配 config 0x00 的 vendor+device，格式 `0x<device><vendor>`（示例 `0x00261011` = dev 0x0026 / vendor 0x1011），可带 `&mask`。SAS3008 用 `0x00971000` 正确 |
 
 > 复现：`py -3 C:\Users\ling\OneDrive\Documents\Agent\Hackintosh\ida\kc_storage_vtable_check.py`（脚本位于工作区 `ida/`，与 `reference/` 一样不入库）。系统升级后重跑该脚本即可回归 ABI。
 
+#### 4.0.2 路线 B 复核（2026-11-10，Apple OSS 源码 + BootKC）
+
+`reference/IOSCSIParallelFamily/`（§2 的固定 commit）与同一份 BootKC 交叉核对的结论：**路线 B 在工具链与语义上都可行**；§4.2 的判定据此改为「可行但不推荐作首版」，理由改为 KPI 废弃与工程复杂度，而非可行性。
+
+| 核查项 | 实证 | 结论 |
+|---|---|---|
+| SDK 侧头文件 | `MacKernelSDK/Headers/IOKit/scsi/spi/IOSCSIParallelInterfaceController.h` 存在；36 个 `virtual` 声明与 Apple OSS 头逐项同序 | 编译所需头文件齐备 |
+| KPI 符号集 | 仓库 `config/IOSCSIParallelFamily.exports` 导出 117 个符号（含 `__ZTV33IOSCSIParallelInterfaceController`、`gMetaClass`/`metaClass`/`MetaClass::alloc`、`GetSCSIParallelTask`、`ExecuteParallelTask`、`CompleteParallelTask`、`CreateTargetForID`/`DestroyTargetForID`），`config/generate-symbols-plist.sh` 写入 `__LINKINFO,__symbolsets`；KC 中该 family 的 `__LINKINFO` 内 symbolsets.plist 为 `CFBundleVersion=3.0.0` / `OSBundleCompatibleVersion=1.2.0`，**117/117 导出符号都在 KC 符号表中** | 它是正式 KPI，第三方 kext 可声明依赖并解析符号 |
+| 版本对应 | KC prelink plist：`/System/Library/Extensions/IOSCSIParallelFamily.kext`，3.0.0 / 1.2.0，`DTSDKName=macosx26.7.internal`、`DTPlatformVersion=26.7.1`、`LSMinimumSystemVersion=26.7`；依赖 `IOSCSIArchitectureModelFamily 1.0.0`、`IOPCIFamily 2.7`、KPI 9.0.0 | 源码与目标机 26.7.x 二进制同版本 |
+| 依赖声明样例 | 仓库 `TestTools/AppleSCSIHBAEmulator/Info.plist` 是继承该类的官方 kext，声明 `com.apple.iokit.IOSCSIParallelFamily = 1.2.0`；KC 内第三方 `com.promise.driver.stex (PromiseSTEX)` 同样声明 1.2.0 且 `Physical Interconnect = SAS` | 第三方应写 **1.2.0**；不要照抄 `AppleLSIFusionMPT` 的 `1.3.7` |
+| Apple 自己的 SAS 驱动 | BootKC 内 `AppleLSIFusionMPT.kext` 的 `AppleLSIFusionSAS` personality：`IONameMatch = LSILogic,sas / pci1000,50 / pci1000,56 / pci1000,58`、`Physical Interconnect = SAS`、依赖该 family | 「强制 SPI 语义与 SAS3 不匹配」不成立；但**不含 `pci1000,97`**，Apple 驱动不会匹配 SAS3008，且老 MPT 固件与 MPI2.5 命令集不同，不能靠改 Info.plist 接管 |
+| 语义裁剪 | `DoesHBASupportSCSIParallelFeature()` 可对所有 feature 返回 false（官方 emulator 即如此）；`SCSIDeviceIdentifier` 为 `UInt64`（`IOKit/scsi/SCSITask.h:56`）；`DoesHBAPerformDeviceManagement()` 返回 true 时基类不做 0..max 线性扫描，由驱动按拓扑事件自行 `CreateTargetForID()`（`IOSCSIParallelInterfaceController.cpp:359-376,1710-1784`） | 可对接 SAS3 devhandle / expander，不受 16 槽并行总线限制 |
+| vtable ABI | `__ZTV33IOSCSIParallelInterfaceController` @ `0xffffff8002ae6168`：槽 268–276 = 9 个纯虚，277–279 = `Used(1..3)` 的 `DoesHBAPerformAutoSense`/`ReportHBAConstraints`/`DoesHBASupportMultiPathing`，280–284 = `Unused(4..8)`，295–305 = `Used(9..12)`/`Unused(13..15)`；与 SDK 头、OSS 头声明一致（SDK 头多出的 `Unused(3)` 来自 `< 10.7` 的 `#else` 分支） | 路线 B 的 ABI 风险同样关闭 |
+| 废弃状态 | OSS 头 `141` 行 `__kpi_deprecated("Use IOUserSCSIParallelInterfaceController with DriverKit, instead")`；`MacKernelSDK/Headers/sys/cdefs.h:208` 将其展开为 `__deprecated_msg`（警告，非错误）；仓库含 `SCSIControllerDriverKit/` 与 `DriverKitKernelSupport/` | 26.7.2 仍可用，但长期方向是 dext，未来系统可能移除 |
+
+> 复现：`py -3 C:\Users\ling\OneDrive\Documents\Agent\Hackintosh\ida\kc_spi_routeb_check.py`（脚本位于工作区 `ida/`，不入库）。系统升级后与 `kc_storage_vtable_check.py` 一并重跑。
+
+仍未实证的环节（需授权，见 §9）：① MacKernelSDK + 当前 Xcode 能否链接该 family 符号（SDK 没有它的 KPI stub/symbolset 声明，需确认 `-undefined dynamic_lookup` 或补声明）；② 真机 `kmutil` 加载最小 kext（`OSBundleLibraries` 写 `1.2.0`），确认 BootKC 中运行时未加载的 family 被依赖拉起、符号解析成功、子类 vtable 不错位。走 B 还需自研 `SCSIParallelTask` ↔ `Mpi2SCSIIORequest_t`、devhandle ↔ UInt64 target ID、TMF 与拓扑事件映射；M1/M2 工作量不变，只省掉 M3/M4 的部分 CDB 构造。
+
 ### 4.1 MacKernelSDK 提供什么
 
-存在（`MacKernelSDK/Headers/`）：`IOKit/pci/IOPCIDevice.h`（config 读写、`findPCICapability`、BAR 映射）、`IOKit/IOBufferMemoryDescriptor.h`、`IOKit/IODMACommand.h`（`gen64IOVMSegments`、`kIODMACommandOutputLittle64`）、`IOKit/IOMemoryDescriptor.h`（`IOMemoryMap`）、`IOWorkLoop`/`IOCommandGate`/`IOInterruptEventSource`/`IOFilterInterruptEventSource`/`IOTimerEventSource`/`IOCommandPool`/`IOLocks`、libkern 集合与字节序、`IOKit/storage/IOBlockStorageDevice.h` 及 `IOStorage`/`IOMedia`/`IOBlockStorageDriver`、`IOKit/storage/IOStorageProtocolCharacteristics.h`（`Physical Interconnect = "SAS"`）、以及 `IOKit/scsi/` 下的 `SCSITask.h`、`IOSCSIProtocolInterface.h`、`IOSCSIPeripheralDeviceNub.h`、各 `SCSICmds_*.h`（CDB 定义可用）。
+存在（`MacKernelSDK/Headers/`）：`IOKit/pci/IOPCIDevice.h`（config 读写、`findPCICapability`、BAR 映射）、`IOKit/IOBufferMemoryDescriptor.h`、`IOKit/IODMACommand.h`（`gen64IOVMSegments`、`kIODMACommandOutputLittle64`）、`IOKit/IOMemoryDescriptor.h`（`IOMemoryMap`）、`IOWorkLoop`/`IOCommandGate`/`IOInterruptEventSource`/`IOFilterInterruptEventSource`/`IOTimerEventSource`/`IOCommandPool`/`IOLocks`、libkern 集合与字节序、`IOKit/storage/IOBlockStorageDevice.h` 及 `IOStorage`/`IOMedia`/`IOBlockStorageDriver`、`IOKit/storage/IOStorageProtocolCharacteristics.h`（`Physical Interconnect = "SAS"`）、以及 `IOKit/scsi/` 下的 `SCSITask.h`、`IOSCSIProtocolInterface.h`、`IOSCSIPeripheralDeviceNub.h`、各 `SCSICmds_*.h`（CDB 定义可用），还有 `IOKit/scsi/spi/IOSCSIParallelInterfaceController.h`（路线 B 基类，36 个 `virtual` 声明与 Apple OSS 头同序，见 §4.0.2）。
 
-不存在：SAS/SSP/SMP/expander 框架头、`IOSCSIParallelFamily`/`IOSCSIArchitectureModelFamily` 的伞头与 KPI 依赖声明、`IOSCSIBlockStorageDevice.h`、`SCSIControllerDriverKit`/`IOUserSCSIParallelInterfaceController`（dext 路线）、PCIDriverKit 的 `.iig` 依赖链、HBA 示例 kext、xcconfig/CI、arm64 `libkmod`、kernel collection/签名文档。SDK 中 `com.apple.iokit.IOSCSIArchitectureModelFamily` 只作为字符串常量出现（`IOKit/scsi/IOSCSIProtocolInterface.h:166`）。**注意：这里说的是「SDK 缺」，不是「系统缺」**——系统侧这些 family 的实体见 §4.0。
+`IOSCSIParallelInterfaceController` 的头文件已在 SDK 中，第三方 kext 不需要额外伞头：只需在 `Info.plist` 的 `OSBundleLibraries` 声明 `com.apple.iokit.IOSCSIParallelFamily = 1.2.0`，符号由内核 `__LINKINFO,__symbolsets` 在加载时解析。Apple OSS 仓库还提供官方 HBA 子类样例 `TestTools/AppleSCSIHBAEmulator/`（§4.0.2）。
+
+不存在：SAS/SSP/SMP/expander 框架头、`IOSCSIArchitectureModelFamily` 的伞头、`IOSCSIBlockStorageDevice.h`、PCIDriverKit 的 `.iig` 依赖链、xcconfig/CI、arm64 `libkmod`、kernel collection/签名文档。DriverKit 侧的 `SCSIControllerDriverKit`/`IOUserSCSIParallelInterfaceController` 不在 MacKernelSDK 中，只出现在 Apple OSS 仓库。SDK 中 `com.apple.iokit.IOSCSIArchitectureModelFamily` 只作为字符串常量出现（`IOKit/scsi/IOSCSIProtocolInterface.h:166`）。**注意：这里说的是「SDK 缺」，不是「系统缺」**——系统侧这些 family 的实体与 KPI 符号集见 §4.0、§4.0.2。
 
 ### 4.2 三条路线对比与决策
 
 | 路线 | 做法 | 判定 |
 |---|---|---|
 | **A（采纳）** | 自研 `IOService`（provider=`IOPCIDevice`）实现 HBA；每块盘实例化一个 `IOBlockStorageDevice` 子类 nub，`registerService` 后由系统 `IOBlockStorageDriver` 创建 `IOMedia`/`IOMediaBSDClient` | **可行，且已有实证**：BootKC 中 `IOStorageFamily` 的 `__ZTV20IOBlockStorageDevice` 与 Apple 自研子类（`AppleVirtIOBlockStorageDevice`）都在（§4.0）；只依赖 `IOBlockStorageDevice` 抽象接口与 14 个纯虚方法，耦合面最小 |
-| B | 继承 `IOKit/scsi/spi/IOSCSIParallelInterfaceController`，复用 macOS SCSI 应用层栈 | **当前工具链下不可行，系统侧可行**：BootKC 中 `IOSCSIArchitectureModelFamily`/`IOSCSIParallelFamily` 及控制器实体方法都在（§4.0 第 1、5 条），但 MacKernelSDK 没有对应伞头与 `OSBundleLibraries` 依赖声明，无法编译出能正确链接的子类；且该类强制 SPI 语义（Wide/Sync/QAS/DT 协商、16 槽并行总线），与 SAS3 点对点拓扑不匹配，私有 family 还有 ABI 风险。若日后从当前 Xcode SDK / KC 反编译补齐头与依赖，可作为 M7+ 的备选升级路线 |
+| B | 继承 `IOKit/scsi/spi/IOSCSIParallelInterfaceController`，复用 macOS SCSI 应用层栈 | **技术可行，但不作为首版**：SDK 已有该头、BootKC 有完整 KPI 符号集且 vtable ABI 一致（§4.0.2），Apple 自身 `AppleLSIFusionMPT` 与第三方 `PromiseSTEX` 都以它实现 SAS；但 KPI 已 `__kpi_deprecated` 并指向 DriverKit、依赖两个运行时未加载的私有 family、需新增 `SCSIParallelTask` ↔ MPI 映射层，而 M1/M2 工作量不变。最小 kext 链接/加载 spike 验证后列为 M7+ 备选 |
 | C | `IOService` + `IOUserClient` 诊断透传，用户态发 CDB | **只能做调试**，无法生成 `IOMedia`/`/dev/disk`，不能作为主路线；可作为 M6 的诊断通道 |
 
-决策：**A**。SDK 的 SCSI 头文件只用来取 CDB 操作码、sense、任务状态等**定义**，不作为继承体系。
+决策：**A**。SDK 的 SCSI 头文件只用来取 CDB 操作码、sense、任务状态等**定义**，不作为继承体系。路线 B 不再是「不可行」，而是「可行但维护风险与复杂度更高」：KPI 已废弃、依赖私有 family 链、系统升级可能移除，且收益只覆盖 M3/M4 的部分 CDB 工作。
 
-> M0 的 ABI 前置验证（v0.2 修正）：`com.apple.iokit.IOStorageFamily` / `IOPCIFamily` 的存在性已由 BootKC 段名、KPI 标识字符串与 `__ZTV20IOBlockStorageDevice` 实证，**不再是「是否存在」的风险**；剩余要验证的是 ① MacKernelSDK（macOS 11 / Xcode 12.0）头文件与 26.7 内核的 vtable 槽位/保留槽是否一一对应（不一致会加载即 panic），② `OSBundleLibraries` 的版本匹配。做法：读 `__ZTV20IOBlockStorageDevice` (@`0xffffff8002b70450`) 与 `__ZTV29AppleVirtIOBlockStorageDevice` (@`0xffffff8001f0d1f0`) 的原始槽位，与 SDK 头虚函数顺序逐项比对，再用最小 kext 在真机验证。
+> M0 的 ABI 前置验证：`com.apple.iokit.IOStorageFamily` / `IOPCIFamily` 的存在性，以及 MacKernelSDK（macOS 11 / Xcode 12.0）头与 26.7 内核 `IOBlockStorageDevice` vtable 槽位/保留槽的一一对应，均已由 BootKC 离线逐槽核对完成（§4.0.1）；`OSBundleLibraries` 的最低版本按现场 `kextstat` 取值，不照抄 KC prelink plist。剩余的是在真机用最小 kext 验证加载。路线 B 若启用，另有同等级的 SPI vtable 核对（§4.0.2）与最小 kext 链接/加载 spike。
 
 ### 4.3 分层设计
 
@@ -204,12 +227,12 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 3. **SGE 与 chain**：SAS3 只走 IEEE chain，`mpr_add_chain`（`mpr.c:3388-3460`）明确拒绝 SIMPLE SGL；首帧 `SGLOffset0=24`，sense buffer 用每命令预分配的低 32 位地址。
 4. **中断上下文**：filter 中只做「读描述符 / 置 `0xff` / 入队」，命令完成、TMF、nub 增删全部放到 workloop；不得在 filter 里调用 `IOCommandGate::runAction` 或任何可能睡眠的锁。
 5. **SMID 与 completion 绑定**：`MPRCommand` 池与 SMID 一一对应，完成回调必须能由 SMID 反查 `IOStorageCompletion`；超时后 SMID 不能回收，直到 TMF 完成，避免固件写已复用帧。
-6. **块设备契约与 ABI**：实现 `IOBlockStorageDevice.h` 的 14 个纯虚（`doAsyncReadWrite`、`reportBlockSize/MaxValidBlock/MediaState`、vendor/product/revision 等）；`doUnmap`/`doSynchronize` 有默认实现但需按 CDB 覆写；通过 `IOBlockStorageDriver` 生成 `IOMedia`（`IOBlockStorageDriver.h:1242-1397`）。**26.7 内核的实体里还有 `doDiscard`、`doSynchronizeCache`、`doSynchronize`、`doSetPriority`、`doGetProvisionStatus` 与 `_RESERVEDIOBlockStorageDevice4..22+`（§4.0 第 2 条），SDK 头把它们标为 deprecated/保留，不能按 SDK 的 `= 0` 数量推断 vtable；M0 必须先做 vtable 核对（§4.2 引用块），`AppleVirtIOBlockStorageDevice` 是最直接的实现模板。**
+6. **块设备契约与 ABI**：实现 `IOBlockStorageDevice.h` 的 14 个纯虚（`doAsyncReadWrite`、`reportBlockSize/MaxValidBlock/MediaState`、vendor/product/revision 等）；`doUnmap`/`doSynchronize` 有默认实现但需按 CDB 覆写；通过 `IOBlockStorageDriver` 生成 `IOMedia`（`IOBlockStorageDriver.h:1242-1397`）。**26.7 内核的实体里还有 `doDiscard`、`doSynchronizeCache`、`doSynchronize`、`doSetPriority`、`doGetProvisionStatus` 与 `_RESERVEDIOBlockStorageDevice4..22+`（§4.0 第 2 条），SDK 头把它们标为 deprecated/保留，不能按 SDK 的 `= 0` 数量推断 vtable；vtable 核对已按 §4.0.1 完成，`AppleVirtIOBlockStorageDevice` 是最直接的实现模板。**
 7. **最小 CDB 集**：INQUIRY、READ CAPACITY(16)、READ(10/16)、WRITE(10/16)、SYNCHRONIZE CACHE(10/16)、UNMAP、REQUEST SENSE、REPORT LUNS、START STOP UNIT、MODE SENSE；定义取 `MacKernelSDK/Headers/IOKit/scsi/SCSICmds_*.h`。
 8. **固件事件**：首版只处理 `SAS_TOPOLOGY_CHANGE_LIST`、`SAS_DISCOVERY`、`SAS_DEVICE_DISCOVERY_ERROR`、`SAS_DEVICE_STATUS_CHANGE`，其余忽略并记录；拓扑稳定后再 `registerService`，避免盘符抖动。
 9. **电源与复位**：`mpr_reinit`（`mpr.c:837-924`）的「mask irq → diag reset → PCI 配置恢复 → 重新 IOC Facts → 重新注册事件 → 释放冻结命令」需 1:1 重建；watchdog 用 1 s doorbell 检查（`mpr.c:2256`）。
 10. **文件行尾与部署**：所有上传到 macOS 的 `.plist`/`.sh`/`.py`/源码必须是 LF（`.gitattributes` 已声明 `* text=auto eol=lf`；CRLF 的 `Info.plist` 会让 kext 被静默丢弃）。kext 走 `kmutil`/AuxiliaryKernelExtensions.kc 与现有 OpenCore 流程，可复用同工作区 `drivers_src/NvmeHook` 的部署验证经验；本驱动是 PCI 驱动，不依赖 Lilu。目标机串口调试默认关闭（`debug=0x100`、无 `serial=5`），长期开启 `kprintf` 会显著拖慢系统，仅在抓日志时临时开启。
-11. **内核缓存反编译的使用边界**：`ida/` 下的 `.kc`/`.i64` 只用于核对类/vtable/符号/依赖键等 ABI 事实，是把 macOS 11 SDK 头「校准」到 26.7 内核的手段；不复制 Apple 代码，也不把 KC 地址、vtable 偏移或内部符号写进驱动（会随系统升级失效）。系统升级后重取 KC 并重做 §4.2 的核对。
+11. **内核缓存反编译的使用边界**：`ida/` 下的 `.kc`/`.i64` 只用于核对类/vtable/符号/依赖键等 ABI 事实，是把 macOS 11 SDK 头「校准」到 26.7 内核的手段；不复制 Apple 代码，也不把 KC 地址、vtable 偏移或内部符号写进驱动（会随系统升级失效）。系统升级后重取 KC，并重跑 §4.0.1 / §4.0.2 的两个离线核对脚本。
 
 ---
 
@@ -224,7 +247,7 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 | **M4 读写与恢复** | WRITE(10/16)、SYNCHRONIZE CACHE、UNMAP、auto sense、超时与 TMF（ABORT/LUN RESET/TARGET RESET）、diag reset 恢复 | `dd` 写后回读校验；`diskutil` 分区/卸载；人为拔盘或超时注入后驱动能恢复；TRIM/UNMAP 对已知敏感固件先做小范围验证 | 24 h 混合读写无挂起；复位后盘能重新出现 |
 | **M5 拓扑与热插拔** | topology change 事件、expander 下多盘、设备移除/新增、重启后 persistent 映射语义（可退化为每次重新发现） | 热插拔 10 轮，`diskutil list` 与 IORegistry 目标表一致；无幽灵盘 | 多盘并发 IO 下拓扑变化不丢命令 |
 | **M6 加固/诊断（可选）** | watchdog、IORegistry 统计、`IOUserClient` 诊断工具、性能基线、日志开关 | 工具可导出 config page / 事件日志 / 寄存器；性能与 FreeBSD/Linux 同机对比 | 可定位 90% 现场问题而无需串口 |
-| **M7 后续（不在首版）** | IR 卷、SES、固件升级、多队列/MSI-X 亲和、中断合并、启动盘、签名与发布；**或**在补齐 SCSI family 头与 KPI 依赖后评估路线 B | 单独立项 | — |
+| **M7 后续（不在首版）** | IR 卷、SES、固件升级、多队列/MSI-X 亲和、中断合并、启动盘、签名与发布；**或**路线 B 的最小 kext 链接/加载 spike 与 `SCSIParallelTask` ↔ MPI 适配评估（头与 KPI 依赖已实证齐备，§4.0.2）；dext 方向单独立项 | 单独立项 | — |
 
 每个阶段开始前先写该阶段的失败判据与回滚方式（kext 只放测试机、保留可启动的干净 EFI 配置）。**禁止在带有重要数据的磁盘上做写测试。**
 
@@ -237,6 +260,7 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 3. MPI 结构体定义以 FreeBSD `mpi/*.h` 为唯一代码来源；两份 `mpi2*.h` 的差异（Linux 版含 `mpi2_image.h`、字段更新）在 `MPI/` 目录下用注释记录，不混用。
 4. `MacKernelSDK` 头文件仅用于编译，遵循其自身许可；不把 SDK 头文件拷进驱动源码树。
 5. `ida/BootKernelExtensions.kc` 与 IDA 数据库属于 Apple 内核二进制的反编译资料，只用于核对 ABI / 接口契约与事实记录；不复制其代码、不把 KC 地址固化进驱动。`ionvme-symbol-analysis.md` 的 §4/§5（Lilu 符号 hook / Samsung 990 EVO）与本项目无关，不予采用。
+6. `reference/IOSCSIParallelFamily/` 为 Apple OSS 源码，许可 **APSL 2.0**（不同于 FreeBSD BSD-2-Clause 与 Linux GPL-2.0）；只作头文件、ABI、依赖键与行为参考，不复制实现代码进驱动源码。若将来需要引用其中常量或结构定义，按 APSL 要求保留版权与许可声明，并在 `NOTICE`/`LICENSE` 中单列来源与 commit。
 
 ---
 
@@ -256,7 +280,8 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 | R10 | 启动盘与系统卷依赖 | 盘符/启动顺序变化 | 首版不做启动盘；测试机保留内部 SATA 系统盘 |
 | R11 | UNMAP/TRIM 触发某些 SSD 固件缺陷 | 掉盘 | 已有同工作区 Optane TRIM 掉盘经验，默认先禁用 UNMAP，验证设备后再开 |
 | R12 | 单中断向量性能上限 | 吞吐低 | 首版接受；M7 再按 Linux `mpt3sas_base.c:3212-3501` 做多队列 |
-| R13 | 系统升级后内核缓存与目标机版本漂移 | 按旧 vtable/符号做的设计在新内核上失效 | 现场已确认目标机 = 26.7.2 / 25G332 / Darwin 25.6.0，与 KC 分析文档一致；KC 内 26.7.1 / 25G325 只是部分 kext 的构建批次。系统升级后重取 BootKC 并重跑 §4.0.1 的脚本；不把 KC 地址写进代码 |
+| R13 | 系统升级后内核缓存与目标机版本漂移 | 按旧 vtable/符号做的设计在新内核上失效 | 现场已确认目标机 = 26.7.2 / 25G332 / Darwin 25.6.0，与 KC 分析文档一致；KC 内 26.7.1 / 25G325 只是部分 kext 的构建批次。系统升级后重取 BootKC 并重跑 §4.0.1 / §4.0.2 的脚本；不把 KC 地址写进代码 |
+| R14 | 路线 B 依赖的 `IOSCSIParallelFamily` KPI 已 `__kpi_deprecated`，Apple 引导迁移到 DriverKit，未来系统可能移除或改 ABI | 若改走 B，新系统上可能无法加载，维护成本高于路线 A | 首版不走 B；若启用，先做最小 kext 链接/加载 spike，锁定机型与系统版本，每次升级重跑 §4.0.2 的符号集与 vtable 回归；dext 方向单独立项 |
 
 需要用户决策的未决项：
 
@@ -266,24 +291,27 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 4. 测试盘是否允许破坏性写入？是否需要只读验收阶段（M3）作为硬门槛？
 5. 诊断用户态工具是放在本仓库，还是借用现有工具链？
 6. 是否需要签名/发布级打包，还是仅测试机开发签名？
-7. 目标机是否锁定 26.7.2 / 25G332？（现场已确认；升级会触发 §4.0.1 的 ABI 回归）
+7. 目标机是否锁定 26.7.2 / 25G332？（现场已确认；升级会触发 §4.0.1 / §4.0.2 的 ABI 回归）
+8. 是否在 M7 用最小 kext spike 评估路线 B，或改走 DriverKit/dext 单独立项？（当前按「都不做」计划）
 
 ---
 
 ## 9. 当前进度与暂停点（2026-11-10）
 
-**已完成（不依赖 SAS3008）**，详见 §4.0.1：
+**已完成（不依赖 SAS3008）**，详见 §4.0.1、§4.0.2：
 
 1. 现场确认目标机系统版本、已加载 family / KPI 版本，以及 `IOSCSIParallelFamily` 运行时未加载。
 2. 用 `ida/kc_storage_vtable_check.py` 完成 `IOBlockStorageDevice` vtable 与 MacKernelSDK 头的逐槽 ABI 核对（方法槽 268–293、保留槽 294–321、两套 Apple 子类交叉验证），**R1 已关闭**。
 3. 确认 `IOPCIPrimaryMatch` 格式与 `0x00971000` 写法；确认 `OSBundleLibraries` 不应照抄 KC prelink plist 的历史版本。
 4. 复核 FreeBSD / Linux 参考源码基线、许可与 MPI 可复用清单（§2、§3、§7）。
+5. 拉取 Apple OSS `IOSCSIParallelFamily` 到 `reference/`（§2 固定 commit），完成路线 B 静态复核（§4.0.2）：KPI 符号集、版本对应、官方/第三方 SAS 依赖先例、SPI vtable 逐槽核对；**路线 B 改判为「技术可行但不推荐作首版」**，其 KPI 废弃风险记为 R14。
 
-**暂停点：以下步骤都需要 SAS3008 实际接入，按用户要求在此停止；未执行任何部署、重启或写盘操作。**
+**暂停点：以下步骤都需要 SAS3008 实际接入或用户授权 kext 部署/重启，按用户要求在此停止；未执行任何部署、重启或写盘操作。**
 
 1. 在目标机上确认 SAS3008 的 PCI 配置空间、BAR、固件 IT/IR 模式，验证 `IOPCIPrimaryMatch=0x00971000` 命中（`ioreg`、`system_profiler SPPCIDataType`）；不要沿用历史设备号。
 2. 建立 kext Xcode 工程与 `Info.plist`（`IOProviderClass=IOPCIDevice`、`IOPCIPrimaryMatch=0x00971000`、`OSBundleLibraries` 按 §4.0.1 的现场版本取最低要求值），上传前确认 LF；写空壳 `MPRController::probe/start`（`setMemoryEnable`/`setBusMasterEnable` + BAR 映射 + 寄存器 dump）并在真机验证加载。
 3. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
 4. 进入 M1：MMIO dump、diag reset → READY、IOC Facts、队列几何、IOC Init。
+5. （仅当决定评估路线 B，不需要 SAS3008）用 MacKernelSDK 编译并真机加载最小 `IOSCSIParallelInterfaceController` 子类 kext，`OSBundleLibraries` 写 `com.apple.iokit.IOSCSIParallelFamily = 1.2.0`，验证 KPI 符号解析、family 被依赖拉起与子类 vtable 不错位；仍需要 kext 部署/重启授权。
 
 **恢复条件**：SAS3008 已插入并确认目标机可正常启动；用户授权 kext 部署及必要的重启。在此之前不再推进。
