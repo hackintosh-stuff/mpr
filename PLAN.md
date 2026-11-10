@@ -332,7 +332,11 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 
 部署脚本改为按三项条件定位，旧脚本中基于 `disk0` / `disk0s1` 的判定已全部移除。
 
-**待验证**：重启后 `com.ling.MPR (0.2.0)` 加载，`ioreg -r -c MPRController -l -w0` 中 `MPRStage=M1a`、`MPRBuild=0.2.0`、`MPRM1a*` / `MPRFacts*` 属性可读，并与 Debian 侧 IOC Facts / 队列几何对照；无新增 panic。
+**已验证（2026-11-11 重启后）**：`com.ling.MPR (0.2.0)` 加载；`MPRStage=M1a`、`MPRBuild=0.2.0`、`MPRM1aState=ok`、`MPRM1aReachedReady=Yes`、`MPRM1aFactsStatus=0`、`MPRFactsIOCStatus=0`。IOC 状态由 `MPRM1aInitialState=0x20000000`（OPERATIONAL）经 diag reset / doorbell 握手落到 `MPRM1aFinalState=0x10000000`（READY），`MPRM1aFactsFunction=3` 表示 IOC Facts 握手成功。无新增 panic，系统盘仍为 `internal, physical`。
+
+IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x09000000`（`09.00.00.00`）、MPI `0x205`（2.5）、MSI-X 上限 `96`、最大 chain 深度 `128`、请求 credit `3072`、request/reply frame `32` dwords（= 128 B）、端口数 `1`、最大 devhandle `323`。`MPRFactsIOCCapabilities=0x6985c`，其中 IR 能力位需按 MPI2 定义逐位核对后再与 Debian 的 `Capabilities=(Raid)` 结论并档。以上确认 M1-a 的寄存器访问、diag reset、READY 迁移与同步 doorbell 传输链路在本机可用。
+
+**M1 尚未完成**：DMA 队列、IOC Init、中断、config page、拓扑发现与目标表均未实现；按后续里程碑推进。
 
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
