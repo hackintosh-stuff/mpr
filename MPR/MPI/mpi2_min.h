@@ -270,4 +270,108 @@ static_assert(offsetof(MPRIOCInitRequest, ReplyDescriptorPostQueueAddress) == 0x
 static_assert(offsetof(MPRIOCInitRequest, ReplyFreeQueueAddress) == 0x38,
               "reply free queue offset");
 
+/* ---------------------------------------------------------------------- */
+/* M1-c: config page request/response over the request/reply queues.       */
+
+/* Reply descriptor flags (mpi2.h:546-557) */
+#define MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK      0x0F
+#define MPI2_RPY_DESCRIPT_FLAGS_ADDRESS_REPLY  0x01
+#define MPI2_RPY_DESCRIPT_FLAGS_UNUSED         0x0F
+
+/* Request descriptor default type (mpi2.h:421) */
+#define MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE   0x08
+
+/* Config action / page type (mpi2_cnfg.h:336-343, :506-513) */
+#define MPI2_CONFIG_ACTION_PAGE_HEADER         0x00
+#define MPI2_CONFIG_ACTION_PAGE_READ_CURRENT   0x01
+#define MPI2_CONFIG_PAGETYPE_MANUFACTURING     0x09
+#define MPI2_MANUFACTURING0_PAGEVERSION        0x00
+
+/* Simple SGE flags (mpi2.h:1068-1078, :1084, :1103) */
+#define MPI2_SGE_FLAGS_LAST_ELEMENT            0x80
+#define MPI2_SGE_FLAGS_END_OF_BUFFER           0x40
+#define MPI2_SGE_FLAGS_SIMPLE_ELEMENT          0x10
+#define MPI2_SGE_FLAGS_64_BIT_ADDRESSING       0x02
+#define MPI2_SGE_FLAGS_SHIFT                   24
+#define MPI2_SGE_LENGTH_MASK                   0x00FFFFFF
+
+#pragma pack(push, 1)
+
+/* MPI2_DEFAULT_REQUEST_DESCRIPTOR: 8 bytes (mpi2.h:404-413) */
+typedef struct {
+    UInt8   RequestFlags;               /* 0x00 */
+    UInt8   MSIxIndex;                  /* 0x01 */
+    UInt16  SMID;                       /* 0x02 */
+    UInt16  LMID;                       /* 0x04 */
+    UInt16  DescriptorTypeDependent;    /* 0x06 */
+} MPRDefaultRequestDescriptor;
+
+/* MPI2_CONFIG_PAGE_HEADER: 4 bytes (mpi2_cnfg.h:288-295) */
+typedef struct {
+    UInt8   PageVersion;    /* 0x00 */
+    UInt8   PageLength;     /* 0x01 */
+    UInt8   PageNumber;     /* 0x02 */
+    UInt8   PageType;       /* 0x03 */
+} MPRConfigPageHeader;
+
+/* MPI2_CONFIG_REQUEST: 0x28 bytes (mpi2_cnfg.h:483-503) */
+typedef struct {
+    UInt8   Action;                 /* 0x00 */
+    UInt8   SGLFlags;               /* 0x01 */
+    UInt8   ChainOffset;            /* 0x02 */
+    UInt8   Function;               /* 0x03 */
+    UInt16  ExtPageLength;          /* 0x04 */
+    UInt8   ExtPageType;            /* 0x06 */
+    UInt8   MsgFlags;               /* 0x07 */
+    UInt8   VP_ID;                  /* 0x08 */
+    UInt8   VF_ID;                  /* 0x09 */
+    UInt16  Reserved1;              /* 0x0A */
+    UInt8   Reserved2;              /* 0x0C */
+    UInt8   ProxyVF_ID;             /* 0x0D */
+    UInt16  Reserved4;              /* 0x0E */
+    UInt32  Reserved3;              /* 0x10 */
+    MPRConfigPageHeader Header;     /* 0x14 */
+    UInt32  PageAddress;            /* 0x18 */
+    UInt32  SgeFlagsLength;         /* 0x1C */
+    UInt64  SgeAddress;             /* 0x20 */
+} MPRConfigRequest;
+
+/* MPI2_CONFIG_REPLY: 0x18 bytes (mpi2_cnfg.h:518-535) */
+typedef struct {
+    UInt8   Action;                 /* 0x00 */
+    UInt8   SGLFlags;               /* 0x01 */
+    UInt8   MsgLength;              /* 0x02 */
+    UInt8   Function;               /* 0x03 */
+    UInt16  ExtPageLength;          /* 0x04 */
+    UInt8   ExtPageType;            /* 0x06 */
+    UInt8   MsgFlags;               /* 0x07 */
+    UInt8   VP_ID;                  /* 0x08 */
+    UInt8   VF_ID;                  /* 0x09 */
+    UInt16  Reserved1;              /* 0x0A */
+    UInt16  Reserved2;              /* 0x0C */
+    UInt16  IOCStatus;              /* 0x0E */
+    UInt32  IOCLogInfo;             /* 0x10 */
+    MPRConfigPageHeader Header;     /* 0x14 */
+} MPRConfigReply;
+
+/* MPI2_CONFIG_PAGE_MAN_0: 0x4C bytes (mpi2_cnfg.h:615-625) */
+typedef struct {
+    MPRConfigPageHeader Header;             /* 0x00 */
+    UInt8   ChipName[16];                   /* 0x04 */
+    UInt8   ChipRevision[8];                /* 0x14 */
+    UInt8   BoardName[16];                  /* 0x1C */
+    UInt8   BoardAssembly[16];              /* 0x2C */
+    UInt8   BoardTracerNumber[16];          /* 0x3C */
+} MPRConfigPageMan0;
+
+#pragma pack(pop)
+
+static_assert(sizeof(MPRDefaultRequestDescriptor) == 0x08, "request descriptor layout");
+static_assert(sizeof(MPRConfigPageHeader) == 0x04, "config page header layout");
+static_assert(sizeof(MPRConfigRequest) == 0x28, "config request layout");
+static_assert(sizeof(MPRConfigReply) == 0x18, "config reply layout");
+static_assert(sizeof(MPRConfigPageMan0) == 0x4C, "manufacturing page 0 layout");
+static_assert(offsetof(MPRConfigRequest, SgeFlagsLength) == 0x1C, "config SGE offset");
+static_assert(offsetof(MPRConfigPageMan0, ChipName) == 0x04, "ChipName offset");
+
 #endif /* MPR_MPI2_MIN_H */

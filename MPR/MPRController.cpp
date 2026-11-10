@@ -33,6 +33,10 @@ OSDefineMetaClassAndStructors(MPRController, IOService)
 #define MPR_M1B_STATE_TRIES     1000
 #define MPR_DMA_LOW_MASK        0x00000000FFFFFFFFULL
 
+/* M1-c polls the reply queue instead of taking interrupts. */
+#define MPR_M1C_TRIES           2000
+#define MPR_M1C_PAGE_BYTES      128
+
 struct MPRRegisterInfo
 {
     const char *name;
@@ -680,6 +684,182 @@ MPRController::runM1b(void)
     return true;
 }
 
+/* ------------------------------------------------------------------------ */
+/* M1-c: one synchronous config request (Manufacturing Page0) submitted      */
+/* through the request queue and completed by polling the reply queue.       */
+
+static void
+mprCopyField(char *dst, const UInt8 *src, UInt32 length)
+{
+    UInt32 i = length;
+
+    memcpy(dst, src, length);
+    dst[length] = '\0';
+    while (i > 0 && (dst[i - 1] == ' ' || dst[i - 1] == '\0')) {
+        dst[--i] = '\0';
+    }
+}
+
+bool
+MPRController::readManufacturingPage0(void)
+{
+    IOByteCount segLength;
+    UInt8      *frame;
+    UInt8      *queue;
+    UInt8      *post;
+    UInt8      *replyBase;
+    MPRDefaultRequestDescriptor *desc;
+    MPRConfigRequest *config;
+    MPRConfigReply   *reply = NULL;
+    MPRConfigPageMan0 *page;
+    UInt32 tries, value32;
+    UInt32 replyBytes, baddr;
+    UInt64 entry, clear;
+    UInt8  flags;
+    bool   ok = false;
+
+    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        MPR_M1C_PAGE_BYTES, MPR_DMA_LOW_MASK);
+    if (fPageBuffer == NULL) {
+        setProperty("MPRM1cFailure", "page buffer allocation failed");
+        return false;
+    }
+    fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+    if (fPagePhys == 0 || segLength < MPR_M1C_PAGE_BYTES ||
+        (fPagePhys + MPR_M1C_PAGE_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
+        setProperty("MPRM1cFailure", "page buffer is not low-4GB contiguous");
+        return false;
+    }
+    memset(fPageBuffer->getBytesNoCopy(), 0, MPR_M1C_PAGE_BYTES);
+
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        setProperty("MPRM1cFailure", "request frame unavailable");
+        return false;
+    }
+
+    memset(frame, 0, fRequestFrameSize);
+    desc = (MPRDefaultRequestDescriptor *)frame;
+    config = (MPRConfigRequest *)(frame + sizeof(MPRDefaultRequestDescriptor));
+
+    desc->RequestFlags = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE;
+    desc->MSIxIndex = 0;
+    desc->SMID = 0;
+
+    config->Function = MPI2_FUNCTION_CONFIG;
+    config->Action = MPI2_CONFIG_ACTION_PAGE_READ_CURRENT;
+    config->Header.PageType = MPI2_CONFIG_PAGETYPE_MANUFACTURING;
+    config->Header.PageNumber = 0;
+    config->Header.PageVersion = MPI2_MANUFACTURING0_PAGEVERSION;
+    config->Header.PageLength = 0;
+    config->PageAddress = 0;
+    config->SgeFlagsLength =
+        ((UInt32)(MPI2_SGE_FLAGS_SIMPLE_ELEMENT | MPI2_SGE_FLAGS_LAST_ELEMENT |
+                  MPI2_SGE_FLAGS_END_OF_BUFFER | MPI2_SGE_FLAGS_64_BIT_ADDRESSING)
+         << MPI2_SGE_FLAGS_SHIFT) |
+        (MPR_M1C_PAGE_BYTES & MPI2_SGE_LENGTH_MASK);
+    config->SgeAddress = fPagePhys;
+
+    /* Post request frame 0 (SMID 0) through the 0xC0/0xC4 register pair. */
+    memcpy(&value32, frame, sizeof(value32));
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
+    memcpy(&value32, frame + 4, sizeof(value32));
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, value32);
+
+    queue = (UInt8 *)fQueueBuffer->getBytesNoCopy();
+    replyBase = (UInt8 *)fReplyBuffer->getBytesNoCopy();
+    post = queue + fFqDepth * 4;
+    replyBytes = fReplyFrameSize * fFqDepth;
+
+    for (tries = 0; tries < MPR_M1C_TRIES && !ok; tries++) {
+        memcpy(&entry, post + fReplyPostIndex * 8, sizeof(entry));
+        flags = (UInt8)(entry & MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK);
+        if (flags == MPI2_RPY_DESCRIPT_FLAGS_UNUSED ||
+            ((entry >> 32) & 0xFFFFFFFFULL) == 0xFFFFFFFFULL) {
+            IODelay(1000);
+            continue;
+        }
+
+        baddr = (UInt32)(entry >> 32);
+        clear = 0xFFFFFFFFFFFFFFFFULL;
+        memcpy(post + fReplyPostIndex * 8, &clear, sizeof(clear));
+        fReplyPostIndex = (fReplyPostIndex + 1) % fPqDepth;
+        writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, fReplyPostIndex);
+
+        if (flags == MPI2_RPY_DESCRIPT_FLAGS_ADDRESS_REPLY &&
+            baddr >= (UInt32)fReplyPhys &&
+            baddr < (UInt32)fReplyPhys + replyBytes) {
+            reply = (MPRConfigReply *)(replyBase + (baddr - (UInt32)fReplyPhys));
+            ok = true;
+        }
+    }
+
+    if (!ok || reply == NULL) {
+        setProperty("MPRM1cFailure", "no reply descriptor received");
+        return false;
+    }
+
+    setProperty("MPRConfigIOCStatus",
+                (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+    setProperty("MPRConfigIOCLogInfo", (unsigned long long)reply->IOCLogInfo, 32);
+    setProperty("MPRConfigPageType", (unsigned long long)reply->Header.PageType, 8);
+    setProperty("MPRConfigPageNumber", (unsigned long long)reply->Header.PageNumber, 8);
+    setProperty("MPRConfigPageLength", (unsigned long long)reply->Header.PageLength, 8);
+
+    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
+        setProperty("MPRM1cFailure", "config request failed");
+        return false;
+    }
+    if (reply->Header.PageType != MPI2_CONFIG_PAGETYPE_MANUFACTURING ||
+        reply->Header.PageNumber != 0) {
+        setProperty("MPRM1cFailure", "unexpected config page");
+        return false;
+    }
+
+    page = (MPRConfigPageMan0 *)fPageBuffer->getBytesNoCopy();
+    if (page == NULL) {
+        setProperty("MPRM1cFailure", "page buffer has no virtual address");
+        return false;
+    }
+
+    {
+        char chip[17], revision[9], board[17], assembly[17], tracer[17];
+
+        mprCopyField(chip, page->ChipName, sizeof(page->ChipName));
+        mprCopyField(revision, page->ChipRevision, sizeof(page->ChipRevision));
+        mprCopyField(board, page->BoardName, sizeof(page->BoardName));
+        mprCopyField(assembly, page->BoardAssembly, sizeof(page->BoardAssembly));
+        mprCopyField(tracer, page->BoardTracerNumber, sizeof(page->BoardTracerNumber));
+
+        setProperty("MPRManPage0ChipName", chip);
+        setProperty("MPRManPage0ChipRevision", revision);
+        setProperty("MPRManPage0BoardName", board);
+        setProperty("MPRManPage0BoardAssembly", assembly);
+        setProperty("MPRManPage0BoardTracerNumber", tracer);
+        IOLog("MPR M1c: ManPage0 chip=%s rev=%s board=%s\n", chip, revision, board);
+    }
+
+    return true;
+}
+
+bool
+MPRController::runM1c(void)
+{
+    bool ok;
+
+    fReplyPostIndex = 0;
+    ok = readManufacturingPage0();
+
+    if (fPageBuffer != NULL) {
+        fPageBuffer->release();
+        fPageBuffer = NULL;
+    }
+    fPagePhys = 0;
+    setProperty("MPRM1cState", ok ? "ok" : "failed");
+    return ok;
+}
+
 bool
 MPRController::start(IOService *provider)
 {
@@ -689,6 +869,20 @@ MPRController::start(IOService *provider)
     if (!super::start(provider)) {
         return false;
     }
+
+    /* OSObject instances are not guaranteed zero-filled; every member used by
+     * M1-a/M1-b/M1-c is initialized here so a failure cannot read garbage. */
+    fMMIO = NULL;
+    fRegs = NULL;
+    fQueueBuffer = NULL;
+    fReplyBuffer = NULL;
+    fRequestBuffer = NULL;
+    fPageBuffer = NULL;
+    fFreePhys = fPostPhys = fReplyPhys = fRequestPhys = fPagePhys = 0;
+    fFqDepth = fPqDepth = fRequestCount = fReplyFreeIndex = 0;
+    fRequestFrameSize = fReplyFrameSize = fRequestCredit = fMaxReplyDepth = 0;
+    fReplyPostIndex = 0;
+    fFactsValid = false;
 
     pci = OSDynamicCast(IOPCIDevice, provider);
     if (pci == NULL) {
@@ -716,25 +910,29 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M1b");
-    setProperty("MPRBuild", "0.3.0");
+    setProperty("MPRStage", "M1c");
+    setProperty("MPRBuild", "0.4.0");
 
-    /* Failures inside M1-a/M1-b are recorded in IORegistry and never panic the
-     * machine or prevent the kext from loading. M1-b issues IOC Init only:
-     * no interrupts, no config pages and no I/O requests. */
-    if (runM1a()) {
-        runM1b();
+    /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
+     * panic the machine or prevent the kext from loading. M1-c reads one
+     * config page through the queues and still takes no interrupts. */
+    if (runM1a() && runM1b()) {
+        runM1c();
     } else {
-        setProperty("MPRM1bState", "skipped-m1a-failed");
+        setProperty("MPRM1cState", "skipped-earlier-stage-failed");
     }
 
-    IOLog("MPR M1b: start complete\n");
+    IOLog("MPR M1c: start complete\n");
     return true;
 }
 
 void
 MPRController::stop(IOService *provider)
 {
+    if (fPageBuffer != NULL) {
+        fPageBuffer->release();
+        fPageBuffer = NULL;
+    }
     freeQueueMemory();
     if (fMMIO != NULL) {
         fMMIO->release();

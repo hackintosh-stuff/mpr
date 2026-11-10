@@ -35,6 +35,11 @@ private:
     UInt32           fMaxReplyDepth;
     bool             fFactsValid;
 
+    /* M1-c: config page data buffer and reply consumption index. */
+    IOBufferMemoryDescriptor *fPageBuffer;
+    UInt64           fPagePhys;
+    UInt32           fReplyPostIndex;
+
     UInt32 readReg(UInt32 offset);
     void   writeReg(UInt32 offset, UInt32 value);
 
@@ -52,6 +57,9 @@ private:
     void   freeQueueMemory(void);
     bool   sendIOCInit(void);
     bool   runM1b(void);
+
+    bool   readManufacturingPage0(void);
+    bool   runM1c(void);
 
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
