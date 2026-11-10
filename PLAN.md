@@ -1,7 +1,7 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.4（2026-11-10；完成无硬件预核查与路线 B 复核，等待接入 SAS3008）
-目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**当前未接入**）
+状态：草案 v0.5（2026-11-11；SAS3008 已接入，M0 空壳 kext 完成 ESP 部署与真机加载验证，未接测试盘）
+目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**已接入；未接测试盘**）
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
 
@@ -240,7 +240,7 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 
 | 阶段 | 目标与交付 | 验收方式 | 退出条件 |
 |---|---|---|---|
-| **M0 环境** | 确认目标机 SAS3008 的 PCI ID/固件模式/BAR；Xcode 工程接入 MacKernelSDK（`KERNEL_EXTENSION_HEADER_SEARCH_PATHS`、`KERNEL_FRAMEWORK_HEADERS`）；最小 kext 能加载并匹配；**用 KC 的 `__ZTV20IOBlockStorageDevice` / `__ZTV29AppleVirtIOBlockStorageDevice` 核对 SDK 头 vtable 槽位与保留槽，并确定 `OSBundleLibraries` 版本**（§4.2）。**其中 vtable / KPI / 系统版本 / PCI 匹配键核查已于 2026-11-10 无硬件完成，见 §4.0.1；剩余 PCI 探测与最小 kext 加载需接入 SAS3008** | `ioreg -l -p IODeviceTree`、`kmutil showloaded`、`kextstat`、`log show --predicate 'process == "kernel"'`；最小 kext 的 `start` 成功打印；产出 vtable 逐槽比对表 | 空 kext 稳定加载/卸载，PCI 匹配字典命中；vtable 与 SDK 头一致（已核实），KPI 版本结论明确 |
+| **M0 环境** | 确认目标机 SAS3008 的 PCI ID/固件模式/BAR；Xcode 工程接入 MacKernelSDK（`KERNEL_EXTENSION_HEADER_SEARCH_PATHS`、`KERNEL_FRAMEWORK_HEADERS`）；最小 kext 能加载并匹配；**用 KC 的 `__ZTV20IOBlockStorageDevice` / `__ZTV29AppleVirtIOBlockStorageDevice` 核对 SDK 头 vtable 槽位与保留槽，并确定 `OSBundleLibraries` 版本**（§4.2）。**vtable / KPI / 系统版本 / PCI 匹配键核查见 §4.0.1；SAS3008 接入后已完成 PCI 探测、BAR 解码、Xcode 工程与最小 kext 真机加载（§9）** | `ioreg -l -p IODeviceTree`、`kmutil showloaded`、`kextstat`、`log show --predicate 'process == "kernel"'`；最小 kext 的 `start` 成功打印；产出 vtable 逐槽比对表 | 空 kext 稳定加载/卸载，PCI 匹配字典命中；vtable 与 SDK 头一致（已核实），KPI 版本结论明确 |
 | **M1 寄存器与 IOC** | MMIO dump、diag reset → READY、IOC Facts、按 Facts 计算队列几何、分配 DMA 池、IOC Init → OPERATIONAL（先轮询，不开中断） | 用户态诊断工具读 Doorbell/`IOCState`，对比参考驱动的 Facts 字段；寄存器 dump 与 `mpi2.h` 常量一致 | 无需中断即可收发一条同步 config 请求（如读 Manufacturing Page0）；IOC 保持在 OPERATIONAL |
 | **M2 中断与事件** | 单 MSI/MSI-X 向量 + `IOFilterInterruptEventSource`、reply descriptor 解析、EventNotification、PortEnable、固件事件队列 | 能看到 `SAS_DISCOVERY`/拓扑事件；`mpr_user`-style config page 读取成功；连续 10 分钟无丢失 reply | reply queue 与 Host Index 回写无泄漏；事件队列不丢不重 |
 | **M3 单盘只读** | 目标表 → 第一个 `IOBlockStorageDevice` nub（实现参照 §4.0 的 `AppleVirtIOBlockStorageDevice`）；INQUIRY / READ CAPACITY(16) / READ(16)；`IOMedia` 出现 | `diskutil list`、`ioreg -r -c IOMedia`、`dd if=/dev/rdiskN of=/dev/null bs=1m count=1024` 无错；只读挂载可列目录 | 1 GB 顺序读回读数据一致，无 kernel panic、无 DMA 越界 |
@@ -296,22 +296,26 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 
 ---
 
-## 9. 当前进度与暂停点（2026-11-10）
+## 9. 当前进度与暂停点（2026-11-11）
 
-**已完成（不依赖 SAS3008）**，详见 §4.0.1、§4.0.2：
+**已完成**，详见 §4.0.1、§4.0.2、§6：
 
 1. 现场确认目标机系统版本、已加载 family / KPI 版本，以及 `IOSCSIParallelFamily` 运行时未加载。
 2. 用 `ida/kc_storage_vtable_check.py` 完成 `IOBlockStorageDevice` vtable 与 MacKernelSDK 头的逐槽 ABI 核对（方法槽 268–293、保留槽 294–321、两套 Apple 子类交叉验证），**R1 已关闭**。
 3. 确认 `IOPCIPrimaryMatch` 格式与 `0x00971000` 写法；确认 `OSBundleLibraries` 不应照抄 KC prelink plist 的历史版本。
 4. 复核 FreeBSD / Linux 参考源码基线、许可与 MPI 可复用清单（§2、§3、§7）。
 5. 拉取 Apple OSS `IOSCSIParallelFamily` 到 `reference/`（§2 固定 commit），完成路线 B 静态复核（§4.0.2）：KPI 符号集、版本对应、官方/第三方 SAS 依赖先例、SPI vtable 逐槽核对；**路线 B 改判为「技术可行但不推荐作首版」**，其 KPI 废弃风险记为 R14。
+6. SAS3008 已接入：IORegistry 确认 `0x1000:0x0097` / `pciclass,010700` / `pci1000,97`；BAR1 = 32-bit MMIO `0xFC440000`/64 KB（配置偏移 `0x14`）、BAR3 = `0xFC400000`/256 KB、BAR0 为 I/O。`IOPCIPrimaryMatch=0x00971000` 命中，系统正常启动且原本无驱动接管。
+7. 建立 kext 工程（`MPR/`、`MPR.xcodeproj/`、`tools/build-noxcode.sh`）与 `Info.plist`，写空壳 `MPRController::probe/start`（PCI 使能、BAR1 映射、7 个 MPI2 系统接口寄存器只读 dump 到 IORegistry）。目标机只有 Command Line Tools，构建走无 Xcode 链路：`clang++` + MacKernelSDK + `ld -kext` + ad-hoc 签名。
+8. 按 §5 / `AGENTS.md` 只写内部 SATA 盘的 ESP：`EFI/OC/Kexts/MPR.kext` + `Kernel > Add` 条目；改前同目录备份 `config.plist`、`plutil -lint`、确认唯一差异为新增条目；重启后 `com.ling.MPR (0.1.0)` 加载、`ioreg -r -c MPRController` 出现且寄存器可读。**M0 的「最小 kext 加载并匹配」验收项通过**。
 
-**暂停点：以下步骤都需要 SAS3008 实际接入或用户授权 kext 部署/重启，按用户要求在此停止；未执行任何部署、重启或写盘操作。**
+**当前状态**：空壳 kext 已在真机加载并命中 PCI 匹配字典，BAR1 可读。按 §6 的 M0 退出条件，固件 IT/IR 模式判定与空 kext 卸载验证仍未完成；SAS3008 **未接测试盘**，`diskutil list` 无 SAS 盘。空壳 kext 不写硬件寄存器、不发 DMA、不注册服务；ESP 上保留 `config.plist.bak_mpr-m0_20261111` 备份，回滚路径未实测。
 
-1. 在目标机上确认 SAS3008 的 PCI 配置空间、BAR、固件 IT/IR 模式，验证 `IOPCIPrimaryMatch=0x00971000` 命中（`ioreg`、`system_profiler SPPCIDataType`）；不要沿用历史设备号。
-2. 建立 kext Xcode 工程与 `Info.plist`（`IOProviderClass=IOPCIDevice`、`IOPCIPrimaryMatch=0x00971000`、`OSBundleLibraries` 按 §4.0.1 的现场版本取最低要求值），上传前确认 LF；写空壳 `MPRController::probe/start`（`setMemoryEnable`/`setBusMasterEnable` + BAR 映射 + 寄存器 dump）并在真机验证加载。
-3. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
-4. 进入 M1：MMIO dump、diag reset → READY、IOC Facts、队列几何、IOC Init。
-5. （仅当决定评估路线 B，不需要 SAS3008）用 MacKernelSDK 编译并真机加载最小 `IOSCSIParallelInterfaceController` 子类 kext，`OSBundleLibraries` 写 `com.apple.iokit.IOSCSIParallelFamily = 1.2.0`，验证 KPI 符号解析、family 被依赖拉起与子类 vtable 不错位；仍需要 kext 部署/重启授权。
+**暂停点：以下步骤需要新的部署/重启授权或接入测试盘，按用户要求在此停止。**
 
-**恢复条件**：SAS3008 已插入并确认目标机可正常启动；用户授权 kext 部署及必要的重启。在此之前不再推进。
+1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
+2. 进入 M1：MMIO dump、diag reset → READY、IOC Facts、队列几何、IOC Init，并判定固件 IT/IR 模式。每轮改 kext 都需要部署与重启授权，并重复 §5 的 ESP 备份 / `plutil -lint` / 唯一差异校验。
+3. M3 单盘只读验收前需接入测试盘（当前未接入）。
+4. （仅当决定评估路线 B，不需要 SAS3008）用 MacKernelSDK 编译并真机加载最小 `IOSCSIParallelInterfaceController` 子类 kext，`OSBundleLibraries` 写 `com.apple.iokit.IOSCSIParallelFamily = 1.2.0`，验证 KPI 符号解析、family 被依赖拉起与子类 vtable 不错位；仍需 kext 部署/重启授权。
+
+**恢复条件**：用户授权后续 kext 部署与必要的重启；M3 之前还需接入测试盘。在此之前不再推进。

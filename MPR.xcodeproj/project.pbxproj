@@ -1,0 +1,194 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 50;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A00000000000000000000001 /* MPRController.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000002 /* MPRController.cpp */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A00000000000000000000002 /* MPRController.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MPRController.cpp; sourceTree = "<group>"; };
+		A00000000000000000000003 /* MPRController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MPRController.h; sourceTree = "<group>"; };
+		A00000000000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A00000000000000000000005 /* MPR.kext */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MPR.kext; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000006 /* MacKernelSDK */ = {isa = PBXFileReference; lastKnownFileType = folder; path = MacKernelSDK; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A00000000000000000000007 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A00000000000000000000008 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000009 /* MPR */,
+				A00000000000000000000006 /* MacKernelSDK */,
+				A0000000000000000000000A /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A00000000000000000000009 /* MPR */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000002 /* MPRController.cpp */,
+				A00000000000000000000003 /* MPRController.h */,
+				A00000000000000000000004 /* Info.plist */,
+			);
+			path = MPR;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000000A /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000005 /* MPR.kext */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A0000000000000000000000B /* MPR */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A0000000000000000000000C /* Build configuration list for PBXNativeTarget "MPR" */;
+			buildPhases = (
+				A0000000000000000000000D /* Sources */,
+				A00000000000000000000007 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MPR;
+			productName = MPR;
+			productReference = A00000000000000000000005 /* MPR.kext */;
+			productType = "com.apple.product-type.kernel-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A0000000000000000000000E /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 1600;
+			};
+			buildConfigurationList = A0000000000000000000000F /* Build configuration list for PBXProject "MPR" */;
+			compatibilityVersion = "Xcode 9.3";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+			);
+			mainGroup = A00000000000000000000008;
+			productRefGroup = A0000000000000000000000A /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A0000000000000000000000B /* MPR */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A0000000000000000000000D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000001 /* MPRController.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A00000000000000000000010 /* Debug (project) */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CODE_SIGN_IDENTITY = "-";
+				GCC_OPTIMIZATION_LEVEL = 0;
+				KERNEL_EXTENSION_HEADER_SEARCH_PATHS = "$(SRCROOT)/MacKernelSDK/Headers";
+				KERNEL_FRAMEWORK_HEADERS = "$(SRCROOT)/MacKernelSDK/Headers";
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		A00000000000000000000011 /* Release (project) */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CODE_SIGN_IDENTITY = "-";
+				KERNEL_EXTENSION_HEADER_SEARCH_PATHS = "$(SRCROOT)/MacKernelSDK/Headers";
+				KERNEL_FRAMEWORK_HEADERS = "$(SRCROOT)/MacKernelSDK/Headers";
+				MACOSX_DEPLOYMENT_TARGET = 11.0;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		A00000000000000000000012 /* Debug (target) */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 0.1.0;
+				INFOPLIST_FILE = "$(SRCROOT)/MPR/Info.plist";
+				MARKETING_VERSION = 0.1.0;
+				MODULE_NAME = com.ling.MPR;
+				MODULE_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ling.MPR;
+				PRODUCT_NAME = MPR;
+				WRAPPER_EXTENSION = kext;
+			};
+			name = Debug;
+		};
+		A00000000000000000000013 /* Release (target) */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 0.1.0;
+				INFOPLIST_FILE = "$(SRCROOT)/MPR/Info.plist";
+				MARKETING_VERSION = 0.1.0;
+				MODULE_NAME = com.ling.MPR;
+				MODULE_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ling.MPR;
+				PRODUCT_NAME = MPR;
+				WRAPPER_EXTENSION = kext;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A0000000000000000000000F /* Build configuration list for PBXProject "MPR" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000010 /* Debug (project) */,
+				A00000000000000000000011 /* Release (project) */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A0000000000000000000000C /* Build configuration list for PBXNativeTarget "MPR" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000012 /* Debug (target) */,
+				A00000000000000000000013 /* Release (target) */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A0000000000000000000000E /* Project object */;
+}
