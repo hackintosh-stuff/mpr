@@ -338,6 +338,14 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **M1 尚未完成**：DMA 队列、IOC Init、中断、config page、拓扑发现与目标表均未实现；按后续里程碑推进。
 
+### 9.3 M1-b：IOC Init → OPERATIONAL（2026-11-11，已验证）
+
+按 IOC Facts 的几何（`IOCRequestFrameSize=32` dwords、`ReplyFrameSize=32` dwords、`RequestCredit=3072`、`MaxReplyDescriptorPostQueueDepth=65504`）在低 4GB 分配三块物理连续内存：free+post 队列（各 144 项、16B 对齐、共用一块）、reply frames（144×128 B）、request frames（128×128 B）。free queue 每项写入对应 reply frame 地址的低 32 位，post queue 全填 `0xff`（`mpr.c:1691-1706`）。IOC Init 经同步 doorbell 发送，High 地址字段写 0，`HostPageSize=4K`、`HostMSIxVectors=0`（不开中断）；OPERATIONAL 后再写 `ReplyFreeHostIndex` / `ReplyPostHostIndex`（`mpr.c:700-712`）。
+
+**已验证（重启后）**：`com.ling.MPR (0.3.0)` 加载；`MPRM1bState=ok`、`MPRIOCInitStatus=0`、`MPRIOCInitLogInfo=0`、`MPRIOCState=0x20000000`（OPERATIONAL）；`MPRQueueFreeDepth=MPRQueuePostDepth=144`、`MPRRequestCount=128`；物理地址 `queue=0x2d31a000`、`reply=0x2d75a000`、`request=0x2d75f000` 均在低 4GB；`MPRReplyFreeHostIndex=128`、`MPRReplyPostHostIndex=0`。M1-a 属性保持 `ok`，无新增 panic，系统盘仍为 `internal, physical`。
+
+**M1 剩余**：同步 config 请求（如 Manufacturing Page0）尚未实现；`HostMSIxVectors=0` 表示未启用 MSI-X，中断、config page、拓扑发现与目标表仍属后续里程碑。
+
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
