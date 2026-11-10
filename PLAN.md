@@ -1,7 +1,7 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.5（2026-11-11；SAS3008 已接入，M0 空壳 kext 完成 ESP 部署与真机加载验证，未接测试盘）
-目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**已接入；未接测试盘**）
+状态：草案 v0.6（2026-11-11；SAS3008 已接入并接测试盘，M0 空壳 kext 完成 ESP 部署与真机加载验证）
+目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**已接入；已接 1 块 SATA SSD 测试盘，允许读写**）
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
 
@@ -15,7 +15,7 @@
 
 1. kext 通过 `IOPCIDevice` 匹配 SAS3008，完成 PCI 使能、BAR 映射、IOC 复位与初始化。
 2. 建立 request / reply / reply-free 队列与 chain 池，能用中断或轮询收发 MPI 消息。
-3. 通过固件事件完成拓扑发现，把直连及经 expander 的 SAS/SATA 磁盘暴露为**原生** `IOMedia`（`diskutil list` 可见）。
+3. 通过固件事件完成拓扑发现，把经 STP/SATA 接入的磁盘暴露为**原生** `IOMedia`（`diskutil list` 可见）；目标表与 nub 生命周期覆盖 STP/SATA。SAS SSP / expander 拓扑当前无测试条件，代码保留识别路径但不列入首版验收。
 4. 支持 READ/WRITE、SYNCHRONIZE CACHE、UNMAP、auto sense、超时与 TMF 恢复、热插拔。
 5. 有基本诊断通路（IORegistry 属性 + 用户态工具），可抓 IOC 状态、config page、事件日志。
 
@@ -25,6 +25,7 @@
 - Apple Silicon、dext/DriverKit、多队列高 IOPS 优化、中断合并、WarpDrive。
 - 兼容 SAS2（`mps`/`0x0072`）与 MPI26/GEN35/SEA 分支（SAS3416 等）。
 - 接入 `IOSCSIParallelInterfaceController` / macOS SCSI 应用层栈（路线 B 已复核为技术可行，但列为 M7+ 备选，见 §4.0.2、§4.2）。
+- SAS SSP 直连盘、expander 下多盘与 SMP passthrough 的实机验收（当前无测试条件）；拓扑解析可保留 SSP `device_info` 分支，但不作为首版退出条件。
 
 ### 1.3 驱动形态
 
@@ -190,7 +191,7 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
  ├─ MPRDMA       IOBufferMemoryDescriptor + IODMACommand 封装，生成 IEEE SGE
  ├─ MPRIntr      IOFilterInterruptEventSource → workloop 内处理 reply descriptor
  ├─ MPRConfig    IOC Facts / Port Facts / config page / EventNotification / PortEnable
- ├─ MPRDiscovery 固件事件队列 → 目标表（devhandle、SAS address、LUN）→ nub 生命周期
+ ├─ MPRDiscovery 固件事件队列 → 目标表（devhandle、SAS address、LUN、协议类型）→ nub 生命周期；覆盖 STP/SATA 分支
  ├─ MPRBlockDev  IOBlockStorageDevice 子类：CDB 构造、IOStorageCompletion、UNMAP（模板见 §4.0 的 AppleVirtIOBlockStorageDevice）
  ├─ MPRTaskMgmt  超时、ABORT_TASK / LUN_RESET / TARGET_RESET、diag reset 恢复
  └─ MPRUserClient(后期)  寄存器 dump、config page、事件日志、MPI passthrough
@@ -229,7 +230,7 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 5. **SMID 与 completion 绑定**：`MPRCommand` 池与 SMID 一一对应，完成回调必须能由 SMID 反查 `IOStorageCompletion`；超时后 SMID 不能回收，直到 TMF 完成，避免固件写已复用帧。
 6. **块设备契约与 ABI**：实现 `IOBlockStorageDevice.h` 的 14 个纯虚（`doAsyncReadWrite`、`reportBlockSize/MaxValidBlock/MediaState`、vendor/product/revision 等）；`doUnmap`/`doSynchronize` 有默认实现但需按 CDB 覆写；通过 `IOBlockStorageDriver` 生成 `IOMedia`（`IOBlockStorageDriver.h:1242-1397`）。**26.7 内核的实体里还有 `doDiscard`、`doSynchronizeCache`、`doSynchronize`、`doSetPriority`、`doGetProvisionStatus` 与 `_RESERVEDIOBlockStorageDevice4..22+`（§4.0 第 2 条），SDK 头把它们标为 deprecated/保留，不能按 SDK 的 `= 0` 数量推断 vtable；vtable 核对已按 §4.0.1 完成，`AppleVirtIOBlockStorageDevice` 是最直接的实现模板。**
 7. **最小 CDB 集**：INQUIRY、READ CAPACITY(16)、READ(10/16)、WRITE(10/16)、SYNCHRONIZE CACHE(10/16)、UNMAP、REQUEST SENSE、REPORT LUNS、START STOP UNIT、MODE SENSE；定义取 `MacKernelSDK/Headers/IOKit/scsi/SCSICmds_*.h`。
-8. **固件事件**：首版只处理 `SAS_TOPOLOGY_CHANGE_LIST`、`SAS_DISCOVERY`、`SAS_DEVICE_DISCOVERY_ERROR`、`SAS_DEVICE_STATUS_CHANGE`，其余忽略并记录；拓扑稳定后再 `registerService`，避免盘符抖动。
+8. **固件事件与 STP/SATA 目标表**：首版只处理 `SAS_TOPOLOGY_CHANGE_LIST`、`SAS_DISCOVERY`、`SAS_DEVICE_DISCOVERY_ERROR`、`SAS_DEVICE_STATUS_CHANGE`，其余忽略并记录；拓扑稳定后再 `registerService`，避免盘符抖动。目标表按 devhandle + SAS address + LUN 建键，并按 SAS Device Page0 的 `device_info` 区分 SSP / STP / SATA（`MPI2_SAS_DEVICE_INFO_SSP_TARGET 0x400`、`STP_TARGET 0x200`、`SATA_DEVICE 0x80`，`mpi2_sas.h:107-114`；分支见 `mpt3sas_scsih.c:2778-2798`）。当前测试盘是 SATA SSD 走 STP，固件给出的 `0x4433221104…` 形式 SAS address 并非设备 WWN，因此持久标识优先用 INQUIRY/VPD 的 `t10.ATA` wwid 与 devhandle，不能假定 SAS address 全局唯一或稳定；SATA 队列深度按 `max_sata_qd` 单独设定，不套用 SSP 的 wide/narrow port 深度。
 9. **电源与复位**：`mpr_reinit`（`mpr.c:837-924`）的「mask irq → diag reset → PCI 配置恢复 → 重新 IOC Facts → 重新注册事件 → 释放冻结命令」需 1:1 重建；watchdog 用 1 s doorbell 检查（`mpr.c:2256`）。
 10. **文件行尾与部署**：所有上传到 macOS 的 `.plist`/`.sh`/`.py`/源码必须是 LF（`.gitattributes` 已声明 `* text=auto eol=lf`；CRLF 的 `Info.plist` 会让 kext 被静默丢弃）。kext 走 `kmutil`/AuxiliaryKernelExtensions.kc 与现有 OpenCore 流程，可复用同工作区 `drivers_src/NvmeHook` 的部署验证经验；本驱动是 PCI 驱动，不依赖 Lilu。目标机串口调试默认关闭（`debug=0x100`、无 `serial=5`），长期开启 `kprintf` 会显著拖慢系统，仅在抓日志时临时开启。
 11. **内核缓存反编译的使用边界**：`ida/` 下的 `.kc`/`.i64` 只用于核对类/vtable/符号/依赖键等 ABI 事实，是把 macOS 11 SDK 头「校准」到 26.7 内核的手段；不复制 Apple 代码，也不把 KC 地址、vtable 偏移或内部符号写进驱动（会随系统升级失效）。系统升级后重取 KC，并重跑 §4.0.1 / §4.0.2 的两个离线核对脚本。
@@ -243,13 +244,13 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 | **M0 环境** | 确认目标机 SAS3008 的 PCI ID/固件模式/BAR；Xcode 工程接入 MacKernelSDK（`KERNEL_EXTENSION_HEADER_SEARCH_PATHS`、`KERNEL_FRAMEWORK_HEADERS`）；最小 kext 能加载并匹配；**用 KC 的 `__ZTV20IOBlockStorageDevice` / `__ZTV29AppleVirtIOBlockStorageDevice` 核对 SDK 头 vtable 槽位与保留槽，并确定 `OSBundleLibraries` 版本**（§4.2）。**vtable / KPI / 系统版本 / PCI 匹配键核查见 §4.0.1；SAS3008 接入后已完成 PCI 探测、BAR 解码、Xcode 工程与最小 kext 真机加载（§9）** | `ioreg -l -p IODeviceTree`、`kmutil showloaded`、`kextstat`、`log show --predicate 'process == "kernel"'`；最小 kext 的 `start` 成功打印；产出 vtable 逐槽比对表 | 空 kext 稳定加载/卸载，PCI 匹配字典命中；vtable 与 SDK 头一致（已核实），KPI 版本结论明确 |
 | **M1 寄存器与 IOC** | MMIO dump、diag reset → READY、IOC Facts、按 Facts 计算队列几何、分配 DMA 池、IOC Init → OPERATIONAL（先轮询，不开中断） | 用户态诊断工具读 Doorbell/`IOCState`，对比参考驱动的 Facts 字段；寄存器 dump 与 `mpi2.h` 常量一致 | 无需中断即可收发一条同步 config 请求（如读 Manufacturing Page0）；IOC 保持在 OPERATIONAL |
 | **M2 中断与事件** | 单 MSI/MSI-X 向量 + `IOFilterInterruptEventSource`、reply descriptor 解析、EventNotification、PortEnable、固件事件队列 | 能看到 `SAS_DISCOVERY`/拓扑事件；`mpr_user`-style config page 读取成功；连续 10 分钟无丢失 reply | reply queue 与 Host Index 回写无泄漏；事件队列不丢不重 |
-| **M3 单盘只读** | 目标表 → 第一个 `IOBlockStorageDevice` nub（实现参照 §4.0 的 `AppleVirtIOBlockStorageDevice`）；INQUIRY / READ CAPACITY(16) / READ(16)；`IOMedia` 出现 | `diskutil list`、`ioreg -r -c IOMedia`、`dd if=/dev/rdiskN of=/dev/null bs=1m count=1024` 无错；只读挂载可列目录 | 1 GB 顺序读回读数据一致，无 kernel panic、无 DMA 越界 |
+| **M3 单盘只读** | STP/SATA 目标表 → 第一个 `IOBlockStorageDevice` nub（实现参照 §4.0 的 `AppleVirtIOBlockStorageDevice`）；INQUIRY / READ CAPACITY(16) / READ(16)；`IOMedia` 出现 | `diskutil list`、`ioreg -r -c IOMedia`、`dd if=/dev/rdiskN of=/dev/null bs=1m count=1024` 无错；只读挂载可列目录 | 1 GB 顺序读回读数据一致，无 kernel panic、无 DMA 越界 |
 | **M4 读写与恢复** | WRITE(10/16)、SYNCHRONIZE CACHE、UNMAP、auto sense、超时与 TMF（ABORT/LUN RESET/TARGET RESET）、diag reset 恢复 | `dd` 写后回读校验；`diskutil` 分区/卸载；人为拔盘或超时注入后驱动能恢复；TRIM/UNMAP 对已知敏感固件先做小范围验证 | 24 h 混合读写无挂起；复位后盘能重新出现 |
-| **M5 拓扑与热插拔** | topology change 事件、expander 下多盘、设备移除/新增、重启后 persistent 映射语义（可退化为每次重新发现） | 热插拔 10 轮，`diskutil list` 与 IORegistry 目标表一致；无幽灵盘 | 多盘并发 IO 下拓扑变化不丢命令 |
+| **M5 拓扑与热插拔** | topology change 事件、STP/SATA 设备移除/新增、重启后 persistent 映射语义（可退化为每次重新发现）；expander 下多盘与 SSP 因无测试条件不验收 | 热插拔 10 轮（STP/SATA 单盘），`diskutil list` 与 IORegistry 目标表一致；无幽灵盘 | 拓扑变化不丢命令 |
 | **M6 加固/诊断（可选）** | watchdog、IORegistry 统计、`IOUserClient` 诊断工具、性能基线、日志开关 | 工具可导出 config page / 事件日志 / 寄存器；性能与 FreeBSD/Linux 同机对比 | 可定位 90% 现场问题而无需串口 |
 | **M7 后续（不在首版）** | IR 卷、SES、固件升级、多队列/MSI-X 亲和、中断合并、启动盘、签名与发布；**或**路线 B 的最小 kext 链接/加载 spike 与 `SCSIParallelTask` ↔ MPI 适配评估（头与 KPI 依赖已实证齐备，§4.0.2）；dext 方向单独立项 | 单独立项 | — |
 
-每个阶段开始前先写该阶段的失败判据与回滚方式（kext 只放测试机、保留可启动的干净 EFI 配置）。**禁止在带有重要数据的磁盘上做写测试。**
+每个阶段开始前先写该阶段的失败判据与回滚方式（kext 只放测试机、保留可启动的干净 EFI 配置）。**测试盘已确认无重要数据，M4 允许 WRITE / UNMAP / 分区等破坏性写入与回读校验；内部 SATA 系统盘与 USB 安装/救援介质仍禁止任何写入。**
 
 ---
 
@@ -272,13 +273,13 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 | R2 | SAS3008 处于 IR 固件模式或固件版本过旧，事件/能力字段不同 | 初始化失败或发现不到盘 | 先读 Manufacturing Page0/IOC Facts 记录固件版本，按 IT 模式验收；IR 模式明确拒绝 |
 | R3 | MSI-X 中断源索引与 `IOPCIDevice` 的 `intIndex` 语义不一致 | 收不到中断 | M1 先轮询；M2 逐个 index 试，读 `getInterruptType` 的 `kIOInterruptTypePCIMessaged` 位；必要时回退 INTx |
 | R4 | 低 4GB / 4GB boundary / 63 位 DMA 约束在 macOS 上难以保证 | 固件写错地址、静默数据损坏 | 池化分配 + 物理地址校验 + 失败回退 32 位 SGE；M3 用数据校验和验证 |
-| R5 | expander/SMP 拓扑处理复杂度 | 只认直连盘 | M5 前先只支持直连；SMP passthrough 作为后续 |
+| R5 | expander/SMP 与 SSP 拓扑处理复杂度 | 只认直连盘 | 首版验收限定 STP/SATA 直连；SSP/expander 无测试条件，识别分支保留但不作为退出条件；SMP passthrough 作为后续 |
 | R6 | 超时/TMF 与 SMID 复用竞争 | 命令错乱、panic | SMID 冻结到 TMF 完成；参考 `mpr.c:2388-2676` 与 `scsih.c:3120-3204` 的状态机 |
 | R7 | 电源管理/睡眠唤醒 | 唤醒后盘丢失或 IOC 未复位 | FreeBSD 侧无实现可抄，按 `mpr_reinit` 自研；M5 加入睡眠唤醒测试（唤醒需物理电源按钮，NanoKVM 虚拟键盘不能唤醒本机） |
 | R8 | kext 签名 / SIP / AuxKC 重建 / OpenCore 配置 | 驱动加载不了 | 沿用 NvmeHook 的部署与验证流程；每次改 `Info.plist` 复查 LF 行尾与 `plutil -lint` |
 | R9 | GPL 代码污染 | 许可风险 | 见 §7，`reference/` 不入构建，代码评审检查 |
 | R10 | 启动盘与系统卷依赖 | 盘符/启动顺序变化 | 首版不做启动盘；测试机保留内部 SATA 系统盘 |
-| R11 | UNMAP/TRIM 触发某些 SSD 固件缺陷 | 掉盘 | 已有同工作区 Optane TRIM 掉盘经验，默认先禁用 UNMAP，验证设备后再开 |
+| R11 | UNMAP/TRIM 触发某些 SSD 固件缺陷 | 掉盘 | 已有同工作区 Optane TRIM 掉盘经验；测试盘（PCCOOLER SSD T200）支持 UNMAP 且允许读写，M4 先做小范围验证，出现异常立即禁用 UNMAP 并保留只读路径 |
 | R12 | 单中断向量性能上限 | 吞吐低 | 首版接受；M7 再按 Linux `mpt3sas_base.c:3212-3501` 做多队列 |
 | R13 | 系统升级后内核缓存与目标机版本漂移 | 按旧 vtable/符号做的设计在新内核上失效 | 现场已确认目标机 = 26.7.2 / 25G332 / Darwin 25.6.0，与 KC 分析文档一致；KC 内 26.7.1 / 25G325 只是部分 kext 的构建批次。系统升级后重取 BootKC 并重跑 §4.0.1 / §4.0.2 的脚本；不把 KC 地址写进代码 |
 | R14 | 路线 B 依赖的 `IOSCSIParallelFamily` KPI 已 `__kpi_deprecated`，Apple 引导迁移到 DriverKit，未来系统可能移除或改 ABI | 若改走 B，新系统上可能无法加载，维护成本高于路线 A | 首版不走 B；若启用，先做最小 kext 链接/加载 spike，锁定机型与系统版本，每次升级重跑 §4.0.2 的符号集与 vtable 回归；dext 方向单独立项 |
@@ -288,11 +289,10 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 1. 首版是否要求**启动盘**支持？是否要求 IR 卷？（当前按「不做」计划）
 2. 目标 macOS 版本下限是否只锁 Tahoe 26 / x86_64，还是要做 12–26 的版本适配（影响 SDK 的 `__MAC_OS_X_VERSION_MIN_REQUIRED` 门控与 kmod 兼容）？
 3. 是否接受首版单中断向量、无中断合并的性能水平？
-4. 测试盘是否允许破坏性写入？是否需要只读验收阶段（M3）作为硬门槛？
-5. 诊断用户态工具是放在本仓库，还是借用现有工具链？
-6. 是否需要签名/发布级打包，还是仅测试机开发签名？
-7. 目标机是否锁定 26.7.2 / 25G332？（现场已确认；升级会触发 §4.0.1 / §4.0.2 的 ABI 回归）
-8. 是否在 M7 用最小 kext spike 评估路线 B，或改走 DriverKit/dext 单独立项？（当前按「都不做」计划）
+4. 诊断用户态工具是放在本仓库，还是借用现有工具链？
+5. 是否需要签名/发布级打包，还是仅测试机开发签名？
+6. 目标机是否锁定 26.7.2 / 25G332？（现场已确认；升级会触发 §4.0.1 / §4.0.2 的 ABI 回归）
+7. 是否在 M7 用最小 kext spike 评估路线 B，或改走 DriverKit/dext 单独立项？（当前按「都不做」计划）
 
 ---
 
@@ -305,17 +305,18 @@ MPRController (IOService)          probe/start/stop，持有 IOPCIDevice、IOMem
 3. 确认 `IOPCIPrimaryMatch` 格式与 `0x00971000` 写法；确认 `OSBundleLibraries` 不应照抄 KC prelink plist 的历史版本。
 4. 复核 FreeBSD / Linux 参考源码基线、许可与 MPI 可复用清单（§2、§3、§7）。
 5. 拉取 Apple OSS `IOSCSIParallelFamily` 到 `reference/`（§2 固定 commit），完成路线 B 静态复核（§4.0.2）：KPI 符号集、版本对应、官方/第三方 SAS 依赖先例、SPI vtable 逐槽核对；**路线 B 改判为「技术可行但不推荐作首版」**，其 KPI 废弃风险记为 R14。
-6. SAS3008 已接入：IORegistry 确认 `0x1000:0x0097` / `pciclass,010700` / `pci1000,97`；BAR1 = 32-bit MMIO `0xFC440000`/64 KB（配置偏移 `0x14`）、BAR3 = `0xFC400000`/256 KB、BAR0 为 I/O。`IOPCIPrimaryMatch=0x00971000` 命中，系统正常启动且原本无驱动接管。
+6. SAS3008 已接入：IORegistry 确认 `0x1000:0x0097` / `pciclass,010700` / `pci1000,97`。BAR0 为 I/O；BAR1/BAR2 组成 **64-bit** MMIO（配置偏移 `0x14`，64 KB），BAR3/BAR4 为 64-bit MMIO（`0x1c`，256 KB）。物理地址随启动分配：macOS 侧 `0xFC440000` / `0xFC400000`，Debian 侧 `0xfc540000` / `0xfc500000`，代码不得硬编码。`IOPCIPrimaryMatch=0x00971000` 命中，系统正常启动且 macOS 侧原本无驱动接管。
 7. 建立 kext 工程（`MPR/`、`MPR.xcodeproj/`、`tools/build-noxcode.sh`）与 `Info.plist`，写空壳 `MPRController::probe/start`（PCI 使能、BAR1 映射、7 个 MPI2 系统接口寄存器只读 dump 到 IORegistry）。目标机只有 Command Line Tools，构建走无 Xcode 链路：`clang++` + MacKernelSDK + `ld -kext` + ad-hoc 签名。
 8. 按 §5 / `AGENTS.md` 只写内部 SATA 盘的 ESP：`EFI/OC/Kexts/MPR.kext` + `Kernel > Add` 条目；改前同目录备份 `config.plist`、`plutil -lint`、确认唯一差异为新增条目；重启后 `com.ling.MPR (0.1.0)` 加载、`ioreg -r -c MPRController` 出现且寄存器可读。**M0 的「最小 kext 加载并匹配」验收项通过**。
+9. 在 Debian 救援环境完成 SAS3008 与测试盘的只读核查（`ida/m1_hardware_check.md`）：PCI 配置空间 / MSI-X、固件与 IOC 队列几何、SAS 拓扑、盘身份与分区布局。固件镜像为 **IR**（`IOCCapabilities` 含 `INTEGRATED_RAID`），但 `Protocol=(Initiator)` 且未枚举 IR 卷，当前直通运行；测试盘为 **SATA SSD 走 STP**，不是 SAS SSP。
 
-**当前状态**：空壳 kext 已在真机加载并命中 PCI 匹配字典，BAR1 可读。按 §6 的 M0 退出条件，固件 IT/IR 模式判定与空 kext 卸载验证仍未完成；SAS3008 **未接测试盘**，`diskutil list` 无 SAS 盘。空壳 kext 不写硬件寄存器、不发 DMA、不注册服务；ESP 上保留 `config.plist.bak_mpr-m0_20261111` 备份，回滚路径未实测。
+**当前状态**：空壳 kext 已在 macOS 真机加载并命中 PCI 匹配字典，BAR1 可读；它不写硬件寄存器、不发 DMA、不注册服务。SAS3008 已接 1 块测试盘，Debian 下由 `mpt3sas` 枚举为 `/dev/sdb`（`PCCOOLER SSD T200 240GB`、GPT/Windows 布局、**无重要数据**），该盘**允许破坏性写入**；macOS 侧尚未由本驱动枚举。首版验收范围限定 **STP/SATA 直连**，SAS SSP / expander 当前无测试条件、不列入退出条件。按 §6 的 M0 退出条件，空 kext 卸载验证仍未完成；ESP 上保留 `config.plist.bak_mpr-m0_20261111` 备份，回滚路径未实测。
 
-**暂停点：以下步骤需要新的部署/重启授权或接入测试盘，按用户要求在此停止。**
+**暂停点：以下步骤需要新的部署/重启授权，按用户要求在此停止。**
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
-2. 进入 M1：MMIO dump、diag reset → READY、IOC Facts、队列几何、IOC Init，并判定固件 IT/IR 模式。每轮改 kext 都需要部署与重启授权，并重复 §5 的 ESP 备份 / `plutil -lint` / 唯一差异校验。
-3. M3 单盘只读验收前需接入测试盘（当前未接入）。
+2. 进入 M1：MMIO dump、diag reset → READY、IOC Facts、队列几何、IOC Init；用 Debian 侧队列几何与固件版本作对照，必要时读 Manufacturing Page0 确认固件镜像字符串。每轮改 kext 都需要部署与重启授权，并重复 §5 的 ESP 备份 / `plutil -lint` / 唯一差异校验。
+3. 按 STP/SATA 路径推进 M2–M5：目标表与 nub、只读回读、WRITE / SYNCHRONIZE CACHE / UNMAP 回读校验、热插拔与恢复；内部系统盘与 USB 介质保持只读。
 4. （仅当决定评估路线 B，不需要 SAS3008）用 MacKernelSDK 编译并真机加载最小 `IOSCSIParallelInterfaceController` 子类 kext，`OSBundleLibraries` 写 `com.apple.iokit.IOSCSIParallelFamily = 1.2.0`，验证 KPI 符号解析、family 被依赖拉起与子类 vtable 不错位；仍需 kext 部署/重启授权。
 
-**恢复条件**：用户授权后续 kext 部署与必要的重启；M3 之前还需接入测试盘。在此之前不再推进。
+**恢复条件**：用户授权后续 kext 部署与必要的重启。测试盘已接入并允许读写，不再是前置条件；在此之前不再推进。
