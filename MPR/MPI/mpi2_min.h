@@ -476,4 +476,47 @@ static_assert(offsetof(MPREventNotifyReply, Event) == 0x14, "event number offset
 static_assert(offsetof(MPREventNotifyReply, EventContext) == 0x18, "event context offset");
 static_assert(sizeof(MPREventDataSasDiscovery) == 0x0C, "SAS discovery data layout");
 
+/* ---------------------------------------------------------------------- */
+/* M2-c: extended config pages (SAS IO Unit).                              */
+
+/* Extended page type / ext page type (mpi2_cnfg.h:342, :348, :350) */
+#define MPI2_CONFIG_PAGETYPE_EXTENDED              0x0F
+#define MPI2_CONFIG_EXTPAGETYPE_SAS_IO_UNIT        0x10
+#define MPI2_CONFIG_EXTPAGETYPE_SAS_DEVICE         0x12
+
+/* ControllerPhyDeviceInfo bits (mpi2_sas.h:107-114) */
+#define MPI2_SAS_DEVICE_INFO_SSP_TARGET            0x00000400
+#define MPI2_SAS_DEVICE_INFO_STP_TARGET            0x00000200
+#define MPI2_SAS_DEVICE_INFO_SATA_DEVICE           0x00000080
+
+#pragma pack(push, 1)
+
+/* MPI2_CONFIG_EXTENDED_PAGE_HEADER: 8 bytes (mpi2_cnfg.h:305-318) */
+typedef struct {
+    UInt8   PageVersion;    /* 0x00 */
+    UInt8   PageNumber;     /* 0x01 */
+    UInt8   PageType;       /* 0x02 */
+    UInt8   ExtPageType;    /* 0x03 */
+    UInt16  ExtPageLength;  /* 0x04 */
+    UInt16  Reserved1;      /* 0x06 */
+} MPRExtPageHeader;
+
+/* MPI2_SAS_IO_UNIT0_PHY_DATA: 0x14 bytes (mpi2_cnfg.h:2134-2146) */
+typedef struct {
+    UInt8   Port;                       /* 0x00 */
+    UInt8   PortFlags;                  /* 0x01 */
+    UInt8   PhyFlags;                   /* 0x02 */
+    UInt8   NegotiatedLinkRate;         /* 0x03 */
+    UInt32  ControllerPhyDeviceInfo;    /* 0x04 */
+    UInt16  AttachedDevHandle;          /* 0x08 */
+    UInt16  ControllerDevHandle;        /* 0x0A */
+    UInt32  DiscoveryStatus;            /* 0x0C */
+    UInt32  Reserved;                   /* 0x10 */
+} MPRSasIOUnit0PhyData;
+
+#pragma pack(pop)
+
+static_assert(sizeof(MPRExtPageHeader) == 0x08, "extended page header layout");
+static_assert(sizeof(MPRSasIOUnit0PhyData) == 0x14, "SAS IO Unit0 phy data layout");
+
 #endif /* MPR_MPI2_MIN_H */

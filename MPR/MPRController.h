@@ -93,6 +93,12 @@ private:
     bool   sendPortEnable(void);
     bool   runM2b(void);
 
+    bool   readExtConfigPage(UInt8 extPageType, UInt32 pageAddress,
+                             UInt8 *buffer, UInt32 bufferBytes,
+                             UInt32 *actualBytes);
+    bool   readSasIOUnitPage0(void);
+    bool   runM2c(void);
+
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;

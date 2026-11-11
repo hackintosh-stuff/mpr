@@ -40,6 +40,9 @@ OSDefineMetaClassAndStructors(MPRController, IOService)
 /* M2-a waits for the reply interrupt, then falls back to one poll pass. */
 #define MPR_M2_REPLY_TIMEOUT_MS 2000
 
+/* M2-c config page staging buffer (SAS IO Unit Page0 with 8+ phys). */
+#define MPR_PAGE_BUF_BYTES      512
+
 struct MPRRegisterInfo
 {
     const char *name;
@@ -992,6 +995,177 @@ MPRController::runM2b(void)
     return true;
 }
 
+/* ------------------------------------------------------------------------ */
+/* M2-c: extended config page read, used to build the SAS target table.      */
+
+bool
+MPRController::readExtConfigPage(UInt8 extPageType, UInt32 pageAddress,
+                                 UInt8 *buffer, UInt32 bufferBytes,
+                                 UInt32 *actualBytes)
+{
+    MPRConfigRequest *config;
+    MPRConfigReply *reply;
+    UInt8 *frame;
+    UInt32 value32, headerDwords;
+
+    if (bufferBytes == 0 || bufferBytes > MPR_PAGE_BUF_BYTES ||
+        fRequestBuffer == NULL || fPageBuffer == NULL) {
+        return false;
+    }
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return false;
+    }
+    frame += 4 * fRequestFrameSize;     /* SMID 4 */
+
+    /* Step 1: page header without a data SGE. */
+    memset(frame, 0, fRequestFrameSize);
+    config = (MPRConfigRequest *)frame;
+    config->Function = MPI2_FUNCTION_CONFIG;
+    config->Action = MPI2_CONFIG_ACTION_PAGE_HEADER;
+    config->Header.PageType = MPI2_CONFIG_PAGETYPE_EXTENDED;
+    config->Header.PageNumber = 0;
+    config->Header.PageLength = 0;
+    config->ExtPageType = extPageType;
+    config->ExtPageLength = 0;
+    config->PageAddress = pageAddress;
+
+    fReplyCount = 0;
+    value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (4U << 16);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+    if (!waitForReply(MPR_M2_REPLY_TIMEOUT_MS)) {
+        setProperty("MPRConfigExtFailure", "page header timeout");
+        return false;
+    }
+    reply = (MPRConfigReply *)fLastReply;
+    setProperty("MPRConfigExtStatus",
+                (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
+        setProperty("MPRConfigExtFailure", "page header status");
+        return false;
+    }
+    headerDwords = reply->ExtPageLength;
+    if (headerDwords == 0 || (headerDwords * 4) > bufferBytes) {
+        headerDwords = bufferBytes / 4;
+    }
+    setProperty("MPRConfigExtLength", (unsigned long long)headerDwords, 16);
+
+    /* Step 2: page data through the SGE, same SMID. */
+    memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
+    memset(frame, 0, fRequestFrameSize);
+    config->Function = MPI2_FUNCTION_CONFIG;
+    config->Action = MPI2_CONFIG_ACTION_PAGE_READ_CURRENT;
+    config->Header.PageType = MPI2_CONFIG_PAGETYPE_EXTENDED;
+    config->Header.PageNumber = 0;
+    config->Header.PageLength = 0;
+    config->ExtPageType = extPageType;
+    config->ExtPageLength = (UInt16)headerDwords;
+    config->PageAddress = pageAddress;
+    config->SgeFlagsLength =
+        ((UInt32)(MPI2_SGE_FLAGS_SIMPLE_ELEMENT | MPI2_SGE_FLAGS_LAST_ELEMENT |
+                  MPI2_SGE_FLAGS_END_OF_BUFFER | MPI2_SGE_FLAGS_64_BIT_ADDRESSING)
+         << MPI2_SGE_FLAGS_SHIFT) |
+        (bufferBytes & MPI2_SGE_LENGTH_MASK);
+    config->SgeAddress = fPagePhys;
+
+    fReplyCount = 0;
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+    if (!waitForReply(MPR_M2_REPLY_TIMEOUT_MS)) {
+        setProperty("MPRConfigExtFailure", "page data timeout");
+        return false;
+    }
+    reply = (MPRConfigReply *)fLastReply;
+    setProperty("MPRConfigExtDataStatus",
+                (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
+        setProperty("MPRConfigExtFailure", "page data status");
+        return false;
+    }
+
+    memcpy(buffer, fPageBuffer->getBytesNoCopy(), bufferBytes);
+    if (actualBytes != NULL) {
+        *actualBytes = headerDwords * 4;
+    }
+    return true;
+}
+
+bool
+MPRController::readSasIOUnitPage0(void)
+{
+    UInt8 page[MPR_PAGE_BUF_BYTES];
+    UInt32 actual = 0;
+    UInt32 numPhys, i;
+    char name[32];
+
+    if (!readExtConfigPage(MPI2_CONFIG_EXTPAGETYPE_SAS_IO_UNIT, 0,
+                           page, sizeof(page), &actual)) {
+        setProperty("MPRM2cFailure", "SAS IO Unit Page0 read failed");
+        return false;
+    }
+
+    numPhys = page[0x0C];
+    if (numPhys > 16) {
+        numPhys = 16;
+    }
+    setProperty("MPRNumPhys", (unsigned long long)numPhys, 8);
+    setProperty("MPRSasPageBytes", (unsigned long long)actual, 32);
+
+    for (i = 0; i < numPhys; i++) {
+        const UInt8 *phy = page + 0x10 + i * 0x14;
+        UInt32 deviceInfo = (UInt32)phy[0x04] | ((UInt32)phy[0x05] << 8) |
+                            ((UInt32)phy[0x06] << 16) | ((UInt32)phy[0x07] << 24);
+        UInt32 devHandle = (UInt32)phy[0x08] | ((UInt32)phy[0x09] << 8);
+        UInt32 linkRate = phy[0x03];
+
+        snprintf(name, sizeof(name), "MPRPhy%uDevHandle", (unsigned int)i);
+        setProperty(name, (unsigned long long)devHandle, 16);
+        snprintf(name, sizeof(name), "MPRPhy%uDeviceInfo", (unsigned int)i);
+        setProperty(name, (unsigned long long)deviceInfo, 32);
+        snprintf(name, sizeof(name), "MPRPhy%uLinkRate", (unsigned int)i);
+        setProperty(name, (unsigned long long)linkRate, 8);
+
+        if (devHandle != 0 && !getProperty("MPRAttachedDevHandle")) {
+            setProperty("MPRAttachedDevHandle", (unsigned long long)devHandle, 16);
+            setProperty("MPRAttachedDeviceInfo", (unsigned long long)deviceInfo, 32);
+            setProperty("MPRAttachedPhy", (unsigned long long)i, 8);
+        }
+    }
+    return true;
+}
+
+bool
+MPRController::runM2c(void)
+{
+    IOByteCount segLength;
+    bool ok;
+
+    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
+    if (fPageBuffer == NULL) {
+        setProperty("MPRM2cState", "failed-alloc");
+        return false;
+    }
+    fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+    if (fPagePhys == 0 || segLength < MPR_PAGE_BUF_BYTES ||
+        (fPagePhys + MPR_PAGE_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
+        setProperty("MPRM2cState", "failed-alloc");
+        return false;
+    }
+
+    ok = readSasIOUnitPage0();
+    setProperty("MPRM2cState", ok ? "ok" : "failed");
+
+    if (fPageBuffer != NULL) {
+        fPageBuffer->release();
+        fPageBuffer = NULL;
+    }
+    fPagePhys = 0;
+    return ok;
+}
+
 bool
 MPRController::readManufacturingPage0(void)
 {
@@ -1224,8 +1398,8 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M2b");
-    setProperty("MPRBuild", "0.7.2");
+    setProperty("MPRStage", "M2c");
+    setProperty("MPRBuild", "0.8.0");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
@@ -1234,6 +1408,7 @@ MPRController::start(IOService *provider)
     if (runM1a() && runM1b()) {
         runM1c();
         runM2b();
+        runM2c();
     } else {
         setProperty("MPRM1cState", "skipped-earlier-stage-failed");
     }
