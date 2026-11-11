@@ -2307,6 +2307,30 @@ MPRController::publishBlockDevice(void)
         return false;
     }
 
+    {
+        UInt8 vpd[64];
+
+        fUnmapEnabled = false;
+        if (scsiInquiryVpd(0xB0, vpd, sizeof(vpd)) &&
+            vpd[1] == 0xB0 &&
+            (((UInt32)vpd[2] << 8) | (UInt32)vpd[3]) >= 0x20) {
+            UInt32 maxLba = ((UInt32)vpd[20] << 24) |
+                            ((UInt32)vpd[21] << 16) |
+                            ((UInt32)vpd[22] << 8) | (UInt32)vpd[23];
+            UInt32 maxDesc = ((UInt32)vpd[24] << 24) |
+                             ((UInt32)vpd[25] << 16) |
+                             ((UInt32)vpd[26] << 8) | (UInt32)vpd[27];
+
+            fUnmapEnabled = (maxLba != 0 && maxDesc != 0);
+            setProperty("MPRUnmapMaxLbaCount",
+                        (unsigned long long)maxLba, 32);
+            setProperty("MPRUnmapMaxDescriptors",
+                        (unsigned long long)maxDesc, 32);
+        }
+        setProperty("MPRUnmapEnabled",
+                    (unsigned long long)(fUnmapEnabled ? 1 : 0), 8);
+    }
+
     nub = new MPRBlockDev;
     if (nub == NULL) {
         setProperty("MPRBlockDeviceState", "failed-nub-alloc");
@@ -2633,7 +2657,7 @@ MPRController::start(IOService *provider)
     fIoRetryCount = 0;
     fFrozenSmid = 0;
     fTimedOutSmid = 0;
-    fUnmapEnabled = true;
+    fUnmapEnabled = false;
     fReinitInProgress = false;
     fCommandCount = 0;
     fTmfCount = 0;
@@ -2683,7 +2707,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.15.2");
+    setProperty("MPRBuild", "0.15.3");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3042,6 +3066,34 @@ MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
     return mapped == kIOReturnSuccess;
 }
 
+bool
+MPRController::scsiInquiryVpd(UInt8 page, UInt8 *buf, UInt32 len)
+{
+    UInt8 cdb[6];
+    UInt8 *staging;
+    IOReturn status = kIOReturnIOError;
+
+    if (buf == NULL || len == 0 || fDataBuffer == NULL) {
+        return false;
+    }
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x12;                 /* INQUIRY */
+    cdb[1] = 0x01;                 /* EVPD */
+    cdb[2] = page;
+    cdb[3] = (UInt8)((len >> 8) & 0xFF);
+    cdb[4] = (UInt8)(len & 0xFF);
+    if (!issueScsiCommand(cdb, sizeof(cdb), MPI2_SCSIIO_CONTROL_READ,
+                          NULL, len, 8, &status)) {
+        return false;
+    }
+    staging = (UInt8 *)fDataBuffer->getBytesNoCopy();
+    if (staging == NULL) {
+        return false;
+    }
+    memcpy(buf, staging, len);
+    return true;
+}
+
 IOReturn
 MPRController::scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid)
 {
@@ -3354,7 +3406,8 @@ MPRController::unmapBlocks(const IOBlockStorageDeviceExtent *extents,
         UInt64 count = extents[i].blockCount;
 
         if (count == 0 || start >= fCapacityBlocks ||
-            count > fCapacityBlocks - start) {
+            count > fCapacityBlocks - start ||
+            count > 0xFFFFFFFFULL) {
             return kIOReturnBadArgument;
         }
     }

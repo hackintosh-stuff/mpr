@@ -191,6 +191,7 @@ private:
     bool   issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen, UInt32 control,
                             const UInt8 *outData, UInt32 dataLen,
                             UInt32 smid, IOReturn *status);
+    bool   scsiInquiryVpd(UInt8 page, UInt8 *buf, UInt32 len);
     IOReturn scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid);
     IOReturn scsiUnmap(const IOBlockStorageDeviceExtent *extents,
                        UInt32 extentsCount, UInt32 smid);
