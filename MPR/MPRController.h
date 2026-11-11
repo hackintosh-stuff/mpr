@@ -103,6 +103,7 @@ private:
     bool                       fInjectTimeout;   /* mpr_timeout_test boot-arg */
     UInt32                     fInjectTmfFail;   /* mpr_tmf_fail boot-arg */
     bool                       fFastPathEnabled; /* SAS Device Page0 flags */
+    bool                       fSuspended;       /* PM sleep in progress */
     UInt32                     fHighPriorityCredit;
     volatile UInt32            fEventReplyCount;
     volatile UInt32            fEventAckCount;
@@ -204,6 +205,12 @@ public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn powerStateWillChangeTo(IOPMPowerFlags capabilities,
+                                            unsigned long stateNumber,
+                                            IOService *whatDevice) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn powerStateDidChangeTo(IOPMPowerFlags capabilities,
+                                           unsigned long stateNumber,
+                                           IOService *whatDevice) APPLE_KEXT_OVERRIDE;
 
     /* MPRBlockDev relays every request through these accessors. */
     IOReturn readBlocks(IOMemoryDescriptor *buffer, UInt64 block,

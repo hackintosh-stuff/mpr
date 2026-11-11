@@ -2674,6 +2674,7 @@ MPRController::start(IOService *provider)
     fInjectTimeout = false;
     fInjectTmfFail = 0;
     fFastPathEnabled = false;
+    fSuspended = false;
     fHighPriorityCredit = 0;
     fEventReplyCount = 0;
     fEventAckCount = 0;
@@ -2711,7 +2712,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.15.4");
+    setProperty("MPRBuild", "0.15.5");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -2800,6 +2801,35 @@ MPRController::stop(IOService *provider)
         fReplyLock = NULL;
     }
     super::stop(provider);
+}
+
+IOReturn
+MPRController::powerStateWillChangeTo(IOPMPowerFlags capabilities,
+                                      unsigned long stateNumber,
+                                      IOService *whatDevice)
+{
+    if ((capabilities & kIOPMPowerOn) == 0) {
+        /* Sleep: stop accepting new IO. The controller is revalidated by the
+         * next IO after wake; an HBA that lost state will time out and drive
+         * the normal TMF/reset recovery. */
+        fSuspended = true;
+        fStopping = true;
+        setProperty("MPRPowerState", "sleep");
+    }
+    return super::powerStateWillChangeTo(capabilities, stateNumber, whatDevice);
+}
+
+IOReturn
+MPRController::powerStateDidChangeTo(IOPMPowerFlags capabilities,
+                                     unsigned long stateNumber,
+                                     IOService *whatDevice)
+{
+    if ((capabilities & kIOPMPowerOn) != 0 && fSuspended) {
+        fSuspended = false;
+        fStopping = false;
+        setProperty("MPRPowerState", "wake");
+    }
+    return super::powerStateDidChangeTo(capabilities, stateNumber, whatDevice);
 }
 
 /* ------------------------------------------------------------------------ */
