@@ -29,7 +29,7 @@
  */
 
 /*
- * mpi2_min.h - minimal MPI2.5 system-interface subset for the M1-a stage.
+ * mpi2_min.h - minimal MPI2.5 system-interface subset for this controller driver.
  *
  * Values and structure layouts are transcribed from FreeBSD
  * sys/dev/mpr/mpi/{mpi2.h,mpi2_ioc.h} at the fixed reference commit in
@@ -273,7 +273,7 @@ static_assert(offsetof(MPRIOCInitRequest, ReplyFreeQueueAddress) == 0x38,
               "reply free queue offset");
 
 /* ---------------------------------------------------------------------- */
-/* M1-c: config page request/response over the request/reply queues.       */
+/* config page request/response over the request/reply queues.       */
 
 /* Reply descriptor flags (mpi2.h:546-557) */
 #define MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK      0x0F
@@ -377,7 +377,7 @@ static_assert(offsetof(MPRConfigRequest, SgeFlagsLength) == 0x1C, "config SGE of
 static_assert(offsetof(MPRConfigPageMan0, ChipName) == 0x04, "ChipName offset");
 
 /* ---------------------------------------------------------------------- */
-/* M2-b: EventNotification and PortEnable.                                 */
+/* EventNotification and PortEnable.                                 */
 
 /* Event numbers (mpi2_ioc.h:581-614) */
 #define MPI2_EVENT_STATE_CHANGE                    0x0002
@@ -479,7 +479,7 @@ static_assert(offsetof(MPREventNotifyReply, EventContext) == 0x18, "event contex
 static_assert(sizeof(MPREventDataSasDiscovery) == 0x0C, "SAS discovery data layout");
 
 /* ---------------------------------------------------------------------- */
-/* M2-c: extended config pages (SAS IO Unit).                              */
+/* extended config pages (SAS IO Unit).                              */
 
 /* Extended page type / ext page type (mpi2_cnfg.h:342, :348, :350) */
 #define MPI2_CONFIG_PAGETYPE_EXTENDED              0x0F
@@ -526,7 +526,7 @@ static_assert(sizeof(MPRSasIOUnit0PhyData) == 0x14, "SAS IO Unit0 phy data layou
 #define MPI2_SAS_DEVICE_PGAD_HANDLE_MASK           0x0000FFFF
 
 /* ---------------------------------------------------------------------- */
-/* M3-a: SCSI IO request over the request/reply queues.                    */
+/* SCSI IO request over the request/reply queues.                    */
 
 /* RequestFlags type for SCSI IO (mpi2.h:418) */
 #define MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO            0x00
@@ -626,7 +626,7 @@ static_assert(offsetof(MPRScsiIoRequest, Control) == 0x3C, "SCSI IO control offs
 #define MPR_SASDEV0_DEVICEINFO_OFF                 0x1C
 
 /* ---------------------------------------------------------------------- */
-/* M4: task management, SCSI status/state and fixed-format sense data.     */
+/* task management, SCSI status/state and fixed-format sense data.     */
 /* Layouts and values transcribed from FreeBSD                             */
 /* sys/dev/mpr/mpi/{mpi2_init.h,mpi2.h} at the reference commit in         */
 /* PLAN.md section 2.                                                      */
@@ -716,7 +716,7 @@ static_assert(offsetof(MPRScsiTaskMgmtReply, TerminationCount) == 0x14,
               "TM TerminationCount offset");
 
 /* ---------------------------------------------------------------------- */
-/* M4 fixes: high-priority TM descriptor, EventAck and event mask polarity.  */
+/* High-priority task-management descriptor, EventAck and event-mask constants. */
 
 /* mpi2.h:420-421 */
 #define MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY      0x06

@@ -23,7 +23,7 @@ private:
     IOMemoryMap      *fMMIO;
     volatile UInt32  *fRegs;
 
-    /* M1-b: IOC Init control structures, all in low 4 GB physical memory. */
+    /* IOC Init control structures, all in low 4 GB physical memory. */
     IOBufferMemoryDescriptor *fQueueBuffer;
     IOBufferMemoryDescriptor *fReplyBuffer;
     IOBufferMemoryDescriptor *fRequestBuffer;
@@ -41,12 +41,12 @@ private:
     UInt32           fMaxReplyDepth;
     bool             fFactsValid;
 
-    /* M1-c: config page data buffer and reply consumption index. */
+    /* config page data buffer and reply consumption index. */
     IOBufferMemoryDescriptor *fPageBuffer;
     UInt64           fPagePhys;
     UInt32           fReplyPostIndex;
 
-    /* M2-a: reply interrupt delivery. */
+    /* reply interrupt delivery. */
     IOWorkLoop                *fWorkLoop;
     IOFilterInterruptEventSource *fInterrupt;
     volatile UInt32            fReplyCount;
@@ -54,7 +54,7 @@ private:
     volatile UInt32            fReplyViaIrq;
     UInt8                      fLastReply[64];
 
-    /* M2-b: firmware event notifications. */
+    /* firmware event notifications. */
     volatile UInt32            fEventCount;
     UInt16                     fLastEvent;
     UInt16                     fLastEventDataLength;
@@ -63,23 +63,23 @@ private:
     UInt32                     fEventSeen[4];
     UInt8                      fLastEventData[64];
 
-    /* M3-c: bulk data buffer for block transfers. In M3-d it stays resident
+    /* Bulk data buffer for block transfers. It stays resident
      * for the lifetime of the nub instead of being freed after one probe. */
     IOBufferMemoryDescriptor  *fDataBuffer;
     UInt64                     fDataPhys;
     UInt32                     fDataBytes;
 
-    /* M3-d: media identity, nub, and serialization of the shared SCSI IO
+    /* media identity, nub, and serialization of the shared SCSI IO
      * path (one outstanding SMID, one reply slot, one staging buffer). */
     MPRBlockDev               *fBlockDev;
     IOLock                    *fIOLock;
     UInt64                     fCapacityBlocks;
     UInt32                     fBlockSize;
-    UInt32                     fM3dNextSmid;
-    volatile UInt32            fM3dIoCount;
-    volatile UInt32            fM3dRetryCount;
+    UInt32                     fNextIoSmid;
+    volatile UInt32            fIoCount;
+    volatile UInt32            fIoRetryCount;
 
-    /* M4: recovery, sense decoding and the write/UNMAP feature gates. */
+    /* recovery, sense decoding and the write/UNMAP feature gates. */
     UInt16                     fFrozenSmid;      /* held until TMF completes */
     UInt16                     fTimedOutSmid;    /* last waitForSmid() timeout */
     bool                       fUnmapEnabled;
@@ -90,9 +90,9 @@ private:
     volatile UInt32            fEventReplyCount;
     volatile UInt32            fEventAckCount;
     volatile UInt32            fReplyFrameReturned;
-    volatile UInt32            fM4CommandCount;
-    volatile UInt32            fM4TmfCount;
-    volatile UInt32            fM4ResetCount;
+    volatile UInt32            fCommandCount;
+    volatile UInt32            fTmfCount;
+    volatile UInt32            fResetCount;
     UInt8                      fLastSenseKey;
     UInt8                      fLastASC;
     UInt8                      fLastASCQ;
@@ -101,7 +101,7 @@ private:
     char                       fProduct[20];
     char                       fRevision[8];
 
-    /* M3-a: SCSI IO completion tracking. */
+    /* SCSI IO completion tracking. */
     UInt32                     fAttachedDevHandle;
     UInt16                     fLastReplySmid;
     UInt32                     fLastReplyKind;   /* 0 none, 1 address reply, 2 scsi success */
@@ -118,15 +118,15 @@ private:
     bool   handshake(const UInt32 *request, UInt32 requestBytes,
                      UInt16 *replyWords, UInt32 replyBytes);
     bool   getIOCFacts(void);
-    bool   runM1a(void);
+    bool   initializeController(void);
 
     bool   allocateQueueMemory(void);
     void   freeQueueMemory(void);
     bool   sendIOCInit(void);
-    bool   runM1b(void);
+    bool   initializeQueues(void);
 
     bool   readManufacturingPage0(void);
-    bool   runM1c(void);
+    bool   readManufacturingInfo(void);
 
     bool   setupInterrupts(void);
     void   teardownInterrupts(void);
@@ -139,31 +139,31 @@ private:
 
     bool   sendEventNotification(void);
     bool   sendPortEnable(void);
-    bool   runM2b(void);
+    bool   enableEventsAndPort(void);
 
     bool   readExtConfigPage(UInt8 extPageType, UInt32 pageAddress,
                              UInt8 *buffer, UInt32 bufferBytes,
                              UInt32 *actualBytes);
     bool   readSasIOUnitPage0(void);
     bool   readSasDevicePage0(UInt32 devHandle);
-    bool   runM2c(void);
+    bool   discoverTopology(void);
 
     void   postScsiIo(UInt32 smid);
     bool   scsiTur(void);
     bool   scsiInquiry(void);
-    bool   runM3a(void);
+    bool   probeScsiIdentity(void);
     bool   scsiReadCapacity16(void);
     bool   scsiReadCapacity10(void);
-    bool   runM3b(void);
+    bool   probeCapacity(void);
 
     bool   scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
                          UInt32 blockSize, UInt32 smid, bool diagnostics);
-    bool   runM3c(void);
+    bool   probeBlockRead(void);
 
-    bool   allocateM3dBuffers(void);
-    bool   runM3d(void);
+    bool   allocateResidentBuffers(void);
+    bool   publishBlockDevice(void);
 
-    /* M4: command submission, auto sense, task management and recovery. */
+    /* command submission, auto sense, task management and recovery. */
     void   postDefaultRequest(UInt32 smid);
     void   postHighPriorityRequest(UInt32 smid);
     void   releaseReplyFrame(UInt32 baddr);

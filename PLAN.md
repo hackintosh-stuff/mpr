@@ -1,6 +1,6 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.9（2026-11-11；源码版本 0.13.0，M4 为**尚未验收且存在明确缺口的实现原型**；测试盘已接回 SAS3008，Debian 下只读复测与受控读写压力测试均 0 错误，最近部署/加载/接盘记录统一见 §9.1）
+状态：草案 v0.9（2026-11-11；源码版本 0.14.0，命名已去除轮次编号，M4 仍为**尚未验收且存在缺口的实现原型**；测试盘已接回 SAS3008，Debian 下只读复测与受控读写压力测试均 0 错误，最近部署/加载/接盘记录统一见 §9.1）
 目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA；已有 1 块获准用于破坏性测试的 SATA SSD，2026-11-11 已接回 SAS3008 并在 Debian 下按型号/序列号/容量现场核对（`/dev/sdd`，状态见 §9.1），不得沿用历史设备号推断当前身份。
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
@@ -309,7 +309,7 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 
 | 对象 | 可确认的状态 | 边界 |
 |---|---|---|
-| 仓库源码 | `MPR/Info.plist` 与构建脚本标记 0.13.0；包含读写、UNMAP、sense 和 TMF/复位的初步实现 | §9.3 已确认实现缺口，M4 不能标记“代码完成” |
+| 仓库源码 | `MPR/Info.plist` 与构建脚本标记 0.14.0；属性名、方法名、成员名与宏名已去除里程碑轮次编号，包含读写、UNMAP、sense 和 TMF/复位的初步实现 | §9.3 已确认实现缺口，M4 不能标记“代码完成”；0.14.0 尚未编译/部署/加载验证 |
 | 最近编译/部署记录 | 0.13.0 经 `tools/build-noxcode.sh` 在目标 macOS 使用 Apple clang 21 构建、链接及 ad-hoc 签名；原记录称 `plutil -lint`、bundle 类型和内部符号校验通过，并已替换内部 SATA ESP 的 MPR.kext | 原记录未重启；构建和部署记录不证明当前代码已正确运行 |
 | 最近实际加载记录 | `com.ling.MPR (0.12.2)`，M3-d 只读 `IOMedia` | 不能把 ESP 中 0.13.0 的版本写成已加载版本；下一次实机工作先核对 |
 | SAS3008 / 固件 | PCI `0x1000:0x0097`；MPI 2.5；FW `09.00.00.00`；`IOCCapabilities=0x6985c` 包含 `INTEGRATED_RAID=0x1000`，此前未枚举 IR 卷 | 已验证对象是带 IR 能力固件下的独立 SATA 盘；尚非完整 IT/IR 兼容矩阵 |
@@ -335,7 +335,7 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 
 ### 9.3 已确认的实现缺口与修正要求
 
-以下依据当前 `MPR/MPRController.cpp`、`MPR/MPRBlockDev.cpp`、`MPR/MPI/mpi2_min.h` 及 §2 固定参考源码。**本次只修正文档，这些源码缺口尚未修复。** 表中按函数定位，不将易漂移的本仓库行号作为唯一依据。
+以下依据当前 `MPR/MPRController.cpp`、`MPR/MPRBlockDev.cpp`、`MPR/MPI/mpi2_min.h` 及 §2 固定参考源码。表中按函数定位，不将易漂移的本仓库行号作为唯一依据。**当前状态**：D1（reply frame 归还）、D2（事件掩码极性、订阅应答与 EVENT_ACK）、D4（复位/卸载顺序）、D5（恢复失败保持离线、写不重试）、D6（high-priority TMF）、D7（RC16 编码与 RC10 哨兵）已在源码中做了对应修改，但 0.14.0 **尚未编译、部署或加载验证**；D3（按 SMID 保存结果、串行消费回复队列）与 D8–D12 仍未处理。表中「必须完成的修正与验收」仍是完整要求，不能因部分改动而标记完成。
 
 | # | 当前实现 / 问题 | 必须完成的修正与验收 |
 |---|---|---|

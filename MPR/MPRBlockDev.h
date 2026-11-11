@@ -5,7 +5,7 @@
 
 class MPRController;
 
-/* M3-d: transport nub for the single STP/SATA target. IOStorageFamily's
+/* transport nub for the single STP/SATA target. IOStorageFamily's
  * IOBlockStorageDriver matches on device-type = Generic, then creates the
  * IOMedia object. Every request is relayed to MPRController; the nub owns no
  * hardware state of its own. */

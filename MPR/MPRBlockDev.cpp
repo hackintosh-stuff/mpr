@@ -160,8 +160,8 @@ MPRBlockDev::reportWriteProtection(bool *isWriteProtected)
     if (isWriteProtected == NULL) {
         return kIOReturnBadArgument;
     }
-    /* M4 exposes a writable IOMedia. UNMAP is still gated in the controller
-     * and is disabled at runtime on the first failure (risk R11). */
+    /* The media is writable. UNMAP is still gated in the controller and
+     * is disabled at runtime on the first failure (risk R11). */
     *isWriteProtected = false;
     return kIOReturnSuccess;
 }

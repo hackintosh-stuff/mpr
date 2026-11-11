@@ -38,3 +38,13 @@ A driver kept on the system volume is not an option here.
 - The plugin is injected from `EFI/OC/Kexts` through a `Kernel > Add` entry.
   Back up `config.plist` next to itself before editing, `plutil -lint` the result,
   and verify that the only difference from the backup is the entry that was added.
+
+## Identifiers: no milestone-round labels
+
+Milestone numbers (M0…M7) are planning vocabulary and belong in `PLAN.md`
+only. Property keys, class names, methods, members, macros, local variables,
+log lines and comments must describe what the code does, not when it was
+written. Never introduce an identifier such as `runM3b`, `fM4TmfCount` or
+`MPRM3bFailure`; use `probeCapacity`, `fTmfCount`, `MPRCapacityProbeFailure`
+instead. Diagnostics keep their meaning across refactors, and a state
+document does not turn into a log.
