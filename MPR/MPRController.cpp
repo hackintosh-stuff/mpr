@@ -2744,7 +2744,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.4");
+    setProperty("MPRBuild", "0.17.5");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3426,11 +3426,20 @@ MPRController::hotplugThread(void)
     /* The event is followed by a full controller reset: it quiesces the IOC,
      * re-runs discovery and rebuilds the nub/media. A same-handle discovery
      * retry ends up here once, then fHotplugPending stays clear. */
-    if (resetAndReinitialize()) {
-        setProperty("MPRHotplugState",
-                    fAttachedDevHandle != 0 ? "rebuilt" : "removed");
-    } else {
-        setProperty("MPRHotplugState", "reset-failed");
+    {
+        bool resetOk = resetAndReinitialize();
+
+        setProperty("MPRHotplugResetResult", resetOk ? "ok" : "failed");
+        setProperty("MPRHotplugBlockDev",
+                    (unsigned long long)(fBlockDev != NULL ? 1 : 0), 8);
+        setProperty("MPRHotplugHandle",
+                    (unsigned long long)fAttachedDevHandle, 16);
+        if (resetOk) {
+            setProperty("MPRHotplugState",
+                        fAttachedDevHandle != 0 ? "rebuilt" : "removed");
+        } else {
+            setProperty("MPRHotplugState", "reset-failed");
+        }
     }
     /* Discovery completes for several seconds after the reset; do not let
      * those events trigger another rebuild. */
