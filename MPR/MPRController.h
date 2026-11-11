@@ -12,6 +12,7 @@
 
 class IOPCIDevice;
 class MPRBlockDev;
+struct IOBlockStorageDeviceExtent;
 
 class MPRController : public IOService
 {
@@ -77,6 +78,19 @@ private:
     UInt32                     fM3dNextSmid;
     volatile UInt32            fM3dIoCount;
     volatile UInt32            fM3dRetryCount;
+
+    /* M4: recovery, sense decoding and the write/UNMAP feature gates. */
+    UInt16                     fFrozenSmid;      /* held until TMF completes */
+    UInt16                     fTimedOutSmid;    /* last waitForSmid() timeout */
+    bool                       fUnmapEnabled;
+    bool                       fReinitInProgress;
+    volatile UInt32            fM4CommandCount;
+    volatile UInt32            fM4TmfCount;
+    volatile UInt32            fM4ResetCount;
+    UInt8                      fLastSenseKey;
+    UInt8                      fLastASC;
+    UInt8                      fLastASCQ;
+
     char                       fVendor[16];
     char                       fProduct[20];
     char                       fRevision[8];
@@ -143,6 +157,19 @@ private:
     bool   allocateM3dBuffers(void);
     bool   runM3d(void);
 
+    /* M4: command submission, auto sense, task management and recovery. */
+    void   postDefaultRequest(UInt32 smid);
+    IOReturn decodeSense(IOReturn fallback);
+    bool   issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen, UInt32 control,
+                            const UInt8 *outData, UInt32 dataLen,
+                            UInt32 smid, IOReturn *status);
+    IOReturn scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid);
+    IOReturn scsiUnmap(const IOBlockStorageDeviceExtent *extents,
+                       UInt32 extentsCount, UInt32 smid);
+    bool   sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid);
+    bool   recoverTimedOutCommand(UInt32 smid);
+    bool   resetAndReinitialize(void);
+
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
@@ -151,6 +178,11 @@ public:
     /* MPRBlockDev relays every request through these accessors. */
     IOReturn readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
                         UInt64 nblks, UInt64 *actualBytes);
+    IOReturn transferBlocks(bool write, IOMemoryDescriptor *buffer,
+                            UInt64 block, UInt64 nblks, UInt64 *actualBytes);
+    IOReturn synchronizeCache(UInt64 block, UInt64 nblks);
+    IOReturn unmapBlocks(const IOBlockStorageDeviceExtent *extents,
+                         UInt32 extentsCount);
     UInt64   getCapacityBlocks(void) const { return fCapacityBlocks; }
     UInt32   getBlockSize(void) const { return fBlockSize; }
     char    *getVendorString(void) { return fVendor; }

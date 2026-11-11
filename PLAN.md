@@ -1,6 +1,6 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.7（2026-11-11；M3-d 完成：`MPRBlockDev` nub 与 `IOMedia` 已在真机生成，ESP 部署 0.12.2；测试盘不可读扇区已由 Debian `mpt3sas` 交叉验证，Windows 格式化后 4 GiB 读写正常，M4 前需接回 SAS3008 复测）
+状态：草案 v0.8（2026-11-11；M4 代码完成于 0.13.0，尚未编译/部署/验证；待接盘后统一安排读写测试。M3-d 的 `IOMedia` 已在真机验证，ESP 当前仍是 0.12.2）
 目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**已接入；已接 1 块 SATA SSD 测试盘，允许读写**）
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
@@ -436,3 +436,17 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 **验收边界**：§6 的「1 GB 顺序读无错」需更换测试盘后重跑。已在 Debian 13 救援环境用上游 `mpt3sas` 对同一块盘交叉验证：按型号/序列号/容量/分区布局确定为 `/dev/sdb`，`dd bs=1M count=1024` 同样在读过程中报 `Input/output error`，内核日志为 `Sense Key : Medium Error` / `Add. Sense: Unrecovered read error` / `critical medium error, dev sdb`；macOS 侧稳定失败的 LBA 1255072–1255074 在 Debian 下用 `O_DIRECT` 单扇区读同样 9/9 失败，其它 LBA 正常。两套驱动得到相同的 sense，故这是测试盘样本的物理属性，不计为驱动缺陷，也不能用来掩盖驱动缺陷。该盘改接 Windows（`Realtek RTL9210B-CG` USB 桥）并格式化为 exFAT 后，1 GiB 与 4 GiB 两轮写后回读（含 `FILE_FLAG_NO_BUFFERING` 直读）均为 0 错误、事件日志无磁盘错误；写入/格式化可能已触发主控重映射或改变了链路行为，但这不能证明 SAS3008 下已恢复。
 
 **下一步 M4**：WRITE(10) / SYNCHRONIZE CACHE / UNMAP、auto sense、超时与 TMF、diag reset 恢复。继续前需把盘接回 SAS3008 复测（仍报错则换盘），并重新取得 kext 部署与必要重启的授权。
+
+### 9.13 M4：读写与恢复代码（2026-11-11，代码完成，未做真机验证）
+
+本轮只写代码：**没有部署 kext、没有重启、没有接测试盘**。ESP 仍是 0.12.2；0.13.0 只是源码与构建脚本版本。目标机当时处于 Debian，本机也没有可用的 macOS kext 编译工具链，因此本节所有功能都尚未编译或加载验证。
+
+- **写**：`reportWriteProtection` 返回 false，`doAsyncReadWrite` 接受 `kIODirectionOut`；`readBlocks` 泛化为 `transferBlocks(write, ...)`，写时先把 `IOMemoryDescriptor` 的数据搬入常驻低 4GB 暂存缓冲，再提交 M3-c 已验证的 WRITE(10)（`0x2A`）。M3 的读路径保持同步分块、轮换 SMID 与三次重试。
+- **SYNCHRONIZE CACHE(10)**（`0x35`）：覆写 `doSynchronize` / `doSynchronizeCache`，无数据阶段、零长度 IEEE SGE；16 位块数为 0 表示刷到介质末尾。
+- **UNMAP**（`0x42`）：按 SBC 参数列表构造 8 字节头 + 每个 extent 16 字节描述符，覆写 `doUnmap`，首版上限 32 个 extent；首次失败即禁用本会话的 UNMAP 并保留只读路径（R11）。
+- **auto sense**：`decodeSense` 解析固定/描述符格式 sense 的 key / ASC / ASCQ 并映射为 `IOReturn`（如 `MEDIUM ERROR` → `kIOReturnBadMedia`），M3 的 `CHECK CONDITION` 路径与新增命令共用。
+- **超时与 TMF**：`waitForSmid` 标记真实超时；超时后冻结 SMID，依次发 `ABORT_TASK` / `LUN_RESET` / `TARGET_RESET`（默认描述符 `0x08`，SMID 26..28），检查 TM reply 的 `ResponseCode` / `IOCStatus`；三级失败才做 diag reset 恢复（teardown → free → `diagReset` → `runM1a`/`runM1b` → EventNotification/PortEnable → 重读 SAS IO Unit Page0 刷新 devhandle）。
+- **MPI**：`MPRScsiTaskMgmtRequest` / `Reply` 按 FreeBSD `mpi2_init.h` 布局落到 `MPI/mpi2_min.h`（0x34 / 0x1C，附 `static_assert`）。
+- **诊断属性**：`MPRM4Features`、`MPRM4SenseKey/ASC/ASCQ`、`MPRM4MappedStatus`、`MPRM4Tmf*`、`MPRM4FrozenSmid`、`MPRM4Recovery`、`MPRM4ReinitState`、`MPRM4ResetCount`、`MPRM4UnmapDisabled`。
+
+**验证状态**：本机 `py -3` 静态检查通过（控制器 12 个 / nub 5 个方法的声明与定义、MPI 常量、TM 结构布局、括号平衡）；WSL g++ 无法解析 MacKernelSDK 的 clang 专有头，故 **0.13.0 未经编译器验证**。接盘后的统一测试须先在 macOS 上执行 `tools/build-noxcode.sh`，编译通过后再部署与重启，并按 §6 的 M4 验收项安排 `dd` 写后回读、`diskutil` 分区/卸载、超时注入与 24 h 混合读写。

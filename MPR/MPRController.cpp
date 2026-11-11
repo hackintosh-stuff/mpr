@@ -903,6 +903,7 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
 {
     UInt32 i;
 
+    fTimedOutSmid = 0;
     /* A reply left over from an earlier command must not be mistaken for the
      * completion of this one. Each M3-d command uses a rotating SMID, so the
      * SMID in the reply descriptor identifies the command unambiguously. */
@@ -913,7 +914,13 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
         IOSleep(1);
     }
     processReplyQueue();
-    return fReplyCount > 0 && fLastReplySmid == (UInt16)smid;
+    if (fReplyCount > 0 && fLastReplySmid == (UInt16)smid) {
+        return true;
+    }
+    /* M4 uses this to distinguish a real timeout (needs TMF) from a SCSI
+     * status error (needs sense decoding). */
+    fTimedOutSmid = (UInt16)smid;
+    return false;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1729,6 +1736,12 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
             setProperty("MPRM3dLastFailReplyCount",
                         (unsigned long long)fReplyCount, 32);
         }
+        /* A genuine timeout means the firmware may still own the request
+         * frame. Freeze that SMID and abort/reset the target before any new
+         * command reuses it (PLAN section 5 rule 5, risk R6). */
+        if (fTimedOutSmid == (UInt16)smid) {
+            recoverTimedOutCommand(smid);
+        }
         return false;
     }
     if (fLastReplyKind == 2) {
@@ -1753,6 +1766,7 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
     if (!diagnostics) {
         UInt8 *sense;
         UInt64 words[4];
+        IOReturn mapped;
 
         setProperty("MPRM3dLastFailure", "scsi-status");
         setProperty("MPRM3dLastFailSmid", (unsigned long long)smid, 16);
@@ -1779,6 +1793,11 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
                 setProperty("MPRM3dSenseW3", words[3], 64);
             }
         }
+        /* Auto sense: the IOC already copied the sense data into our buffer;
+         * translate it into a meaningful IOReturn for the storage stack. */
+        mapped = decodeSense(kIOReturnIOError);
+        setProperty("MPRM4MappedStatus",
+                    (unsigned long long)(UInt32)mapped, 32);
     }
     return false;
 }
@@ -1872,8 +1891,8 @@ MPRController::runM3c(void)
 /* M3-d: IOBlockStorageDevice nub, IOMedia, and the block read path.        */
 
 IOReturn
-MPRController::readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
-                          UInt64 nblks, UInt64 *actualBytes)
+MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
+                              UInt64 block, UInt64 nblks, UInt64 *actualBytes)
 {
     UInt8 *staging;
     UInt64 byteCount, done = 0, maxBlocks, remaining, want;
@@ -1946,8 +1965,21 @@ MPRController::readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
         fM3dNextSmid++;
         fM3dIoCount++;
 
+        /* A write must copy the client's data into the low-4GB staging buffer
+         * before the request frame is posted. scsiReadWrite() no longer
+         * clears the staging buffer on writes. */
+        if (write) {
+            copied = buffer->readBytes((IOByteCount)done, staging, chunkBytes);
+            if (copied != chunkBytes) {
+                setProperty("MPRM4Failure", "stage-write");
+                setProperty("MPRM4DoneBytes", done, 64);
+                status = kIOReturnUnderrun;
+                break;
+            }
+        }
+
         for (attempt = 0; attempt < 3 && !ok; attempt++) {
-            ok = scsiReadWrite(false, lba, chunkBlocks, fBlockSize,
+            ok = scsiReadWrite(write, lba, chunkBlocks, fBlockSize,
                                smid, false);
             if (!ok) {
                 fM3dRetryCount++;
@@ -1955,6 +1987,7 @@ MPRController::readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
             }
         }
         if (!ok) {
+            setProperty("MPRM4Failure", "scsi-io");
             setProperty("MPRM3dFailure", "scsi-io");
             setProperty("MPRM3dFailureLba", lba, 64);
             setProperty("MPRM3dFailureSmid", (unsigned long long)smid, 16);
@@ -1966,14 +1999,18 @@ MPRController::readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
             status = kIOReturnDeviceError;
             break;
         }
-        copied = buffer->writeBytes((IOByteCount)done, staging, chunkBytes);
-        done += (UInt64)copied;
-        if (copied != chunkBytes) {
-            setProperty("MPRM3dFailure", "copy");
-            setProperty("MPRM3dFailureCopied", (unsigned long long)copied, 64);
-            setProperty("MPRM3dDoneBytes", done, 64);
-            status = kIOReturnUnderrun;
-            break;
+        if (!write) {
+            copied = buffer->writeBytes((IOByteCount)done, staging, chunkBytes);
+            done += (UInt64)copied;
+            if (copied != chunkBytes) {
+                setProperty("MPRM3dFailure", "copy");
+                setProperty("MPRM3dFailureCopied", (unsigned long long)copied, 64);
+                setProperty("MPRM3dDoneBytes", done, 64);
+                status = kIOReturnUnderrun;
+                break;
+            }
+        } else {
+            done += (UInt64)chunkBytes;
         }
     }
     IOLockUnlock(fIOLock);
@@ -2355,6 +2392,16 @@ MPRController::start(IOService *provider)
     fM3dNextSmid = 0;
     fM3dIoCount = 0;
     fM3dRetryCount = 0;
+    fFrozenSmid = 0;
+    fTimedOutSmid = 0;
+    fUnmapEnabled = true;
+    fReinitInProgress = false;
+    fM4CommandCount = 0;
+    fM4TmfCount = 0;
+    fM4ResetCount = 0;
+    fLastSenseKey = 0xFF;
+    fLastASC = 0;
+    fLastASCQ = 0;
     memset(fVendor, 0, sizeof(fVendor));
     memset(fProduct, 0, sizeof(fProduct));
     memset(fRevision, 0, sizeof(fRevision));
@@ -2387,8 +2434,10 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M3d");
-    setProperty("MPRBuild", "0.12.2");
+    setProperty("MPRStage", "M4");
+    setProperty("MPRBuild", "0.13.0");
+    setProperty("MPRM4Features",
+                "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
@@ -2452,4 +2501,454 @@ MPRController::stop(IOService *provider)
         fIOLock = NULL;
     }
     super::stop(provider);
+}
+
+/* ------------------------------------------------------------------------ */
+/* M4: write, SYNCHRONIZE CACHE, UNMAP, auto sense, TMF and diag reset.      */
+/* SMID map: 1..4 config/events, 5..9 startup probes, 10..25 runtime IO,    */
+/* 26..28 task management, 29 sync cache, 30 UNMAP.                         */
+
+#define MPR_SM_TMF_BASE         26
+#define MPR_SM_SYNC_CACHE       29
+#define MPR_SM_UNMAP            30
+#define MPR_MAX_UNMAP_EXTENTS   32
+
+IOReturn
+MPRController::readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
+                          UInt64 nblks, UInt64 *actualBytes)
+{
+    return transferBlocks(false, buffer, block, nblks, actualBytes);
+}
+
+void
+MPRController::postDefaultRequest(UInt32 smid)
+{
+    /* Config and task-management messages use the default descriptor type;
+     * only SCSI IO uses the fast-path descriptor (see postScsiIo). */
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET,
+             MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (smid << 16));
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+}
+
+IOReturn
+MPRController::decodeSense(IOReturn fallback)
+{
+    UInt8 *sense;
+    UInt8 response, key = 0xFF, asc = 0, ascq = 0;
+
+    if (fPageBuffer == NULL) {
+        return fallback;
+    }
+    sense = (UInt8 *)fPageBuffer->getBytesNoCopy();
+    if (sense == NULL) {
+        return fallback;
+    }
+    sense += MPR_SENSE_OFFSET;
+    response = sense[0] & 0x7F;
+
+    if (response == 0x70 || response == 0x71) {         /* fixed format */
+        key = sense[2] & 0x0F;
+        if (sense[7] >= 6) {
+            asc = sense[12];
+            ascq = sense[13];
+        }
+    } else if (response == 0x72 || response == 0x73) {  /* descriptor format */
+        key = sense[1] & 0x0F;
+        asc = sense[2];
+        ascq = sense[3];
+    } else {
+        return fallback;                                 /* no usable sense */
+    }
+
+    fLastSenseKey = key;
+    fLastASC = asc;
+    fLastASCQ = ascq;
+    setProperty("MPRM4SenseKey", (unsigned long long)key, 8);
+    setProperty("MPRM4ASC", (unsigned long long)asc, 8);
+    setProperty("MPRM4ASCQ", (unsigned long long)ascq, 8);
+
+    switch (key) {
+        case MPR_SENSE_KEY_NO_SENSE:
+        case MPR_SENSE_KEY_RECOVERED_ERROR:
+            return kIOReturnSuccess;
+        case MPR_SENSE_KEY_NOT_READY:
+        case MPR_SENSE_KEY_UNIT_ATTENTION:
+            return kIOReturnNotReady;
+        case MPR_SENSE_KEY_MEDIUM_ERROR:
+        case MPR_SENSE_KEY_BLANK_CHECK:
+            return kIOReturnBadMedia;
+        case MPR_SENSE_KEY_HARDWARE_ERROR:
+            return kIOReturnDeviceError;
+        case MPR_SENSE_KEY_ILLEGAL_REQUEST:
+            return kIOReturnUnsupported;
+        case MPR_SENSE_KEY_DATA_PROTECT:
+            return kIOReturnNotWritable;
+        case MPR_SENSE_KEY_ABORTED_COMMAND:
+            return kIOReturnAborted;
+        default:
+            return fallback;
+    }
+}
+
+bool
+MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
+                                UInt32 control, const UInt8 *outData,
+                                UInt32 dataLen, UInt32 smid,
+                                IOReturn *status)
+{
+    UInt8 *frame, *staging;
+    MPRScsiIoRequest *request;
+    MPRScsiIoReply *reply;
+    IOReturn mapped;
+    bool posted;
+
+    if (status != NULL) {
+        *status = kIOReturnNotReady;
+    }
+    if (fRequestBuffer == NULL || fPageBuffer == NULL || fDataBuffer == NULL ||
+        cdb == NULL || cdbLen == 0 || cdbLen > 32 || smid == 0 ||
+        smid >= fRequestCount || dataLen > fDataBytes ||
+        fAttachedDevHandle == 0) {
+        return false;
+    }
+    if (fFrozenSmid != 0 && fFrozenSmid == (UInt16)smid) {
+        if (status != NULL) {
+            *status = kIOReturnAborted;
+        }
+        return false;
+    }
+
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    staging = (UInt8 *)fDataBuffer->getBytesNoCopy();
+    if (frame == NULL || staging == NULL) {
+        return false;
+    }
+    frame += smid * fRequestFrameSize;
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPRScsiIoRequest *)frame;
+
+    request->DevHandle = (UInt16)fAttachedDevHandle;
+    request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
+    request->SenseBufferLowAddress = (UInt32)(fPagePhys + MPR_SENSE_OFFSET);
+    request->SenseBufferLength = 96;
+    request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
+    request->DataLength = dataLen;
+    request->IoFlags = (UInt16)(cdbLen | MPI25_SCSIIO_IOFLAGS_FAST_PATH);
+    request->Control = control;
+    memcpy(request->CDB, cdb, cdbLen);
+
+    if (dataLen != 0) {
+        if (outData != NULL) {
+            memcpy(staging, outData, dataLen);
+        } else {
+            memset(staging, 0, dataLen);
+        }
+        mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fDataPhys, dataLen);
+    } else {
+        /* A zero-length IEEE SGE is still required for a data-less command. */
+        mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fPagePhys, 0);
+    }
+
+    fM4CommandCount++;
+    fReplyCount = 0;
+    fLastReplyKind = 0;
+    fLastReplySmid = 0xFFFF;
+    postScsiIo(smid);
+    posted = waitForSmid(15000, smid);
+    if (!posted) {
+        if (status != NULL) {
+            *status = kIOReturnTimeout;
+        }
+        if (fTimedOutSmid == (UInt16)smid) {
+            recoverTimedOutCommand(smid);
+        }
+        return false;
+    }
+    if (fLastReplyKind == 2) {
+        if (status != NULL) {
+            *status = kIOReturnSuccess;
+        }
+        return true;
+    }
+
+    reply = (MPRScsiIoReply *)fLastReply;
+    mapped = kIOReturnIOError;
+    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
+        mapped = kIOReturnDeviceError;
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_CHECK_CONDITION) {
+        mapped = ((reply->SCSIState & MPI2_SCSI_STATE_AUTOSENSE_VALID) != 0)
+                     ? decodeSense(kIOReturnIOError) : kIOReturnDeviceError;
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_BUSY ||
+               reply->SCSIStatus == MPI2_SCSI_STATUS_TASK_SET_FULL ||
+               reply->SCSIStatus == MPI2_SCSI_STATUS_RESERVATION_CONFLICT) {
+        mapped = kIOReturnBusy;
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_TASK_ABORTED) {
+        mapped = kIOReturnAborted;
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_GOOD) {
+        mapped = kIOReturnSuccess;
+    }
+
+    setProperty("MPRM4LastCommandStatus",
+                (unsigned long long)(UInt32)mapped, 32);
+    setProperty("MPRM4LastSCSIStatus",
+                (unsigned long long)reply->SCSIStatus, 8);
+    setProperty("MPRM4LastIOCStatus",
+                (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+    if (status != NULL) {
+        *status = mapped;
+    }
+    return mapped == kIOReturnSuccess;
+}
+
+IOReturn
+MPRController::scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid)
+{
+    UInt8 cdb[10];
+    IOReturn status = kIOReturnNotReady;
+
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x35;                             /* SYNCHRONIZE CACHE(10) */
+    cdb[2] = (UInt8)(lba >> 24);
+    cdb[3] = (UInt8)(lba >> 16);
+    cdb[4] = (UInt8)(lba >> 8);
+    cdb[5] = (UInt8)lba;
+    cdb[7] = (UInt8)(blocks >> 8);
+    cdb[8] = (UInt8)blocks;
+
+    if (!issueScsiCommand(cdb, sizeof(cdb), MPI2_SCSIIO_CONTROL_NODATATRANSFER,
+                          NULL, 0, smid, &status)) {
+        return status;
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn
+MPRController::scsiUnmap(const IOBlockStorageDeviceExtent *extents,
+                         UInt32 extentsCount, UInt32 smid)
+{
+    UInt8 cdb[10];
+    UInt8 params[8 + 16 * MPR_MAX_UNMAP_EXTENTS];
+    UInt32 dataLen = 8 + 16 * extentsCount;
+    UInt32 i;
+    IOReturn status = kIOReturnNotReady;
+
+    if (extents == NULL || extentsCount == 0 ||
+        extentsCount > MPR_MAX_UNMAP_EXTENTS) {
+        return kIOReturnBadArgument;
+    }
+    memset(cdb, 0, sizeof(cdb));
+    memset(params, 0, sizeof(params));
+    cdb[0] = 0x42;                             /* UNMAP */
+    cdb[7] = (UInt8)(dataLen >> 8);            /* parameter list length */
+    cdb[8] = (UInt8)dataLen;
+
+    params[0] = (UInt8)((dataLen - 2) >> 8);   /* UNMAP data length */
+    params[1] = (UInt8)(dataLen - 2);
+    params[2] = (UInt8)((dataLen - 8) >> 8);   /* descriptor data length */
+    params[3] = (UInt8)(dataLen - 8);
+
+    for (i = 0; i < extentsCount; i++) {
+        UInt8 *d = params + 8 + 16 * i;
+        UInt64 start = extents[i].blockStart;
+        UInt64 count = extents[i].blockCount;
+
+        d[0] = (UInt8)(start >> 56);
+        d[1] = (UInt8)(start >> 48);
+        d[2] = (UInt8)(start >> 40);
+        d[3] = (UInt8)(start >> 32);
+        d[4] = (UInt8)(start >> 24);
+        d[5] = (UInt8)(start >> 16);
+        d[6] = (UInt8)(start >> 8);
+        d[7] = (UInt8)start;
+        d[8] = (UInt8)(count >> 24);
+        d[9] = (UInt8)(count >> 16);
+        d[10] = (UInt8)(count >> 8);
+        d[11] = (UInt8)count;
+    }
+
+    if (!issueScsiCommand(cdb, sizeof(cdb), MPI2_SCSIIO_CONTROL_WRITE,
+                          params, dataLen, smid, &status)) {
+        /* R11: a failed UNMAP can drop some SATA SSD firmware. Do not retry
+         * it in this session; the read path stays available. */
+        fUnmapEnabled = false;
+        setProperty("MPRM4UnmapDisabled", "first-unmap-failure");
+        return status;
+    }
+    return kIOReturnSuccess;
+}
+
+bool
+MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
+{
+    UInt8 *frame;
+    MPRScsiTaskMgmtRequest *request;
+    MPRScsiTaskMgmtReply *reply;
+    bool ok = false;
+
+    if (fRequestBuffer == NULL || fAttachedDevHandle == 0 ||
+        smid == 0 || smid >= fRequestCount) {
+        return false;
+    }
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return false;
+    }
+    frame += smid * fRequestFrameSize;
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPRScsiTaskMgmtRequest *)frame;
+    request->DevHandle = (UInt16)fAttachedDevHandle;
+    request->Function = MPI2_FUNCTION_SCSI_TASK_MGMT;
+    request->TaskType = taskType;
+    request->TaskMID = taskMid;
+
+    fM4TmfCount++;
+    fReplyCount = 0;
+    fLastReplyKind = 0;
+    fLastReplySmid = 0xFFFF;
+    postDefaultRequest(smid);
+    if (waitForSmid(15000, smid) && fLastReplyKind == 1) {
+        reply = (MPRScsiTaskMgmtReply *)fLastReply;
+        ok = ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS) &&
+             (reply->ResponseCode == MPI2_SCSITASKMGMT_RSP_TM_COMPLETE ||
+              reply->ResponseCode == MPI2_SCSITASKMGMT_RSP_TM_SUCCEEDED);
+        setProperty("MPRM4TmfResponseCode",
+                    (unsigned long long)reply->ResponseCode, 8);
+        setProperty("MPRM4TmfIOCStatus",
+                    (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+        setProperty("MPRM4TmfTerminationCount",
+                    (unsigned long long)reply->TerminationCount, 32);
+    }
+    setProperty("MPRM4TmfTaskType", (unsigned long long)taskType, 8);
+    setProperty("MPRM4TmfState", ok ? "ok" : "failed");
+    return ok;
+}
+
+bool
+MPRController::recoverTimedOutCommand(UInt32 smid)
+{
+    static const UInt8 levels[3] = {
+        MPI2_SCSITASKMGMT_TASKTYPE_ABORT_TASK,
+        MPI2_SCSITASKMGMT_TASKTYPE_LUN_RESET,
+        MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET
+    };
+    UInt32 i;
+    bool recovered = false;
+
+    if (smid == 0) {
+        return false;
+    }
+    /* Freeze the SMID until the firmware confirms the task is gone; it must
+     * not write a late reply into a reused request frame (risk R6). */
+    fFrozenSmid = (UInt16)smid;
+    setProperty("MPRM4FrozenSmid", (unsigned long long)smid, 16);
+
+    for (i = 0; i < 3 && !recovered; i++) {
+        if (sendTaskMgmt(levels[i], (UInt16)smid, MPR_SM_TMF_BASE + i)) {
+            recovered = true;
+        } else {
+            IOSleep(50);
+        }
+    }
+    if (!recovered) {
+        recovered = resetAndReinitialize();
+    }
+    fFrozenSmid = 0;
+    setProperty("MPRM4Recovery", recovered ? "ok" : "failed");
+    return recovered;
+}
+
+bool
+MPRController::resetAndReinitialize(void)
+{
+    bool ok = false;
+
+    if (fReinitInProgress) {
+        return false;
+    }
+    fReinitInProgress = true;
+    fM4ResetCount++;
+
+    /* Follow the same order as start(): drop the interrupt source and DMA
+     * pools, force the adapter into RESET, then rebuild from IOC Facts. */
+    teardownInterrupts();
+    freeQueueMemory();
+    fReplyPostIndex = 0;
+    fReplyCount = 0;
+    fLastReplySmid = 0xFFFF;
+    fLastReplyKind = 0;
+
+    if (diagReset()) {
+        setupInterrupts();
+        if (runM1a() && runM1b()) {
+            sendEventNotification();
+            sendPortEnable();
+            /* The firmware rebuilt its device table. Clear the cached handle
+             * property so the topology read accepts the new devhandle. */
+            removeProperty("MPRAttachedDevHandle");
+            fAttachedDevHandle = 0;
+            if (readSasIOUnitPage0()) {
+                ok = (fAttachedDevHandle != 0);
+            }
+        }
+    }
+
+    fReinitInProgress = false;
+    setProperty("MPRM4ReinitState", ok ? "ok" : "failed");
+    setProperty("MPRM4ResetCount", (unsigned long long)fM4ResetCount, 32);
+    return ok;
+}
+
+IOReturn
+MPRController::synchronizeCache(UInt64 block, UInt64 nblks)
+{
+    UInt32 blocks;
+    IOReturn status;
+
+    if (fIOLock == NULL || fDataBuffer == NULL || fPageBuffer == NULL ||
+        fCapacityBlocks == 0 || fBlockSize == 0) {
+        return kIOReturnNotReady;
+    }
+    if (block >= fCapacityBlocks) {
+        return kIOReturnBadArgument;
+    }
+    if (nblks == 0 || nblks > fCapacityBlocks - block) {
+        nblks = fCapacityBlocks - block;
+    }
+    /* NUMBER OF LOGICAL BLOCKS is 16-bit; zero means "to end of media". */
+    blocks = (nblks > 0xFFFFULL) ? 0 : (UInt32)nblks;
+
+    IOLockLock(fIOLock);
+    status = scsiSynchronizeCache(block, blocks, MPR_SM_SYNC_CACHE);
+    IOLockUnlock(fIOLock);
+    return status;
+}
+
+IOReturn
+MPRController::unmapBlocks(const IOBlockStorageDeviceExtent *extents,
+                           UInt32 extentsCount)
+{
+    UInt32 i;
+    IOReturn status;
+
+    if (!fUnmapEnabled) {
+        return kIOReturnUnsupported;
+    }
+    if (extents == NULL || extentsCount == 0 ||
+        extentsCount > MPR_MAX_UNMAP_EXTENTS || fIOLock == NULL ||
+        fCapacityBlocks == 0 || fBlockSize == 0) {
+        return kIOReturnBadArgument;
+    }
+    for (i = 0; i < extentsCount; i++) {
+        UInt64 start = extents[i].blockStart;
+        UInt64 count = extents[i].blockCount;
+
+        if (count == 0 || start >= fCapacityBlocks ||
+            count > fCapacityBlocks - start) {
+            return kIOReturnBadArgument;
+        }
+    }
+    IOLockLock(fIOLock);
+    status = scsiUnmap(extents, extentsCount, MPR_SM_UNMAP);
+    IOLockUnlock(fIOLock);
+    return status;
 }

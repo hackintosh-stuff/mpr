@@ -160,8 +160,9 @@ MPRBlockDev::reportWriteProtection(bool *isWriteProtected)
     if (isWriteProtected == NULL) {
         return kIOReturnBadArgument;
     }
-    /* M3 is read-only; WRITE and UNMAP belong to M4. */
-    *isWriteProtected = true;
+    /* M4 exposes a writable IOMedia. UNMAP is still gated in the controller
+     * and is disabled at runtime on the first failure (risk R11). */
+    *isWriteProtected = false;
     return kIOReturnSuccess;
 }
 
@@ -173,24 +174,52 @@ MPRBlockDev::doAsyncReadWrite(IOMemoryDescriptor *buffer,
 {
     UInt64  actualBytes = 0;
     IOReturn status;
+    bool    write;
 
     if (buffer == NULL || completion == NULL || fController == NULL) {
         return kIOReturnBadArgument;
     }
 
     /* A descriptor with kIODirectionOut carries data from memory to the
-     * device. Reject it here rather than issuing a WRITE(10) in M3. */
-    if ((buffer->getDirection() & kIODirectionOut) != 0) {
-        return kIOReturnNotWritable;
-    }
+     * device; kIODirectionIn carries data read from the device. */
+    write = (buffer->getDirection() & kIODirectionOut) != 0;
 
-    /* MPRController::readBlocks() completes synchronously; the completion is
-     * invoked after the controller lock has been released, so a client that
-     * immediately issues another read cannot deadlock on that lock. */
-    status = fController->readBlocks(buffer, block, nblks, &actualBytes);
+    /* MPRController::transferBlocks() completes synchronously; the completion
+     * is invoked after the controller lock has been released, so a client that
+     * immediately issues another request cannot deadlock on that lock. */
+    status = fController->transferBlocks(write, buffer, block, nblks,
+                                         &actualBytes);
     if (completion->action != NULL) {
         completion->action(completion->target, completion->parameter,
                            status, actualBytes);
     }
     return kIOReturnSuccess;
+}
+
+IOReturn
+MPRBlockDev::doSynchronizeCache(void)
+{
+    /* Deprecated entry point, kept for older IOStorageFamily clients. */
+    return (fController != NULL) ? fController->synchronizeCache(0, 0)
+                                 : kIOReturnNotReady;
+}
+
+IOReturn
+MPRBlockDev::doSynchronize(UInt64 block, UInt64 nblks,
+                           IOStorageSynchronizeOptions options)
+{
+    if (fController == NULL) {
+        return kIOReturnNotReady;
+    }
+    return fController->synchronizeCache(block, nblks);
+}
+
+IOReturn
+MPRBlockDev::doUnmap(IOBlockStorageDeviceExtent *extents,
+                     UInt32 extentsCount, IOStorageUnmapOptions options)
+{
+    if (fController == NULL) {
+        return kIOReturnNotReady;
+    }
+    return fController->unmapBlocks(extents, extentsCount);
 }

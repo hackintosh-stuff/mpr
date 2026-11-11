@@ -625,4 +625,94 @@ static_assert(offsetof(MPRScsiIoRequest, Control) == 0x3C, "SCSI IO control offs
 #define MPR_SASDEV0_DEVHANDLE_OFF                  0x18
 #define MPR_SASDEV0_DEVICEINFO_OFF                 0x1C
 
+/* ---------------------------------------------------------------------- */
+/* M4: task management, SCSI status/state and fixed-format sense data.     */
+/* Layouts and values transcribed from FreeBSD                             */
+/* sys/dev/mpr/mpi/{mpi2_init.h,mpi2.h} at the reference commit in         */
+/* PLAN.md section 2.                                                      */
+
+/* SAM status codes (mpi2_init.h:415-427) */
+#define MPI2_SCSI_STATUS_GOOD                      0x00
+#define MPI2_SCSI_STATUS_CHECK_CONDITION           0x02
+#define MPI2_SCSI_STATUS_BUSY                      0x08
+#define MPI2_SCSI_STATUS_RESERVATION_CONFLICT      0x18
+#define MPI2_SCSI_STATUS_TASK_SET_FULL             0x28
+#define MPI2_SCSI_STATUS_TASK_ABORTED              0x40
+
+/* SCSIState bits (mpi2_init.h:429-435) */
+#define MPI2_SCSI_STATE_AUTOSENSE_VALID            0x01
+#define MPI2_SCSI_STATE_AUTOSENSE_FAILED           0x02
+#define MPI2_SCSI_STATE_NO_SCSI_STATUS             0x04
+#define MPI2_SCSI_STATE_TERMINATED                 0x08
+#define MPI2_SCSI_STATE_RESPONSE_INFO_VALID        0x10
+
+/* TaskType values (mpi2_init.h:470-480) */
+#define MPI2_SCSITASKMGMT_TASKTYPE_ABORT_TASK      0x01
+#define MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET    0x03
+#define MPI2_SCSITASKMGMT_TASKTYPE_LUN_RESET       0x05
+
+/* TM ResponseCode values (mpi2_init.h:516-524) */
+#define MPI2_SCSITASKMGMT_RSP_TM_COMPLETE          0x00
+#define MPI2_SCSITASKMGMT_RSP_TM_SUCCEEDED         0x08
+
+/* Fixed-format sense keys (SPC-4) */
+#define MPR_SENSE_KEY_NO_SENSE                     0x00
+#define MPR_SENSE_KEY_RECOVERED_ERROR              0x01
+#define MPR_SENSE_KEY_NOT_READY                    0x02
+#define MPR_SENSE_KEY_MEDIUM_ERROR                 0x03
+#define MPR_SENSE_KEY_HARDWARE_ERROR               0x04
+#define MPR_SENSE_KEY_ILLEGAL_REQUEST              0x05
+#define MPR_SENSE_KEY_UNIT_ATTENTION               0x06
+#define MPR_SENSE_KEY_DATA_PROTECT                 0x07
+#define MPR_SENSE_KEY_BLANK_CHECK                  0x08
+#define MPR_SENSE_KEY_ABORTED_COMMAND              0x0B
+
+#pragma pack(push, 1)
+
+/* MPI2_SCSI_TASK_MANAGE_REQUEST: 0x34 bytes (mpi2_init.h:449-468) */
+typedef struct {
+    UInt16  DevHandle;              /* 0x00 */
+    UInt8   ChainOffset;            /* 0x02 */
+    UInt8   Function;               /* 0x03 */
+    UInt8   Reserved1;              /* 0x04 */
+    UInt8   TaskType;               /* 0x05 */
+    UInt8   Reserved2;              /* 0x06 */
+    UInt8   MsgFlags;               /* 0x07 */
+    UInt8   VP_ID;                  /* 0x08 */
+    UInt8   VF_ID;                  /* 0x09 */
+    UInt16  Reserved3;              /* 0x0A */
+    UInt8   LUN[8];                 /* 0x0C */
+    UInt32  Reserved4[7];           /* 0x14 */
+    UInt16  TaskMID;                /* 0x30 */
+    UInt16  Reserved5;              /* 0x32 */
+} MPRScsiTaskMgmtRequest;
+
+/* MPI2_SCSI_TASK_MANAGE_REPLY: 0x1C bytes (mpi2_init.h:495-514) */
+typedef struct {
+    UInt16  DevHandle;              /* 0x00 */
+    UInt8   MsgLength;              /* 0x02 */
+    UInt8   Function;               /* 0x03 */
+    UInt8   ResponseCode;           /* 0x04 */
+    UInt8   TaskType;               /* 0x05 */
+    UInt8   Reserved1;              /* 0x06 */
+    UInt8   MsgFlags;               /* 0x07 */
+    UInt8   VP_ID;                  /* 0x08 */
+    UInt8   VF_ID;                  /* 0x09 */
+    UInt16  Reserved2;              /* 0x0A */
+    UInt16  Reserved3;              /* 0x0C */
+    UInt16  IOCStatus;              /* 0x0E */
+    UInt32  IOCLogInfo;             /* 0x10 */
+    UInt32  TerminationCount;       /* 0x14 */
+    UInt32  ResponseInfo;           /* 0x18 */
+} MPRScsiTaskMgmtReply;
+
+#pragma pack(pop)
+
+static_assert(sizeof(MPRScsiTaskMgmtRequest) == 0x34, "TM request layout");
+static_assert(sizeof(MPRScsiTaskMgmtReply) == 0x1C, "TM reply layout");
+static_assert(offsetof(MPRScsiTaskMgmtRequest, TaskMID) == 0x30,
+              "TM TaskMID offset");
+static_assert(offsetof(MPRScsiTaskMgmtReply, TerminationCount) == 0x14,
+              "TM TerminationCount offset");
+
 #endif /* MPR_MPI2_MIN_H */

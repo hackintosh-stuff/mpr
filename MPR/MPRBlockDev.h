@@ -42,6 +42,12 @@ public:
                                       UInt64 block, UInt64 nblks,
                                       IOStorageAttributes *attributes,
                                       IOStorageCompletion *completion) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn doSynchronizeCache(void) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn doSynchronize(UInt64 block, UInt64 nblks,
+                                   IOStorageSynchronizeOptions options = 0) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn doUnmap(IOBlockStorageDeviceExtent *extents,
+                             UInt32 extentsCount,
+                             IOStorageUnmapOptions options = 0) APPLE_KEXT_OVERRIDE;
 };
 
 #endif /* MPRBlockDev_h */
