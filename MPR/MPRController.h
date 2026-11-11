@@ -111,6 +111,7 @@ private:
     bool   scsiInquiry(void);
     bool   runM3a(void);
     bool   scsiReadCapacity16(void);
+    bool   scsiReadCapacity10(void);
     bool   runM3b(void);
 
 public:
