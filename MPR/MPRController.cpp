@@ -2712,7 +2712,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.15.5");
+    setProperty("MPRBuild", "0.15.6");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3368,11 +3368,16 @@ MPRController::resetAndReinitialize(void)
             memcpy(oldVendor, fVendor, sizeof(oldVendor));
             memcpy(oldProduct, fProduct, sizeof(oldProduct));
             if (probeScsiIdentity() && probeCapacity()) {
-                changed =
+                bool identityChanged =
                     (memcmp(oldVendor, fVendor, sizeof(oldVendor)) != 0) ||
-                    (memcmp(oldProduct, fProduct, sizeof(oldProduct)) != 0) ||
-                    (oldBlocks != fCapacityBlocks) ||
-                    (oldBlockSize != fBlockSize);
+                    (memcmp(oldProduct, fProduct, sizeof(oldProduct)) != 0);
+
+                setProperty("MPRIdentityChanged",
+                            identityChanged ? "yes" : "no");
+                /* Only a geometry change requires a new IOMedia; vendor/
+                 * product padding differences are not a reliable identity. */
+                changed = (oldBlocks != fCapacityBlocks) ||
+                          (oldBlockSize != fBlockSize);
                 if (changed && fBlockDev != NULL) {
                     /* A different target or geometry must not keep the old
                      * media contract; tear the nub down and republish. */
