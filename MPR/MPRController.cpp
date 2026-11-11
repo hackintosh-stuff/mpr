@@ -1,6 +1,8 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/storage/IOBlockStorageDriver.h>
+#include <IOKit/storage/IOMedia.h>
 #include <libkern/OSByteOrder.h>
 #include <kern/task.h>
 #include <pexpert/pexpert.h>
@@ -2301,14 +2303,24 @@ MPRController::publishBlockDevice(void)
         setProperty("MPRBlockDeviceState", "failed-alloc");
         return false;
     }
-    if (fPageBuffer == NULL && fDataBuffer == NULL) {
+    if (fPageBuffer == NULL || fDataBuffer == NULL) {
+        /* probeScsiIdentity()/probeCapacity() release the page buffer when
+         * they finish, while the data buffer from the initial probe remains.
+         * Drop the survivor and allocate a matching pair before rebuilding. */
+        if (fPageBuffer != NULL) {
+            fPageBuffer->release();
+            fPageBuffer = NULL;
+        }
+        if (fDataBuffer != NULL) {
+            fDataBuffer->release();
+            fDataBuffer = NULL;
+        }
+        fPagePhys = 0;
+        fDataPhys = 0;
         if (!allocateResidentBuffers()) {
             setProperty("MPRBlockDeviceState", "failed-alloc");
             return false;
         }
-    } else if (fPageBuffer == NULL || fDataBuffer == NULL) {
-        setProperty("MPRBlockDeviceState", "failed-buffer-state");
-        return false;
     }
 
     {
@@ -2712,7 +2724,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.15.6");
+    setProperty("MPRBuild", "0.15.10");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3321,6 +3333,62 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
     return recovered;
 }
 
+void
+MPRController::rescanPartitions(void)
+{
+    OSIterator *iter;
+    IORegistryEntry *child;
+    IOBlockStorageDriver *driver = NULL;
+    IOMedia *media = NULL;
+
+    if (fBlockDev == NULL) {
+        return;
+    }
+    iter = fBlockDev->getChildIterator(gIOServicePlane);
+    if (iter == NULL) {
+        setProperty("MPRPartitionRescan", "no-child-iterator");
+        return;
+    }
+    while ((child = (IORegistryEntry *)iter->getNextObject()) != NULL) {
+        driver = OSDynamicCast(IOBlockStorageDriver, child);
+        if (driver != NULL) {
+            break;
+        }
+    }
+    iter->release();
+    if (driver == NULL) {
+        setProperty("MPRPartitionRescan", "no-driver");
+        return;
+    }
+
+    iter = driver->getChildIterator(gIOServicePlane);
+    if (iter == NULL) {
+        setProperty("MPRPartitionRescan", "no-media-iterator");
+        return;
+    }
+    while ((child = (IORegistryEntry *)iter->getNextObject()) != NULL) {
+        IOMedia *candidate = OSDynamicCast(IOMedia, child);
+
+        if (candidate != NULL &&
+            candidate->getProperty(kIOMediaWholeKey) == kOSBooleanTrue) {
+            media = candidate;
+            break;
+        }
+    }
+    iter->release();
+    if (media == NULL) {
+        setProperty("MPRPartitionRescan", "no-whole-media");
+        return;
+    }
+    setProperty("MPRPartitionRescanMedia", media->getProperty("BSD Name"));
+    /* resetAndReinitialize() re-enumerated the media with an empty Content,
+     * so IOStorageFamily stopped matching IOGUIDPartitionScheme. Republish
+     * the content key; that re-runs the partition-scheme probe. */
+    media->setProperty(kIOMediaContentKey, "GUID_partition_scheme");
+    media->setProperty(kIOMediaContentHintKey, "");
+    setProperty("MPRPartitionRescan", "guid");
+}
+
 bool
 MPRController::resetAndReinitialize(void)
 {
@@ -3396,6 +3464,20 @@ MPRController::resetAndReinitialize(void)
     fReinitInProgress = false;
     setProperty("MPRReinitState", ok ? "ok" : "failed");
     setProperty("MPRResetCount", (unsigned long long)fResetCount, 32);
+    if (ok) {
+        /* IOMedia's Content is fixed when the media object is created, so a
+         * property write cannot re-run the GPT probe. Rebuild the nub and let
+         * IOBlockStorageDriver create a new media and read LBA1 again. */
+        if (fBlockDev != NULL) {
+            fBlockDev->setController(NULL);
+            fBlockDev->terminate();
+            fBlockDev->detach(this);
+            fBlockDev->release();
+            fBlockDev = NULL;
+        }
+        IOSleep(100);
+        ok = publishBlockDevice();
+    }
     return ok;
 }
 

@@ -152,6 +152,7 @@ private:
     static void interruptAction(OSObject *owner, IOInterruptEventSource *sender,
                                 int index);
     void   processReplyQueue(void);
+    void   rescanPartitions(void);
     bool   waitForReply(UInt32 timeoutMs);
     bool   waitForSmid(UInt32 timeoutMs, UInt32 smid);
     bool   takeReplySlot(UInt32 smid, UInt8 *reply, UInt32 replyLen, UInt8 *kind);
