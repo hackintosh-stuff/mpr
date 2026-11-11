@@ -1247,6 +1247,20 @@ MPRController::runM2c(void)
 /* M3-a: SCSI INQUIRY through the request/reply queues, validating the SCSI  */
 /* IO path before the block-storage nub is added.                            */
 
+/* IEEE simple SGE (16 bytes): Address, Length, Reserved1/2, Flags.
+ * SCSI IO uses IEEE SGEs; only CONFIG requests use the legacy MPI format. */
+static void
+mprFillIeeeSge(UInt8 *sge, UInt64 address, UInt32 length)
+{
+    UInt32 zero = 0;
+    UInt8  flags = 0x40;    /* simple element, system address, end of list */
+
+    memcpy(sge, &address, sizeof(address));
+    memcpy(sge + 8, &length, sizeof(length));
+    memcpy(sge + 12, &zero, sizeof(zero));
+    memcpy(sge + 15, &flags, sizeof(flags));
+}
+
 void
 MPRController::postScsiIo(UInt32 smid)
 {
@@ -1267,7 +1281,7 @@ MPRController::scsiTur(void)
     MPRScsiIoRequest *request;
     MPRScsiIoReply *reply;
     UInt8 *frame;
-    UInt32 value32, sgeFlags, attempt;
+    UInt32 attempt;
     bool posted;
 
     if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fPageBuffer == NULL) {
@@ -1292,12 +1306,8 @@ MPRController::scsiTur(void)
     request->Control = MPI2_SCSIIO_CONTROL_NODATATRANSFER;
     request->CDB[0] = 0x00;                 /* TEST UNIT READY */
 
-    /* A zero-length SGE is still required for a data-less command. */
-    sgeFlags = (UInt32)(MPI2_SGE_FLAGS_SIMPLE_ELEMENT | MPI2_SGE_FLAGS_LAST_ELEMENT |
-                        MPI2_SGE_FLAGS_END_OF_BUFFER | MPI2_SGE_FLAGS_64_BIT_ADDRESSING);
-    value32 = (sgeFlags << MPI2_SGE_FLAGS_SHIFT) | 0;
-    memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4, &value32, sizeof(value32));
-    memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4 + 4, &fPagePhys, sizeof(fPagePhys));
+    /* A zero-length IEEE SGE is still required for a data-less command. */
+    mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fPagePhys, 0);
 
     posted = false;
     for (attempt = 0; attempt < 10 && !posted; attempt++) {
@@ -1339,7 +1349,6 @@ MPRController::scsiInquiry(void)
     MPRScsiIoReply   *reply;
     UInt8 *frame;
     UInt8 *data;
-    UInt32 value32, sgeFlags;
     bool   posted;
     char vendor[9], product[17], revision[5];
 
@@ -1366,12 +1375,8 @@ MPRController::scsiInquiry(void)
     request->CDB[0] = 0x12;                 /* INQUIRY */
     request->CDB[4] = 36;                   /* allocation length */
 
-    /* Simple 64-bit SGE placed right after the fixed CDB area. */
-    sgeFlags = (UInt32)(MPI2_SGE_FLAGS_SIMPLE_ELEMENT | MPI2_SGE_FLAGS_LAST_ELEMENT |
-                        MPI2_SGE_FLAGS_END_OF_BUFFER | MPI2_SGE_FLAGS_64_BIT_ADDRESSING);
-    value32 = (sgeFlags << MPI2_SGE_FLAGS_SHIFT) | 36;
-    memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4, &value32, sizeof(value32));
-    memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4 + 4, &fPagePhys, sizeof(fPagePhys));
+    /* IEEE SGE placed right after the fixed CDB area. */
+    mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fPagePhys, 36);
 
     {
         UInt64 w[4];
@@ -1729,7 +1734,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M3a");
-    setProperty("MPRBuild", "0.9.6");
+    setProperty("MPRBuild", "0.9.7");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
