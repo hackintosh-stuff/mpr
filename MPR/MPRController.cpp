@@ -1253,9 +1253,12 @@ MPRController::postScsiIo(UInt32 smid)
     UInt32 low = MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO | (smid << 16);
 
     /* The IOC has fast path enabled for this device (SAS Device Page0 Flags
-     * bit 0x4000), so the target devhandle travels in descriptor word 1. */
+     * bit 0x4000), so the target devhandle travels in descriptor word 1.
+     * MPI2_SCSI_IO_REQUEST_DESCRIPTOR puts LMID at 0x04 and DevHandle at
+     * 0x06, i.e. DevHandle occupies the high half of word 1. */
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, low);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, fAttachedDevHandle & 0xFFFF);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET,
+             (fAttachedDevHandle & 0xFFFF) << 16);
 }
 
 bool
@@ -1727,7 +1730,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M3a");
-    setProperty("MPRBuild", "0.9.4");
+    setProperty("MPRBuild", "0.9.5");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
