@@ -43,6 +43,9 @@ OSDefineMetaClassAndStructors(MPRController, IOService)
 /* M2-c config page staging buffer (SAS IO Unit Page0 with 8+ phys). */
 #define MPR_PAGE_BUF_BYTES      512
 
+/* M3-a: sense buffer lives in the upper half of the page staging buffer. */
+#define MPR_SENSE_OFFSET        0x100
+
 struct MPRRegisterInfo
 {
     const char *name;
@@ -856,8 +859,17 @@ MPRController::processReplyQueue(void)
                 fEventCount++;
             } else {
                 memcpy(fLastReply, replyFrame, sizeof(fLastReply));
+                fLastReplySmid = (UInt16)((entry >> 16) & 0xFFFF);
+                fLastReplyKind = 1;
                 fReplyCount++;
             }
+        } else if (flags == MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS) {
+            /* A successful SCSI IO carries no reply frame; only the SMID. */
+            fLastReplySmid = (UInt16)((entry >> 16) & 0xFFFF);
+            fLastReplyKind = 2;
+            memset(fLastReply, 0, sizeof(fLastReply));
+            fScsiSuccess++;
+            fReplyCount++;
         }
     }
     writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, fReplyPostIndex);
@@ -1130,6 +1142,7 @@ MPRController::readSasIOUnitPage0(void)
             setProperty("MPRAttachedDevHandle", (unsigned long long)devHandle, 16);
             setProperty("MPRAttachedDeviceInfo", (unsigned long long)deviceInfo, 32);
             setProperty("MPRAttachedPhy", (unsigned long long)i, 8);
+            fAttachedDevHandle = devHandle;
             readSasDevicePage0(devHandle);
         }
     }
@@ -1210,6 +1223,137 @@ MPRController::runM2c(void)
 
     ok = readSasIOUnitPage0();
     setProperty("MPRM2cState", ok ? "ok" : "failed");
+
+    if (fPageBuffer != NULL) {
+        fPageBuffer->release();
+        fPageBuffer = NULL;
+    }
+    fPagePhys = 0;
+    return ok;
+}
+
+/* ------------------------------------------------------------------------ */
+/* M3-a: SCSI INQUIRY through the request/reply queues, validating the SCSI  */
+/* IO path before the block-storage nub is added.                            */
+
+bool
+MPRController::scsiInquiry(void)
+{
+    MPRScsiIoRequest *request;
+    MPRScsiIoReply   *reply;
+    UInt8 *frame;
+    UInt8 *data;
+    UInt32 value32, sgeFlags;
+    char vendor[9], product[17], revision[5];
+
+    if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fPageBuffer == NULL) {
+        setProperty("MPRM3aFailure", "no attached device or buffer");
+        return false;
+    }
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return false;
+    }
+    frame += 5 * fRequestFrameSize;     /* SMID 5 */
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPRScsiIoRequest *)frame;
+
+    request->DevHandle = (UInt16)fAttachedDevHandle;
+    request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
+    request->SenseBufferLowAddress = (UInt32)(fPagePhys + MPR_SENSE_OFFSET);
+    request->SenseBufferLength = 96;
+    request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
+    request->DataLength = 36;
+    request->IoFlags = 6;                   /* six-byte CDB */
+    request->Control = MPI2_SCSIIO_CONTROL_READ;
+    request->CDB[0] = 0x12;                 /* INQUIRY */
+    request->CDB[4] = 36;                   /* allocation length */
+
+    /* Simple 64-bit SGE placed right after the fixed CDB area. */
+    sgeFlags = (UInt32)(MPI2_SGE_FLAGS_SIMPLE_ELEMENT | MPI2_SGE_FLAGS_LAST_ELEMENT |
+                        MPI2_SGE_FLAGS_END_OF_BUFFER | MPI2_SGE_FLAGS_64_BIT_ADDRESSING);
+    value32 = (sgeFlags << MPI2_SGE_FLAGS_SHIFT) | 36;
+    memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4, &value32, sizeof(value32));
+    memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4 + 4, &fPagePhys, sizeof(fPagePhys));
+
+    memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
+    fReplyCount = 0;
+    fLastReplyKind = 0;
+    fLastReplySmid = 0xFFFF;
+    value32 = MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO | (5U << 16);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+
+    if (!waitForReply(MPR_M2_REPLY_TIMEOUT_MS)) {
+        setProperty("MPRM3aFailure", "INQUIRY timeout");
+        return false;
+    }
+    if (fLastReplySmid != 5) {
+        setProperty("MPRM3aFailure", "INQUIRY finished for another SMID");
+        return false;
+    }
+
+    if (fLastReplyKind == 1) {
+        reply = (MPRScsiIoReply *)fLastReply;
+        setProperty("MPRInquiryIOCStatus",
+                    (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+        setProperty("MPRInquiryScsiStatus", (unsigned long long)reply->SCSIStatus, 8);
+        setProperty("MPRInquiryTransferCount", (unsigned long long)reply->TransferCount, 32);
+        setProperty("MPRInquiryResponseInfo", (unsigned long long)reply->ResponseInfo, 32);
+        if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS ||
+            reply->SCSIStatus != 0) {
+            setProperty("MPRM3aFailure", "INQUIRY reply status");
+            return false;
+        }
+    } else {
+        /* SCSI_IO_SUCCESS: command succeeded, no reply frame was posted. */
+        setProperty("MPRInquiryIOCStatus", 0ULL, 16);
+        setProperty("MPRInquiryScsiStatus", 0ULL, 8);
+        setProperty("MPRInquiryTransferCount", 36ULL, 32);
+        setProperty("MPRInquiryResponseInfo", 0ULL, 32);
+    }
+    setProperty("MPRInquiryReplyKind", (unsigned long long)fLastReplyKind, 32);
+
+    data = (UInt8 *)fPageBuffer->getBytesNoCopy();
+    if (data == NULL) {
+        setProperty("MPRM3aFailure", "INQUIRY data buffer unavailable");
+        return false;
+    }
+    mprCopyField(vendor, data + 8, 8);
+    mprCopyField(product, data + 16, 16);
+    mprCopyField(revision, data + 32, 4);
+
+    setProperty("MPRInquiryDeviceType", (unsigned long long)(data[0] & 0x1F), 8);
+    setProperty("MPRInquiryVendor", vendor);
+    setProperty("MPRInquiryProduct", product);
+    setProperty("MPRInquiryRevision", revision);
+    IOLog("MPR M3a: INQUIRY type=%u vendor=%s product=%s rev=%s\n",
+          (unsigned int)(data[0] & 0x1F), vendor, product, revision);
+    return true;
+}
+
+bool
+MPRController::runM3a(void)
+{
+    IOByteCount segLength;
+    bool ok;
+
+    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
+    if (fPageBuffer == NULL) {
+        setProperty("MPRM3aState", "failed-alloc");
+        return false;
+    }
+    fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+    if (fPagePhys == 0 || segLength < MPR_PAGE_BUF_BYTES ||
+        (fPagePhys + MPR_PAGE_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
+        setProperty("MPRM3aState", "failed-alloc");
+        return false;
+    }
+
+    ok = scsiInquiry();
+    setProperty("MPRM3aState", ok ? "ok" : "failed");
 
     if (fPageBuffer != NULL) {
         fPageBuffer->release();
@@ -1422,6 +1566,10 @@ MPRController::start(IOService *provider)
     fLastEventAckRequired = 0;
     fLastEventContext = 0;
     fEventSeen[0] = fEventSeen[1] = fEventSeen[2] = fEventSeen[3] = 0;
+    fAttachedDevHandle = 0;
+    fLastReplySmid = 0xFFFF;
+    fLastReplyKind = 0;
+    fScsiSuccess = 0;
     memset(fLastReply, 0, sizeof(fLastReply));
     memset(fLastEventData, 0, sizeof(fLastEventData));
 
@@ -1451,8 +1599,8 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M2d");
-    setProperty("MPRBuild", "0.8.1");
+    setProperty("MPRStage", "M3a");
+    setProperty("MPRBuild", "0.9.0");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
@@ -1462,6 +1610,7 @@ MPRController::start(IOService *provider)
         runM1c();
         runM2b();
         runM2c();
+        runM3a();
     } else {
         setProperty("MPRM1cState", "skipped-earlier-stage-failed");
     }

@@ -117,6 +117,8 @@
 #define MPI2_IOC_STATE_SHIFT                  28
 
 /* MPI function codes (mpi2.h:663-699) */
+#define MPI2_FUNCTION_SCSI_IO_REQUEST         0x00
+#define MPI2_FUNCTION_SCSI_TASK_MGMT          0x01
 #define MPI2_FUNCTION_IOC_INIT                0x02
 #define MPI2_FUNCTION_IOC_FACTS               0x03
 #define MPI2_FUNCTION_CONFIG                  0x04
@@ -522,6 +524,92 @@ static_assert(sizeof(MPRSasIOUnit0PhyData) == 0x14, "SAS IO Unit0 phy data layou
 /* SAS Device PageAddress format (mpi2_cnfg.h:396-401) */
 #define MPI2_SAS_DEVICE_PGAD_FORM_HANDLE           0x20000000
 #define MPI2_SAS_DEVICE_PGAD_HANDLE_MASK           0x0000FFFF
+
+/* ---------------------------------------------------------------------- */
+/* M3-a: SCSI IO request over the request/reply queues.                    */
+
+/* RequestFlags type for SCSI IO (mpi2.h:418) */
+#define MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO            0x00
+
+/* ReplyFlags type for a successful SCSI IO without a reply frame (mpi2.h:547) */
+#define MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS    0x00
+
+/* Control data direction bits (mpi2_init.h:243-248) */
+#define MPI2_SCSIIO_CONTROL_NODATATRANSFER         0x00000000
+#define MPI2_SCSIIO_CONTROL_WRITE                  0x01000000
+#define MPI2_SCSIIO_CONTROL_READ                   0x02000000
+
+/* Offset of the embedded SGE inside a SCSI IO request frame, in dwords. */
+#define MPR_SCSIIO_SGE_DWORDS                      24
+
+#pragma pack(push, 1)
+
+/* MPI2_SCSI_IO_REQUEST: 0x60 bytes (mpi2_init.h:125-160) */
+typedef struct {
+    UInt16  DevHandle;                      /* 0x00 */
+    UInt8   ChainOffset;                    /* 0x02 */
+    UInt8   Function;                       /* 0x03 */
+    UInt16  Reserved1;                      /* 0x04 */
+    UInt8   Reserved2;                      /* 0x06 */
+    UInt8   MsgFlags;                       /* 0x07 */
+    UInt8   VP_ID;                          /* 0x08 */
+    UInt8   VF_ID;                          /* 0x09 */
+    UInt16  Reserved3;                      /* 0x0A */
+    UInt32  SenseBufferLowAddress;          /* 0x0C */
+    UInt16  SGLFlags;                       /* 0x10 */
+    UInt8   SenseBufferLength;              /* 0x12 */
+    UInt8   Reserved4;                      /* 0x13 */
+    UInt8   SGLOffset0;                     /* 0x14 */
+    UInt8   SGLOffset1;                     /* 0x15 */
+    UInt8   SGLOffset2;                     /* 0x16 */
+    UInt8   SGLOffset3;                     /* 0x17 */
+    UInt32  SkipCount;                      /* 0x18 */
+    UInt32  DataLength;                     /* 0x1C */
+    UInt32  BidirectionalDataLength;        /* 0x20 */
+    UInt16  IoFlags;                        /* 0x24 */
+    UInt16  EEDPFlags;                      /* 0x26 */
+    UInt32  EEDPBlockSize;                  /* 0x28 */
+    UInt32  SecondaryReferenceTag;          /* 0x2C */
+    UInt16  SecondaryApplicationTag;        /* 0x30 */
+    UInt16  ApplicationTagTranslationMask;  /* 0x32 */
+    UInt8   LUN[8];                         /* 0x34 */
+    UInt32  Control;                        /* 0x3C */
+    UInt8   CDB[32];                        /* 0x40 */
+} MPRScsiIoRequest;
+
+/* MPI2_SCSI_IO_REPLY: 0x34 bytes (mpi2_init.h:382-408) */
+typedef struct {
+    UInt16  DevHandle;                      /* 0x00 */
+    UInt8   MsgLength;                      /* 0x02 */
+    UInt8   Function;                       /* 0x03 */
+    UInt16  Reserved1;                      /* 0x04 */
+    UInt8   Reserved2;                      /* 0x06 */
+    UInt8   MsgFlags;                       /* 0x07 */
+    UInt8   VP_ID;                          /* 0x08 */
+    UInt8   VF_ID;                          /* 0x09 */
+    UInt16  Reserved3;                      /* 0x0A */
+    UInt8   SCSIStatus;                     /* 0x0C */
+    UInt8   SCSIState;                      /* 0x0D */
+    UInt16  IOCStatus;                      /* 0x0E */
+    UInt32  IOCLogInfo;                     /* 0x10 */
+    UInt32  TransferCount;                  /* 0x14 */
+    UInt32  SenseCount;                     /* 0x18 */
+    UInt32  ResponseInfo;                   /* 0x1C */
+    UInt16  TaskTag;                        /* 0x20 */
+    UInt16  SCSIStatusQualifier;            /* 0x22 */
+    UInt32  BidirectionalTransferCount;     /* 0x24 */
+    UInt32  EEDPErrorOffset;                /* 0x28 */
+    UInt16  EEDPObservedAppTag;             /* 0x2C */
+    UInt16  EEDPObservedGuard;              /* 0x2E */
+    UInt32  EEDPObservedRefTag;             /* 0x30 */
+} MPRScsiIoReply;
+
+#pragma pack(pop)
+
+static_assert(sizeof(MPRScsiIoRequest) == 0x60, "SCSI IO request layout");
+static_assert(sizeof(MPRScsiIoReply) == 0x34, "SCSI IO reply layout");
+static_assert(offsetof(MPRScsiIoRequest, CDB) == 0x40, "SCSI IO CDB offset");
+static_assert(offsetof(MPRScsiIoRequest, Control) == 0x3C, "SCSI IO control offset");
 
 /* SAS Device Page 0 field offsets (mpi2_cnfg.h:2708-2732) */
 #define MPR_SASDEV0_SLOT_OFF                       0x08

@@ -60,6 +60,12 @@ private:
     UInt32                     fEventSeen[4];
     UInt8                      fLastEventData[64];
 
+    /* M3-a: SCSI IO completion tracking. */
+    UInt32                     fAttachedDevHandle;
+    UInt16                     fLastReplySmid;
+    UInt32                     fLastReplyKind;   /* 0 none, 1 address reply, 2 scsi success */
+    UInt32                     fScsiSuccess;
+
     UInt32 readReg(UInt32 offset);
     void   writeReg(UInt32 offset, UInt32 value);
 
@@ -99,6 +105,9 @@ private:
     bool   readSasIOUnitPage0(void);
     bool   readSasDevicePage0(UInt32 devHandle);
     bool   runM2c(void);
+
+    bool   scsiInquiry(void);
+    bool   runM3a(void);
 
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
