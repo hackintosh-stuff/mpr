@@ -1340,7 +1340,6 @@ MPRController::scsiInquiry(void)
     UInt8 *frame;
     UInt8 *data;
     UInt32 value32, sgeFlags;
-    UInt32 attempt;
     bool   posted;
     char vendor[9], product[17], revision[5];
 
@@ -1389,20 +1388,20 @@ MPRController::scsiInquiry(void)
     }
 
     memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
-    posted = false;
-    for (attempt = 0; attempt < 10 && !posted; attempt++) {
-        fReplyCount = 0;
-        fLastReplyKind = 0;
-        fLastReplySmid = 0xFFFF;
-        postScsiIo(5);
-        if (waitForReply(MPR_M2_REPLY_TIMEOUT_MS) && fLastReplySmid == 5) {
-            posted = true;
-            break;
-        }
-        IOSleep(1000);
-    }
-    setProperty("MPRInquiryAttempts", (unsigned long long)(attempt + 1), 32);
+    fReplyCount = 0;
+    fLastReplyKind = 0;
+    fLastReplySmid = 0xFFFF;
+    postScsiIo(5);
+    posted = waitForReply(15000) && (fLastReplySmid == 5);
+    setProperty("MPRInquiryAttempts", 1ULL, 32);
     if (!posted) {
+        setProperty("MPRInquiryKind", (unsigned long long)fLastReplyKind, 32);
+        setProperty("MPRInquirySmid", (unsigned long long)fLastReplySmid, 16);
+        setProperty("MPRInquiryPostIdx", (unsigned long long)fReplyPostIndex, 32);
+        setProperty("MPRInquiryRegPostIdx",
+                    (unsigned long long)readReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET), 32);
+        setProperty("MPRInquiryRegFreeIdx",
+                    (unsigned long long)readReg(MPI2_REPLY_FREE_HOST_INDEX_OFFSET), 32);
         setProperty("MPRM3aFailure", "INQUIRY timeout");
         return false;
     }
@@ -1730,7 +1729,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M3a");
-    setProperty("MPRBuild", "0.9.5");
+    setProperty("MPRBuild", "0.9.6");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
