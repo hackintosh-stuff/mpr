@@ -2477,6 +2477,7 @@ MPRController::start(IOService *provider)
     fDeviceOffline = false;
     fStopping = false;
     fInjectTimeout = false;
+    fInjectTmfFail = 0;
     fHighPriorityCredit = 0;
     fEventReplyCount = 0;
     fEventAckCount = 0;
@@ -2514,19 +2515,26 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.14.1");
+    setProperty("MPRBuild", "0.14.2");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
         /* Opt-in fault injection for the timeout/TMF path. The kernel ignores
          * unknown boot-args, so this is inert unless explicitly requested. */
         int inject = 0;
+        int tmfFail = 0;
 
         if (PE_parse_boot_argn("mpr_timeout_test", &inject, sizeof(inject))) {
             fInjectTimeout = (inject != 0);
         }
+        if (PE_parse_boot_argn("mpr_tmf_fail", &tmfFail, sizeof(tmfFail)) &&
+            tmfFail > 0) {
+            fInjectTmfFail = (UInt32)tmfFail;
+        }
         setProperty("MPRInjectTimeout",
                     (unsigned long long)(fInjectTimeout ? 1 : 0), 8);
+        setProperty("MPRInjectTmfFail",
+                    (unsigned long long)fInjectTmfFail, 8);
     }
 
     /* Failures during bring-up are recorded in IORegistry and never panic
@@ -2996,7 +3004,7 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
         MPI2_SCSITASKMGMT_TASKTYPE_LUN_RESET,
         MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET
     };
-    UInt32 i;
+    UInt32 i, injectFail;
     bool recovered = false;
 
     if (smid == 0) {
@@ -3007,7 +3015,20 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
     fFrozenSmid = (UInt16)smid;
     setProperty("MPRFrozenSmid", (unsigned long long)smid, 16);
 
+    /* mpr_tmf_fail=N makes the first N levels look unsuccessful, so the next
+     * level is really submitted. N=1 exercises LUN_RESET, N=2 TARGET_RESET,
+     * N=3 falls through to resetAndReinitialize(). It applies once. */
+    injectFail = fInjectTmfFail;
+    fInjectTmfFail = 0;
+    if (injectFail != 0) {
+        setProperty("MPRTmfInjectedFail", (unsigned long long)injectFail, 8);
+    }
+
     for (i = 0; i < 3 && !recovered; i++) {
+        if (injectFail > i) {
+            IOSleep(50);
+            continue;
+        }
         if (sendTaskMgmt(levels[i], (UInt16)smid, MPR_SM_TMF_BASE + i)) {
             recovered = true;
         } else {
