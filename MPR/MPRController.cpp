@@ -1276,6 +1276,20 @@ MPRController::scsiInquiry(void)
     memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4, &value32, sizeof(value32));
     memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4 + 4, &fPagePhys, sizeof(fPagePhys));
 
+    {
+        UInt64 w[4];
+
+        memcpy(w, frame, sizeof(w));
+        setProperty("MPRInquiryReqW0", w[0], 64);
+        setProperty("MPRInquiryReqW1", w[1], 64);
+        setProperty("MPRInquiryReqW2", w[2], 64);
+        setProperty("MPRInquiryReqW3", w[3], 64);
+        setProperty("MPRInquiryDevHandleUsed",
+                    (unsigned long long)fAttachedDevHandle, 16);
+        setProperty("MPRInquiryControl", (unsigned long long)request->Control, 32);
+        setProperty("MPRInquiryIoFlags", (unsigned long long)request->IoFlags, 32);
+    }
+
     memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
     fReplyCount = 0;
     fLastReplyKind = 0;
@@ -1291,6 +1305,20 @@ MPRController::scsiInquiry(void)
     if (fLastReplySmid != 5) {
         setProperty("MPRM3aFailure", "INQUIRY finished for another SMID");
         return false;
+    }
+
+    {
+        UInt64 w[4];
+
+        memcpy(w, fLastReply, sizeof(w));
+        setProperty("MPRInquiryReplyW0", w[0], 64);
+        setProperty("MPRInquiryReplyW1", w[1], 64);
+        setProperty("MPRInquiryReplyW2", w[2], 64);
+        setProperty("MPRInquiryReplyW3", w[3], 64);
+        reply = (MPRScsiIoReply *)fLastReply;
+        setProperty("MPRInquirySCSIState", (unsigned long long)reply->SCSIState, 8);
+        setProperty("MPRInquiryReplyFunction", (unsigned long long)reply->Function, 8);
+        setProperty("MPRInquiryReplyMsgLength", (unsigned long long)reply->MsgLength, 8);
     }
 
     if (fLastReplyKind == 1) {
@@ -1600,7 +1628,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M3a");
-    setProperty("MPRBuild", "0.9.0");
+    setProperty("MPRBuild", "0.9.1");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
