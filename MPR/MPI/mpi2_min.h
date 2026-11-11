@@ -534,6 +534,11 @@ static_assert(sizeof(MPRSasIOUnit0PhyData) == 0x14, "SAS IO Unit0 phy data layou
 /* ReplyFlags type for a successful SCSI IO without a reply frame (mpi2.h:547) */
 #define MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS    0x00
 
+/* Fast path SCSI IO (mpi2.h:423, :552; mpi2_init.h:353) */
+#define MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO 0x0C
+#define MPI25_RPY_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO_SUCCESS 0x06
+#define MPI25_SCSIIO_IOFLAGS_FAST_PATH             0x4000
+
 /* Control data direction bits (mpi2_init.h:243-248) */
 #define MPI2_SCSIIO_CONTROL_NODATATRANSFER         0x00000000
 #define MPI2_SCSIIO_CONTROL_WRITE                  0x01000000

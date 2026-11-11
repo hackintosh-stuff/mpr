@@ -863,7 +863,8 @@ MPRController::processReplyQueue(void)
                 fLastReplyKind = 1;
                 fReplyCount++;
             }
-        } else if (flags == MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS) {
+        } else if (flags == MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS ||
+                   flags == MPI25_RPY_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO_SUCCESS) {
             /* A successful SCSI IO carries no reply frame; only the SMID. */
             fLastReplySmid = (UInt16)((entry >> 16) & 0xFFFF);
             fLastReplyKind = 2;
@@ -1246,6 +1247,17 @@ MPRController::runM2c(void)
 /* M3-a: SCSI INQUIRY through the request/reply queues, validating the SCSI  */
 /* IO path before the block-storage nub is added.                            */
 
+void
+MPRController::postScsiIo(UInt32 smid)
+{
+    UInt32 low = MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO | (smid << 16);
+
+    /* The IOC has fast path enabled for this device (SAS Device Page0 Flags
+     * bit 0x4000), so the target devhandle travels in descriptor word 1. */
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, low);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, fAttachedDevHandle & 0xFFFF);
+}
+
 bool
 MPRController::scsiTur(void)
 {
@@ -1273,7 +1285,7 @@ MPRController::scsiTur(void)
     request->SenseBufferLength = 96;
     request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
     request->DataLength = 0;
-    request->IoFlags = 6;
+    request->IoFlags = 6 | MPI25_SCSIIO_IOFLAGS_FAST_PATH;
     request->Control = MPI2_SCSIIO_CONTROL_NODATATRANSFER;
     request->CDB[0] = 0x00;                 /* TEST UNIT READY */
 
@@ -1289,9 +1301,7 @@ MPRController::scsiTur(void)
         fReplyCount = 0;
         fLastReplyKind = 0;
         fLastReplySmid = 0xFFFF;
-        value32 = MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO | (6U << 16);
-        writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
-        writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+        postScsiIo(6);
         if (waitForReply(MPR_M2_REPLY_TIMEOUT_MS) && fLastReplySmid == 6) {
             posted = true;
             break;
@@ -1349,7 +1359,7 @@ MPRController::scsiInquiry(void)
     request->SenseBufferLength = 96;
     request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
     request->DataLength = 36;
-    request->IoFlags = 6;                   /* six-byte CDB */
+    request->IoFlags = 6 | MPI25_SCSIIO_IOFLAGS_FAST_PATH;   /* six-byte CDB */
     request->Control = MPI2_SCSIIO_CONTROL_READ;
     request->CDB[0] = 0x12;                 /* INQUIRY */
     request->CDB[4] = 36;                   /* allocation length */
@@ -1381,9 +1391,7 @@ MPRController::scsiInquiry(void)
         fReplyCount = 0;
         fLastReplyKind = 0;
         fLastReplySmid = 0xFFFF;
-        value32 = MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO | (5U << 16);
-        writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
-        writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+        postScsiIo(5);
         if (waitForReply(MPR_M2_REPLY_TIMEOUT_MS) && fLastReplySmid == 5) {
             posted = true;
             break;
@@ -1719,7 +1727,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M3a");
-    setProperty("MPRBuild", "0.9.3");
+    setProperty("MPRBuild", "0.9.4");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
