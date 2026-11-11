@@ -97,6 +97,7 @@ private:
                              UInt8 *buffer, UInt32 bufferBytes,
                              UInt32 *actualBytes);
     bool   readSasIOUnitPage0(void);
+    bool   readSasDevicePage0(UInt32 devHandle);
     bool   runM2c(void);
 
 public:

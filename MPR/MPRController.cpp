@@ -1130,8 +1130,61 @@ MPRController::readSasIOUnitPage0(void)
             setProperty("MPRAttachedDevHandle", (unsigned long long)devHandle, 16);
             setProperty("MPRAttachedDeviceInfo", (unsigned long long)deviceInfo, 32);
             setProperty("MPRAttachedPhy", (unsigned long long)i, 8);
+            readSasDevicePage0(devHandle);
         }
     }
+    return true;
+}
+
+bool
+MPRController::readSasDevicePage0(UInt32 devHandle)
+{
+    UInt8 page[MPR_PAGE_BUF_BYTES];
+    UInt32 actual = 0, pageAddress, deviceInfo;
+    UInt64 sasAddress = 0;
+    UInt16 parentHandle, slot, enclHandle, pageDevHandle;
+    UInt8 phyNum;
+    char sasText[24];
+    const char *type = "other";
+
+    pageAddress = MPI2_SAS_DEVICE_PGAD_FORM_HANDLE |
+                  (devHandle & MPI2_SAS_DEVICE_PGAD_HANDLE_MASK);
+    if (!readExtConfigPage(MPI2_CONFIG_EXTPAGETYPE_SAS_DEVICE, pageAddress,
+                           page, sizeof(page), &actual)) {
+        setProperty("MPRSasDeviceFailure", "SAS Device Page0 read failed");
+        return false;
+    }
+
+    memcpy(&slot, page + MPR_SASDEV0_SLOT_OFF, sizeof(slot));
+    memcpy(&enclHandle, page + MPR_SASDEV0_ENCLOSURE_OFF, sizeof(enclHandle));
+    memcpy(&sasAddress, page + MPR_SASDEV0_SASADDRESS_OFF, sizeof(sasAddress));
+    memcpy(&parentHandle, page + MPR_SASDEV0_PARENT_OFF, sizeof(parentHandle));
+    phyNum = page[MPR_SASDEV0_PHYNUM_OFF];
+    memcpy(&pageDevHandle, page + MPR_SASDEV0_DEVHANDLE_OFF, sizeof(pageDevHandle));
+    memcpy(&deviceInfo, page + MPR_SASDEV0_DEVICEINFO_OFF, sizeof(deviceInfo));
+
+    if (deviceInfo & MPI2_SAS_DEVICE_INFO_SATA_DEVICE) {
+        type = "SATA";
+    } else if (deviceInfo & MPI2_SAS_DEVICE_INFO_STP_TARGET) {
+        type = "STP";
+    } else if (deviceInfo & MPI2_SAS_DEVICE_INFO_SSP_TARGET) {
+        type = "SSP";
+    }
+
+    snprintf(sasText, sizeof(sasText), "%016llx", (unsigned long long)sasAddress);
+
+    setProperty("MPRSasDeviceHandle", (unsigned long long)pageDevHandle, 16);
+    setProperty("MPRSasDeviceSasAddress", sasText);
+    setProperty("MPRSasDeviceInfo", (unsigned long long)deviceInfo, 32);
+    setProperty("MPRSasDeviceType", type);
+    setProperty("MPRSasDeviceParent", (unsigned long long)parentHandle, 16);
+    setProperty("MPRSasDevicePhyNum", (unsigned long long)phyNum, 8);
+    setProperty("MPRSasDeviceSlot", (unsigned long long)slot, 16);
+    setProperty("MPRSasDeviceEnclosure", (unsigned long long)enclHandle, 16);
+    setProperty("MPRSasDevicePageBytes", (unsigned long long)actual, 32);
+    IOLog("MPR M2d: dev handle=%u sas=%s info=0x%08x type=%s\n",
+          (unsigned int)pageDevHandle, sasText,
+          (unsigned int)deviceInfo, type);
     return true;
 }
 
@@ -1398,8 +1451,8 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M2c");
-    setProperty("MPRBuild", "0.8.0");
+    setProperty("MPRStage", "M2d");
+    setProperty("MPRBuild", "0.8.1");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one

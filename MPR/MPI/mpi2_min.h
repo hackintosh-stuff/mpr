@@ -519,4 +519,17 @@ typedef struct {
 static_assert(sizeof(MPRExtPageHeader) == 0x08, "extended page header layout");
 static_assert(sizeof(MPRSasIOUnit0PhyData) == 0x14, "SAS IO Unit0 phy data layout");
 
+/* SAS Device PageAddress format (mpi2_cnfg.h:396-401) */
+#define MPI2_SAS_DEVICE_PGAD_FORM_HANDLE           0x20000000
+#define MPI2_SAS_DEVICE_PGAD_HANDLE_MASK           0x0000FFFF
+
+/* SAS Device Page 0 field offsets (mpi2_cnfg.h:2708-2732) */
+#define MPR_SASDEV0_SLOT_OFF                       0x08
+#define MPR_SASDEV0_ENCLOSURE_OFF                  0x0A
+#define MPR_SASDEV0_SASADDRESS_OFF                 0x0C
+#define MPR_SASDEV0_PARENT_OFF                     0x14
+#define MPR_SASDEV0_PHYNUM_OFF                     0x16
+#define MPR_SASDEV0_DEVHANDLE_OFF                  0x18
+#define MPR_SASDEV0_DEVICEINFO_OFF                 0x1C
+
 #endif /* MPR_MPI2_MIN_H */
