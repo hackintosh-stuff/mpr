@@ -346,6 +346,16 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **M1 剩余**：同步 config 请求（如 Manufacturing Page0）尚未实现；`HostMSIxVectors=0` 表示未启用 MSI-X，中断、config page、拓扑发现与目标表仍属后续里程碑。
 
+### 9.4 M1-c：同步 config 请求读取 Manufacturing Page0（2026-11-11，已验证）
+
+在 M1-b 的 request/reply 队列上提交一条 CONFIG 请求（SMID 1），轮询 reply queue 完成，不使用中断。SGE 为 64 位 Simple Element（`LAST_ELEMENT|END_OF_BUFFER|SIMPLE|64_BIT_ADDRESSING`），指向低 4GB 的 128 B page 缓冲；`Header.PageLength=19`（76 字节按 dwords 计，`mpr_config.c:141-142`）。
+
+**根因修正**：MPI2 的 request frame **没有 descriptor 前缀**——descriptor（`RequestFlags`/`SMID`）只经 `0xC0/0xC4` 寄存器传递，frame 从 offset 0 起就是消息头（`mpr.c:1583-1587, 3941`）。早期版本把 8 字节 descriptor 写在 frame 前端，IOC 于是把 `frame[3]` 当成 Function（=0，SCSI IO），返回 `0x43 MPI2_IOCSTATUS_SCSI_DEVICE_NOT_THERE`。改为 SMID=1、frame 1、descriptor 走寄存器后一次通过。
+
+**已验证（重启后）**：`com.ling.MPR (0.5.0)`；`MPRM1cState=ok`、`MPRConfigIOCStatus=0`、`MPRConfigIOCLogInfo=0`、`MPRConfigPageType=9`、`MPRConfigPageNumber=0`、`MPRConfigPageLength=19`；`MPRManPage0ChipName=LSISAS3008`、`ChipRevision=ALL`、`BoardName=Quanta Mezz`、`BoardAssembly=35S2BMA0000`。无新增 panic，系统盘仍为 `internal, physical`。
+
+**M1 退出条件达成**：无需中断即可收发一条同步 config 请求（Manufacturing Page0）。下一步 M2：MSI-X 中断、PortEnable、EventNotification、拓扑发现与目标表；DMA 队列与 config 通路已就绪。
+
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
