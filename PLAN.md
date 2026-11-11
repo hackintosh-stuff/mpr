@@ -1,6 +1,6 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.6（2026-11-11；SAS3008 已接入并接测试盘，M0 空壳 kext 完成 ESP 部署与真机加载验证）
+状态：草案 v0.7（2026-11-11；M3-d 完成：`MPRBlockDev` nub 与 `IOMedia` 已在真机生成，ESP 部署 0.12.2；1 GiB 连续顺序读验收受测试盘不可读扇区限制）
 目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**已接入；已接 1 块 SATA SSD 测试盘，允许读写**）
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
@@ -426,3 +426,13 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 4. （仅当决定评估路线 B，不需要 SAS3008）用 MacKernelSDK 编译并真机加载最小 `IOSCSIParallelInterfaceController` 子类 kext，`OSBundleLibraries` 写 `com.apple.iokit.IOSCSIParallelFamily = 1.2.0`，验证 KPI 符号解析、family 被依赖拉起与子类 vtable 不错位；仍需 kext 部署/重启授权。
 
 **恢复条件**：用户授权后续 kext 部署与必要的重启。测试盘已接入并允许读写，不再是前置条件；在此之前不再推进。
+
+### 9.12 M3-d：块设备 nub 与 IOMedia（2026-11-11，已验证）
+
+`MPRBlockDev : IOBlockStorageDevice` 实现 14 个纯虚方法并设置 `device-type=Generic`，由系统 `IOBlockStorageDriver` 生成 `IOMedia`；`Info.plist` 增声明 `com.apple.iokit.IOStorageFamily = 1.0`（现场该 family 的 `OSBundleCompatibleVersion` 是 1.0，运行时版本是 2.1）。M3-a/M3-b 缓存 INQUIRY 身份与 READ CAPACITY(10) 的容量供 nub 报告；M3 阶段 `doAsyncReadWrite` 只接受读，写返回 `kIOReturnNotWritable`，`reportWriteProtection` 返回 true。读路径用 `IOLock` 串行化，按 64 KB 分块复用 M3-c 的 READ(10) fast-path 与低 4GB 暂存缓冲，数据经 `IOMemoryDescriptor::writeBytes` 拷贝后在锁外同步回调 completion。每个命令轮换 SMID 10..25 并按 SMID 等待 reply；单次失败最多重试 3 次，失败时把 IOC/SCSI 状态与 18 字节 sense 导出到 IORegistry（`MPRM3d*`）。
+
+**已验证（重启后）**：`com.ling.MPR (0.12.2)`；`MPRStage=M3d`、`MPRM3dState=ok`、`MPRM3dMediaBlocks=468862128`、`MPRM3dMediaBlockSize=512`；`diskutil list` 出现 240.1 GB 的 `ATA PCCOOLER SSD T20 Media`，GPT 四个分区，`IOMedia` 及其子分区 `Writable=No`；LBA0 `0xAA55`、part0 type `0xEE`、LBA1 `EFI PART` 与 M3-c 一致；600 MiB 顺序读两次 SHA256 相同，无新增 panic。
+
+**验收边界**：§6 的「1 GB 顺序读无错」在这块测试盘上无法关闭。该盘持续读时返回 `CHECK CONDITION` 与固定格式 sense `f0 00 03 … 11 00`（sense key `0x03 MEDIUM ERROR`、ASC `0x11 UNRECOVERED READ ERROR`、information 指向命令首 LBA），LBA 1255072–1255074 的单扇区读 9/9 失败；多数瞬时错误由重试救回。这是测试盘样本的属性，不计为驱动缺陷，也不能用来掩盖驱动缺陷：需更换可连续读写的测试盘，或在 Debian `mpt3sas` 下交叉验证后重跑该条验收。
+
+**下一步 M4**：WRITE(10) / SYNCHRONIZE CACHE / UNMAP、auto sense、超时与 TMF、diag reset 恢复。继续前需先解决测试盘可连续读写的问题，并重新取得 kext 部署与必要重启的授权。
