@@ -550,6 +550,12 @@ MPRController::allocateQueueMemory(void)
     }
 
     memset(queue, 0, queueBytes);
+    if (fReplyBuffer->getBytesNoCopy() != NULL) {
+        memset(fReplyBuffer->getBytesNoCopy(), 0, replyBytes);
+    }
+    if (fRequestBuffer->getBytesNoCopy() != NULL) {
+        memset(fRequestBuffer->getBytesNoCopy(), 0, requestBytes);
+    }
     freeQueue = (UInt32 *)queue;
     postQueue = (UInt64 *)(queue + fFqDepth * 4);
 
@@ -708,12 +714,11 @@ MPRController::readManufacturingPage0(void)
     UInt8      *queue;
     UInt8      *post;
     UInt8      *replyBase;
-    MPRDefaultRequestDescriptor *desc;
     MPRConfigRequest *config;
     MPRConfigReply   *reply = NULL;
     MPRConfigPageMan0 *page;
     UInt32 tries, value32;
-    UInt32 replyBytes, baddr;
+    UInt32 replyBytes, baddr = 0;
     UInt64 entry, clear;
     UInt8  flags;
     bool   ok = false;
@@ -739,33 +744,47 @@ MPRController::readManufacturingPage0(void)
         return false;
     }
 
+    /* SMID 1 = frame 1. The request descriptor (RequestFlags/SMID) travels
+     * through the 0xC0/0xC4 registers; the frame itself begins at the message
+     * header because MPI2 request frames have no descriptor prefix
+     * (mpr.c:1583-1587, mpr.c:3941). */
+    frame += fRequestFrameSize;
     memset(frame, 0, fRequestFrameSize);
-    desc = (MPRDefaultRequestDescriptor *)frame;
-    config = (MPRConfigRequest *)(frame + sizeof(MPRDefaultRequestDescriptor));
-
-    desc->RequestFlags = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE;
-    desc->MSIxIndex = 0;
-    desc->SMID = 0;
+    config = (MPRConfigRequest *)frame;
 
     config->Function = MPI2_FUNCTION_CONFIG;
     config->Action = MPI2_CONFIG_ACTION_PAGE_READ_CURRENT;
     config->Header.PageType = MPI2_CONFIG_PAGETYPE_MANUFACTURING;
     config->Header.PageNumber = 0;
     config->Header.PageVersion = MPI2_MANUFACTURING0_PAGEVERSION;
-    config->Header.PageLength = 0;
+    /* Manufacturing Page 0 is a fixed 0x4C-byte page; the request carries the
+     * length in 32-bit words (mpr_config.c:141-142). */
+    config->Header.PageLength = 19;
     config->PageAddress = 0;
     config->SgeFlagsLength =
         ((UInt32)(MPI2_SGE_FLAGS_SIMPLE_ELEMENT | MPI2_SGE_FLAGS_LAST_ELEMENT |
                   MPI2_SGE_FLAGS_END_OF_BUFFER | MPI2_SGE_FLAGS_64_BIT_ADDRESSING)
          << MPI2_SGE_FLAGS_SHIFT) |
-        (MPR_M1C_PAGE_BYTES & MPI2_SGE_LENGTH_MASK);
+        (76 & MPI2_SGE_LENGTH_MASK);
     config->SgeAddress = fPagePhys;
 
-    /* Post request frame 0 (SMID 0) through the 0xC0/0xC4 register pair. */
-    memcpy(&value32, frame, sizeof(value32));
+    /* Request descriptor: DEFAULT_TYPE plus SMID 1 in bits 16-31. */
+    value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (1U << 16);
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
-    memcpy(&value32, frame + 4, sizeof(value32));
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, value32);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+
+    {
+        UInt64 fw[4];
+
+        memcpy(fw, frame, sizeof(fw));
+        setProperty("MPRConfigFrameW0", fw[0], 64);
+        setProperty("MPRConfigFrameW1", fw[1], 64);
+        setProperty("MPRConfigFrameW2", fw[2], 64);
+        setProperty("MPRConfigFrameW3", fw[3], 64);
+        setProperty("MPRConfigDescLow", (unsigned long long)value32, 32);
+        setProperty("MPRConfigRequestPhys", fRequestPhys, 64);
+        setProperty("MPRConfigPagePhys", fPagePhys, 64);
+    }
 
     queue = (UInt8 *)fQueueBuffer->getBytesNoCopy();
     replyBase = (UInt8 *)fReplyBuffer->getBytesNoCopy();
@@ -793,6 +812,22 @@ MPRController::readManufacturingPage0(void)
             reply = (MPRConfigReply *)(replyBase + (baddr - (UInt32)fReplyPhys));
             ok = true;
         }
+    }
+
+    if (ok && reply != NULL) {
+        UInt64 w[4];
+
+        memcpy(w, (const UInt8 *)reply, sizeof(w));
+        setProperty("MPRConfigReplyW0", w[0], 64);
+        setProperty("MPRConfigReplyW1", w[1], 64);
+        setProperty("MPRConfigReplyW2", w[2], 64);
+        setProperty("MPRConfigReplyW3", w[3], 64);
+        setProperty("MPRConfigReplyBase", fReplyPhys, 64);
+        setProperty("MPRConfigReplyAddr", (unsigned long long)baddr, 64);
+        setProperty("MPRConfigHostIntStatus",
+                    (unsigned long long)readReg(MPI2_HOST_INTERRUPT_STATUS_OFFSET), 32);
+        setProperty("MPRConfigPostHostIndex",
+                    (unsigned long long)readReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET), 32);
     }
 
     if (!ok || reply == NULL) {
@@ -911,7 +946,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M1c");
-    setProperty("MPRBuild", "0.4.0");
+    setProperty("MPRBuild", "0.5.0");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
