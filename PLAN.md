@@ -390,6 +390,18 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **下一步 M3**：以 `MPRSasDevice*` 建单盘目标表 → `IOBlockStorageDevice` nub → INQUIRY / READ CAPACITY(16) / READ(16) → `IOMedia`。
 
+### 9.9 M3-a：SCSI IO 通路（2026-11-11，已验证）
+
+在 request/reply 队列上以 SMID 5/6 提交 SCSI IO（TUR + INQUIRY），经中断等待完成。三个关键修正：
+
+1. **fast-path 描述符**：该固件 SAS Device Page0 的 `Flags` 含 `MPI25_SAS_DEVICE0_FLAGS_ENABLED_FAST_PATH (0x4000)`，必须用 `MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO (0x0C)` 提交，`IoFlags` 置 `MPI25_SCSIIO_IOFLAGS_FAST_PATH (0x4000)`，并把 DevHandle 放在描述符 **word1 的高 16 位**（`MPI2_SCSI_IO_REQUEST_DESCRIPTOR` 字段顺序为 RequestFlags/MSIxIndex/SMID/**LMID**/**DevHandle**）。用普通 SCSI IO 描述符会返回 `0x43 DEVICE_NOT_THERE`；DevHandle 落到低 16 位会返回 `0x42 INVALID_DEVHANDLE`。
+2. **IEEE SGE**：SCSI IO 的数据 SGE 必须是 16 字节 IEEE simple 格式（`Address`/`Length`/`Reserved`/`Flags=0x40`），只有 CONFIG 请求用 legacy 12 字节格式（`mpr.c:3637-3643`、`mpr_sas.c:2118`）。用 legacy SGE 时 IOC 不应答（超时）。
+3. **reply 描述符**：需同时接受 `SCSI_IO_SUCCESS (0x00)` 与 `FAST_PATH_SCSI_IO_SUCCESS (0x06)`（两者都不带 reply frame，仅 SMID）。
+
+**已验证（重启后）**：`com.ling.MPR (0.9.7)`；`MPRM3aTur=ok`、`MPRTurKind=2`、`MPRTurIOCStatus=0`；`MPRM3aState=ok`、`MPRInquiryIOCStatus=0`、`MPRInquiryScsiStatus=0`、`MPRInquiryTransferCount=36`、`MPRInquiryDeviceType=0`；INQUIRY 返回 `vendor=ATA`、`product=PCCOOLER SSD T20`、`revision=5B`，与 Debian 侧 `PCCOOLER SSD T200 240GB` 一致。无新增 panic。
+
+**下一步 M3-b**：以 `IOBlockStorageDevice` 子类暴露该盘，实现 READ CAPACITY(16) / READ(16)，注册 `IOMedia`。
+
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
