@@ -4,6 +4,9 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOInterruptEventSource.h>
+#include <IOKit/IOFilterInterruptEventSource.h>
 #include <libkern/c++/OSMetaClass.h>
 
 class IOPCIDevice;
@@ -40,6 +43,12 @@ private:
     UInt64           fPagePhys;
     UInt32           fReplyPostIndex;
 
+    /* M2-a: reply interrupt delivery. */
+    IOWorkLoop                *fWorkLoop;
+    IOFilterInterruptEventSource *fInterrupt;
+    volatile UInt32            fReplyCount;
+    UInt8                      fLastReply[64];
+
     UInt32 readReg(UInt32 offset);
     void   writeReg(UInt32 offset, UInt32 value);
 
@@ -60,6 +69,14 @@ private:
 
     bool   readManufacturingPage0(void);
     bool   runM1c(void);
+
+    bool   setupInterrupts(void);
+    void   teardownInterrupts(void);
+    static bool interruptFilter(OSObject *owner, IOFilterInterruptEventSource *sender);
+    static void interruptAction(OSObject *owner, IOInterruptEventSource *sender,
+                                int index);
+    void   processReplyQueue(void);
+    bool   waitForReply(UInt32 timeoutMs);
 
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;

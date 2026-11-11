@@ -37,6 +37,9 @@ OSDefineMetaClassAndStructors(MPRController, IOService)
 #define MPR_M1C_TRIES           2000
 #define MPR_M1C_PAGE_BYTES      128
 
+/* M2-a waits for the reply interrupt, then falls back to one poll pass. */
+#define MPR_M2_REPLY_TIMEOUT_MS 2000
+
 struct MPRRegisterInfo
 {
     const char *name;
@@ -623,7 +626,7 @@ MPRController::sendIOCInit(void)
     out.request.ReplyDescriptorPostQueueAddress = fPostPhys;
     out.request.ReplyFreeQueueAddress           = fFreePhys;
     out.request.HostPageSize                    = MPR_HOST_PAGE_SIZE_4K;
-    out.request.HostMSIxVectors                 = 0;
+    out.request.HostMSIxVectors                 = (fInterrupt != NULL) ? 1 : 0;
     out.request.TimeStamp                       = 0;
 
     for (retry = 0; retry < 3 && !ok; retry++) {
@@ -683,6 +686,12 @@ MPRController::runM1b(void)
     writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, 0);
     setProperty("MPRReplyFreeHostIndex", (unsigned long long)fReplyFreeIndex, 32);
     setProperty("MPRReplyPostHostIndex", 0ULL, 32);
+
+    /* Unmask only the reply-descriptor interrupt; every other cause stays
+     * masked so a stuck status bit cannot become an interrupt storm. */
+    if (fInterrupt != NULL) {
+        writeReg(MPI2_HOST_INTERRUPT_MASK_OFFSET, ~MPI2_HIM_REPLY_INT_MASK);
+    }
     setProperty("MPRM1bState", "ok");
     IOLog("MPR M1b: IOC OPERATIONAL, freeDepth=%u postDepth=%u requests=%u\n",
           (unsigned int)fFqDepth, (unsigned int)fPqDepth,
@@ -706,21 +715,160 @@ mprCopyField(char *dst, const UInt8 *src, UInt32 length)
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* M2-a: reply-descriptor interrupt delivered through a filtered event        */
+/* source. The filter only samples and clears the cause; the reply queue is   */
+/* drained on the work loop (PLAN section 5, rule 4).                        */
+
+bool
+MPRController::setupInterrupts(void)
+{
+    int type = -1;
+
+    fWorkLoop = IOWorkLoop::workLoop();
+    if (fWorkLoop == NULL) {
+        setProperty("MPRIntState", "no-workloop");
+        return false;
+    }
+
+    if (fPCIDevice->getInterruptType(0, &type) == kIOReturnSuccess) {
+        setProperty("MPRIntType", (unsigned long long)type, 32);
+    } else {
+        setProperty("MPRIntType", "unavailable");
+    }
+
+    fInterrupt = IOFilterInterruptEventSource::filterInterruptEventSource(
+        this, interruptAction, interruptFilter, fPCIDevice, 0);
+    if (fInterrupt == NULL) {
+        setProperty("MPRIntState", "no-source");
+        return false;
+    }
+    if (fWorkLoop->addEventSource(fInterrupt) != kIOReturnSuccess) {
+        setProperty("MPRIntState", "add-failed");
+        fInterrupt->release();
+        fInterrupt = NULL;
+        return false;
+    }
+    fInterrupt->enable();
+    setProperty("MPRIntState", "ok");
+    return true;
+}
+
+void
+MPRController::teardownInterrupts(void)
+{
+    if (fInterrupt != NULL) {
+        fInterrupt->disable();
+        if (fWorkLoop != NULL) {
+            fWorkLoop->removeEventSource(fInterrupt);
+        }
+        fInterrupt->release();
+        fInterrupt = NULL;
+    }
+    if (fWorkLoop != NULL) {
+        fWorkLoop->release();
+        fWorkLoop = NULL;
+    }
+}
+
+bool
+MPRController::interruptFilter(OSObject *owner, IOFilterInterruptEventSource *sender)
+{
+    MPRController *self = (MPRController *)owner;
+    UInt32 status;
+
+    if (self == NULL || self->fRegs == NULL) {
+        return false;
+    }
+    status = self->readReg(MPI2_HOST_INTERRUPT_STATUS_OFFSET);
+    if ((status & MPI2_HIS_REPLY_DESCRIPTOR_INTERRUPT) == 0) {
+        return false;
+    }
+    /* HostInterruptStatus is write-one-to-clear. */
+    self->writeReg(MPI2_HOST_INTERRUPT_STATUS_OFFSET,
+                   MPI2_HIS_REPLY_DESCRIPTOR_INTERRUPT);
+    return true;
+}
+
+void
+MPRController::interruptAction(OSObject *owner, IOInterruptEventSource *sender,
+                               int index)
+{
+    MPRController *self = (MPRController *)owner;
+
+    if (self != NULL) {
+        self->processReplyQueue();
+    }
+}
+
+void
+MPRController::processReplyQueue(void)
+{
+    UInt8 *queue, *post, *replyBase;
+    UInt32 i, baddr, replyBytes;
+    UInt64 entry, clear;
+    UInt8  flags;
+
+    if (fQueueBuffer == NULL || fReplyBuffer == NULL) {
+        return;
+    }
+    queue = (UInt8 *)fQueueBuffer->getBytesNoCopy();
+    replyBase = (UInt8 *)fReplyBuffer->getBytesNoCopy();
+    if (queue == NULL || replyBase == NULL) {
+        return;
+    }
+    post = queue + fFqDepth * 4;
+    replyBytes = fReplyFrameSize * fFqDepth;
+
+    for (i = 0; i < fPqDepth; i++) {
+        memcpy(&entry, post + fReplyPostIndex * 8, sizeof(entry));
+        flags = (UInt8)(entry & MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK);
+        if (flags == MPI2_RPY_DESCRIPT_FLAGS_UNUSED ||
+            ((entry >> 32) & 0xFFFFFFFFULL) == 0xFFFFFFFFULL) {
+            break;
+        }
+        baddr = (UInt32)(entry >> 32);
+        clear = 0xFFFFFFFFFFFFFFFFULL;
+        memcpy(post + fReplyPostIndex * 8, &clear, sizeof(clear));
+        fReplyPostIndex = (fReplyPostIndex + 1) % fPqDepth;
+        if (flags == MPI2_RPY_DESCRIPT_FLAGS_ADDRESS_REPLY &&
+            baddr >= (UInt32)fReplyPhys &&
+            baddr < (UInt32)fReplyPhys + replyBytes) {
+            memcpy(fLastReply, replyBase + (baddr - (UInt32)fReplyPhys),
+                   sizeof(fLastReply));
+            fReplyCount++;
+        }
+    }
+    writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, fReplyPostIndex);
+}
+
+bool
+MPRController::waitForReply(UInt32 timeoutMs)
+{
+    UInt32 i;
+
+    for (i = 0; i < timeoutMs; i++) {
+        if (fReplyCount > 0) {
+            return true;
+        }
+        IOSleep(1);
+    }
+    /* Fallback when the interrupt source could not be installed. */
+    processReplyQueue();
+    return fReplyCount > 0;
+}
+
 bool
 MPRController::readManufacturingPage0(void)
 {
     IOByteCount segLength;
     UInt8      *frame;
-    UInt8      *queue;
-    UInt8      *post;
-    UInt8      *replyBase;
     MPRConfigRequest *config;
     MPRConfigReply   *reply = NULL;
     MPRConfigPageMan0 *page;
-    UInt32 tries, value32;
-    UInt32 replyBytes, baddr = 0;
-    UInt64 entry, clear;
-    UInt8  flags;
+    UInt32 value32;
+    UInt32 baddr = 0;
+    UInt8  replyCopy[64];
     bool   ok = false;
 
     fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
@@ -786,33 +934,17 @@ MPRController::readManufacturingPage0(void)
         setProperty("MPRConfigPagePhys", fPagePhys, 64);
     }
 
-    queue = (UInt8 *)fQueueBuffer->getBytesNoCopy();
-    replyBase = (UInt8 *)fReplyBuffer->getBytesNoCopy();
-    post = queue + fFqDepth * 4;
-    replyBytes = fReplyFrameSize * fFqDepth;
-
-    for (tries = 0; tries < MPR_M1C_TRIES && !ok; tries++) {
-        memcpy(&entry, post + fReplyPostIndex * 8, sizeof(entry));
-        flags = (UInt8)(entry & MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK);
-        if (flags == MPI2_RPY_DESCRIPT_FLAGS_UNUSED ||
-            ((entry >> 32) & 0xFFFFFFFFULL) == 0xFFFFFFFFULL) {
-            IODelay(1000);
-            continue;
-        }
-
-        baddr = (UInt32)(entry >> 32);
-        clear = 0xFFFFFFFFFFFFFFFFULL;
-        memcpy(post + fReplyPostIndex * 8, &clear, sizeof(clear));
-        fReplyPostIndex = (fReplyPostIndex + 1) % fPqDepth;
-        writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, fReplyPostIndex);
-
-        if (flags == MPI2_RPY_DESCRIPT_FLAGS_ADDRESS_REPLY &&
-            baddr >= (UInt32)fReplyPhys &&
-            baddr < (UInt32)fReplyPhys + replyBytes) {
-            reply = (MPRConfigReply *)(replyBase + (baddr - (UInt32)fReplyPhys));
-            ok = true;
-        }
+    /* Wait for the reply interrupt; waitForReply falls back to one poll pass
+     * if the event source could not be installed. */
+    fReplyCount = 0;
+    if (!waitForReply(MPR_M2_REPLY_TIMEOUT_MS)) {
+        setProperty("MPRM1cFailure", "no reply descriptor received");
+        return false;
     }
+    memcpy(replyCopy, fLastReply, sizeof(replyCopy));
+    reply = (MPRConfigReply *)replyCopy;
+    baddr = (UInt32)fReplyPhys;
+    ok = true;
 
     if (ok && reply != NULL) {
         UInt64 w[4];
@@ -918,6 +1050,10 @@ MPRController::start(IOService *provider)
     fRequestFrameSize = fReplyFrameSize = fRequestCredit = fMaxReplyDepth = 0;
     fReplyPostIndex = 0;
     fFactsValid = false;
+    fWorkLoop = NULL;
+    fInterrupt = NULL;
+    fReplyCount = 0;
+    memset(fLastReply, 0, sizeof(fLastReply));
 
     pci = OSDynamicCast(IOPCIDevice, provider);
     if (pci == NULL) {
@@ -945,12 +1081,13 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M1c");
-    setProperty("MPRBuild", "0.5.0");
+    setProperty("MPRStage", "M2a");
+    setProperty("MPRBuild", "0.6.0");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
      * config page through the queues and still takes no interrupts. */
+    setupInterrupts();
     if (runM1a() && runM1b()) {
         runM1c();
     } else {
@@ -964,6 +1101,7 @@ MPRController::start(IOService *provider)
 void
 MPRController::stop(IOService *provider)
 {
+    teardownInterrupts();
     if (fPageBuffer != NULL) {
         fPageBuffer->release();
         fPageBuffer = NULL;
