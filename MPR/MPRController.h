@@ -7,9 +7,11 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOFilterInterruptEventSource.h>
+#include <IOKit/IOLocks.h>
 #include <libkern/c++/OSMetaClass.h>
 
 class IOPCIDevice;
+class MPRBlockDev;
 
 class MPRController : public IOService
 {
@@ -60,10 +62,21 @@ private:
     UInt32                     fEventSeen[4];
     UInt8                      fLastEventData[64];
 
-    /* M3-c: bulk data buffer for block transfers. */
+    /* M3-c: bulk data buffer for block transfers. In M3-d it stays resident
+     * for the lifetime of the nub instead of being freed after one probe. */
     IOBufferMemoryDescriptor  *fDataBuffer;
     UInt64                     fDataPhys;
     UInt32                     fDataBytes;
+
+    /* M3-d: media identity, nub, and serialization of the shared SCSI IO
+     * path (one outstanding SMID, one reply slot, one staging buffer). */
+    MPRBlockDev               *fBlockDev;
+    IOLock                    *fIOLock;
+    UInt64                     fCapacityBlocks;
+    UInt32                     fBlockSize;
+    char                       fVendor[16];
+    char                       fProduct[20];
+    char                       fRevision[8];
 
     /* M3-a: SCSI IO completion tracking. */
     UInt32                     fAttachedDevHandle;
@@ -120,13 +133,25 @@ private:
     bool   runM3b(void);
 
     bool   scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
-                         UInt32 blockSize, UInt32 smid);
+                         UInt32 blockSize, UInt32 smid, bool diagnostics);
     bool   runM3c(void);
+
+    bool   allocateM3dBuffers(void);
+    bool   runM3d(void);
 
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+
+    /* MPRBlockDev relays every request through these accessors. */
+    IOReturn readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
+                        UInt64 nblks, UInt64 *actualBytes);
+    UInt64   getCapacityBlocks(void) const { return fCapacityBlocks; }
+    UInt32   getBlockSize(void) const { return fBlockSize; }
+    char    *getVendorString(void) { return fVendor; }
+    char    *getProductString(void) { return fProduct; }
+    char    *getRevisionString(void) { return fRevision; }
 };
 
 #endif /* MPRController_h */

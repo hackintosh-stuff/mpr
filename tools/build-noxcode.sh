@@ -24,7 +24,7 @@ ROOT=$(CDPATH= cd -- "$ROOT" && pwd)
 SDK=${MACKERNELSDK:-$ROOT/MacKernelSDK}
 
 NAME=MPR
-VERSION=0.11.0
+VERSION=0.12.0
 BUNDLE_ID=com.ling.MPR
 
 echo "== Environment =="
@@ -35,6 +35,8 @@ echo "version: $NAME $VERSION"
 
 [ -f "$ROOT/MPR/MPRController.cpp" ] || die "missing MPR/MPRController.cpp"
 [ -f "$ROOT/MPR/MPRController.h" ] || die "missing MPR/MPRController.h"
+[ -f "$ROOT/MPR/MPRBlockDev.cpp" ] || die "missing MPR/MPRBlockDev.cpp"
+[ -f "$ROOT/MPR/MPRBlockDev.h" ] || die "missing MPR/MPRBlockDev.h"
 [ -f "$ROOT/MPR/Info.plist" ] || die "missing MPR/Info.plist"
 [ -d "$SDK/Headers/IOKit" ] || die "MacKernelSDK headers missing: $SDK/Headers/IOKit"
 [ -f "$SDK/Library/universal/libkmodc++.a" ] || die "missing libkmodc++.a"
@@ -58,7 +60,7 @@ extern "C" {
 extern kern_return_t _start(kmod_info_t *, void *);
 extern kern_return_t _stop(kmod_info_t *, void *);
 
-KMOD_EXPLICIT_DECL(com.ling.MPR, "0.11.0", _start, _stop);
+KMOD_EXPLICIT_DECL(com.ling.MPR, "0.12.0", _start, _stop);
 
 __attribute__((visibility("hidden"))) kmod_start_func_t *_realmain = nullptr;
 __attribute__((visibility("hidden"))) kmod_stop_func_t  *_antimain = nullptr;
@@ -76,6 +78,8 @@ INCLUDES="-I $SDK/Headers -I $ROOT/MPR"
 echo "== Compilation =="
 # shellcheck disable=SC2086
 xcrun clang++ $CFLAGS $INCLUDES -c "$ROOT/MPR/MPRController.cpp" -o "$OBJ/MPRController.o"
+# shellcheck disable=SC2086
+xcrun clang++ $CFLAGS $INCLUDES -c "$ROOT/MPR/MPRBlockDev.cpp" -o "$OBJ/MPRBlockDev.o"
 # shellcheck disable=SC2086
 xcrun clang++ $CFLAGS $INCLUDES -c "$OBJ/kmod-info.cpp" -o "$OBJ/kmod-info.o"
 
@@ -96,7 +100,7 @@ FT=$(otool -h "$BIN" | awk 'NR>1{print $5}' | tr -d ' ' | tail -1)
 [ "$FT" = "11" ] || die "filetype=$FT; expected 11 (MH_KEXT_BUNDLE)"
 echo "  _kmod_info / _start / _stop present, MH_KEXT_BUNDLE OK"
 
-if nm -u "$BIN" | c++filt | grep -E 'MPRController::' > "$W/unresolved.txt"; then
+if nm -u "$BIN" | c++filt | grep -E 'MPRController::|MPRBlockDev::' > "$W/unresolved.txt"; then
     echo "[error] unresolved symbols from the driver's own sources:" >&2
     cat "$W/unresolved.txt" >&2
     exit 1
