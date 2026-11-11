@@ -8,6 +8,7 @@
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOLocks.h>
+#include <kern/thread_call.h>
 #include <libkern/c++/OSMetaClass.h>
 
 class IOPCIDevice;
@@ -107,6 +108,8 @@ private:
     bool                       fSuspended;       /* PM sleep in progress */
     volatile bool              fTopologyChanged; /* SAS discovery event seen */
     IOTimerEventSource        *fWatchdogTimer;
+    thread_call_t              fHotplugCall;
+    volatile bool              fHotplugPending;
     UInt32                     fHighPriorityCredit;
     volatile UInt32            fEventReplyCount;
     volatile UInt32            fEventAckCount;
@@ -157,6 +160,9 @@ private:
     void   processReplyQueue(void);
     void   rescanPartitions(void);
     void   watchdogTimeout(IOTimerEventSource *sender);
+    void   hotplugThread(void);
+    static void hotplugCall(thread_call_param_t param0,
+                            thread_call_param_t param1);
     bool   waitForReply(UInt32 timeoutMs);
     bool   waitForSmid(UInt32 timeoutMs, UInt32 smid);
     bool   takeReplySlot(UInt32 smid, UInt8 *reply, UInt32 replyLen, UInt8 *kind);

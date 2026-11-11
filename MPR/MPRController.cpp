@@ -879,8 +879,10 @@ MPRController::processReplyQueue(void)
                 if (fLastEvent == MPI2_EVENT_SAS_DEVICE_STATUS_CHANGE ||
                     fLastEvent == MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST) {
                     /* Do not call setProperty() while fReplyLock is held;
-                     * the watchdog and the next IO pick this up. */
+                     * the watchdog schedules a thread that compares the
+                     * discovered DevHandle before rebuilding anything. */
                     fTopologyChanged = true;
+                    fHotplugPending = true;
                 }
                 if (fLastEventAckRequired == MPI2_EVENT_NOTIFICATION_ACK_REQUIRED) {
                     sendEventAck(fLastEvent, fLastEventContext);
@@ -2696,6 +2698,8 @@ MPRController::start(IOService *provider)
     fStopping = false;
     fTopologyChanged = false;
     fWatchdogTimer = NULL;
+    fHotplugCall = NULL;
+    fHotplugPending = false;
     fInjectTimeout = false;
     fInjectTmfFail = 0;
     fFastPathEnabled = false;
@@ -2737,7 +2741,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.16.3");
+    setProperty("MPRBuild", "0.17.0");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -2777,6 +2781,7 @@ MPRController::start(IOService *provider)
     } else {
         setProperty("MPRWatchdogState", "no-workloop");
     }
+    fHotplugCall = thread_call_allocate(hotplugCall, this);
     if (initializeController() && initializeQueues()) {
         readManufacturingInfo();
         enableEventsAndPort();
@@ -2813,6 +2818,11 @@ MPRController::stop(IOService *provider)
         fWatchdogTimer->cancelTimeout();
         fWatchdogTimer->release();
         fWatchdogTimer = NULL;
+    }
+    if (fHotplugCall != NULL) {
+        thread_call_cancel(fHotplugCall);
+        thread_call_free(fHotplugCall);
+        fHotplugCall = NULL;
     }
     teardownInterrupts();
     if (fBlockDev != NULL) {
@@ -3383,9 +3393,79 @@ MPRController::watchdogTimeout(IOTimerEventSource *sender)
     } else {
         setProperty("MPRWatchdogState", "ok");
     }
+    if (fHotplugPending && !fReinitInProgress && !fStopping &&
+        fHotplugCall != NULL) {
+        fHotplugPending = false;
+        thread_call_enter(fHotplugCall);
+    }
     if (sender != NULL) {
         sender->setTimeoutMS(1000);
     }
+}
+
+void
+MPRController::hotplugCall(thread_call_param_t param0,
+                           thread_call_param_t param1)
+{
+    (void)param1;
+    ((MPRController *)param0)->hotplugThread();
+}
+
+void
+MPRController::hotplugThread(void)
+{
+    UInt32 oldHandle, newHandle;
+
+    if (fStopping || fReinitInProgress || fIOLock == NULL) {
+        return;
+    }
+    IOLockLock(fIOLock);
+    fReinitInProgress = true;
+    oldHandle = fAttachedDevHandle;
+    fAttachedDevHandle = 0;
+    removeProperty("MPRAttachedDevHandle");
+    if (!readSasIOUnitPage0()) {
+        setProperty("MPRHotplugState", "discovery-failed");
+        fReinitInProgress = false;
+        IOLockUnlock(fIOLock);
+        return;
+    }
+    newHandle = fAttachedDevHandle;
+    if (newHandle == 0 && oldHandle != 0) {
+        if (fBlockDev != NULL) {
+            fBlockDev->setController(NULL);
+            fBlockDev->terminate();
+            fBlockDev->detach(this);
+            fBlockDev->release();
+            fBlockDev = NULL;
+        }
+        fCapacityBlocks = 0;
+        fDeviceOffline = true;
+        fTopologyChanged = false;
+        setProperty("MPRHotplugState", "removed");
+    } else if (newHandle != 0 && newHandle != oldHandle) {
+        if (probeScsiIdentity() && probeCapacity()) {
+            if (fBlockDev != NULL) {
+                fBlockDev->setController(NULL);
+                fBlockDev->terminate();
+                fBlockDev->detach(this);
+                fBlockDev->release();
+                fBlockDev = NULL;
+            }
+            fDeviceOffline = false;
+            fTopologyChanged = false;
+            setProperty("MPRHotplugState",
+                        publishBlockDevice() ? "rebuilt" : "rebuild-failed");
+        } else {
+            setProperty("MPRHotplugState", "identify-failed");
+        }
+    } else {
+        /* Same handle: a discovery retry, not a device change. */
+        fTopologyChanged = false;
+        setProperty("MPRHotplugState", "unchanged");
+    }
+    fReinitInProgress = false;
+    IOLockUnlock(fIOLock);
 }
 
 void
