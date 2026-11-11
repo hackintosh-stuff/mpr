@@ -1142,6 +1142,13 @@ MPRController::readSasIOUnitPage0(void)
             setProperty("MPRAttachedDevHandle", (unsigned long long)devHandle, 16);
             setProperty("MPRAttachedDeviceInfo", (unsigned long long)deviceInfo, 32);
             setProperty("MPRAttachedPhy", (unsigned long long)i, 8);
+            setProperty("MPRAttachedPortFlags", (unsigned long long)phy[0x01], 8);
+            setProperty("MPRAttachedPhyFlags", (unsigned long long)phy[0x02], 8);
+            setProperty("MPRAttachedDiscoveryStatus",
+                        (unsigned long long)((UInt32)phy[0x0C] |
+                                             ((UInt32)phy[0x0D] << 8) |
+                                             ((UInt32)phy[0x0E] << 16) |
+                                             ((UInt32)phy[0x0F] << 24)), 32);
             fAttachedDevHandle = devHandle;
             readSasDevicePage0(devHandle);
         }
@@ -1244,6 +1251,8 @@ MPRController::scsiInquiry(void)
     UInt8 *frame;
     UInt8 *data;
     UInt32 value32, sgeFlags;
+    UInt32 attempt;
+    bool   posted;
     char vendor[9], product[17], revision[5];
 
     if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fPageBuffer == NULL) {
@@ -1291,19 +1300,23 @@ MPRController::scsiInquiry(void)
     }
 
     memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
-    fReplyCount = 0;
-    fLastReplyKind = 0;
-    fLastReplySmid = 0xFFFF;
-    value32 = MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO | (5U << 16);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
-
-    if (!waitForReply(MPR_M2_REPLY_TIMEOUT_MS)) {
-        setProperty("MPRM3aFailure", "INQUIRY timeout");
-        return false;
+    posted = false;
+    for (attempt = 0; attempt < 10 && !posted; attempt++) {
+        fReplyCount = 0;
+        fLastReplyKind = 0;
+        fLastReplySmid = 0xFFFF;
+        value32 = MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO | (5U << 16);
+        writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
+        writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+        if (waitForReply(MPR_M2_REPLY_TIMEOUT_MS) && fLastReplySmid == 5) {
+            posted = true;
+            break;
+        }
+        IOSleep(1000);
     }
-    if (fLastReplySmid != 5) {
-        setProperty("MPRM3aFailure", "INQUIRY finished for another SMID");
+    setProperty("MPRInquiryAttempts", (unsigned long long)(attempt + 1), 32);
+    if (!posted) {
+        setProperty("MPRM3aFailure", "INQUIRY timeout");
         return false;
     }
 
@@ -1628,7 +1641,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M3a");
-    setProperty("MPRBuild", "0.9.1");
+    setProperty("MPRBuild", "0.9.2");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
