@@ -1791,7 +1791,8 @@ MPRController::scsiReadCapacity10(void)
 
 bool
 MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
-                             UInt32 blockSize, UInt32 smid, bool diagnostics)
+                             UInt32 blockSize, UInt32 smid, bool diagnostics,
+                             IOReturn *outStatus)
 {
     UInt8 cdb[10];
     MPRScsiIoRequest *request;
@@ -1801,6 +1802,11 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
     UInt8 replyKind = 0;
     UInt32 dataLen = blocks * blockSize;
     bool posted;
+    IOReturn mapped = kIOReturnIOError;
+
+    if (outStatus != NULL) {
+        *outStatus = kIOReturnNotReady;
+    }
 
     if (fDeviceOffline || fStopping ||
         (fFrozenSmid != 0 && fFrozenSmid == (UInt16)smid)) {
@@ -1849,8 +1855,13 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
     memcpy(request->CDB, cdb, sizeof(cdb));
     mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fDataPhys, dataLen);
 
-    /* A write caller has already filled the staging buffer; only reads need
-     * it cleared. Clearing it on write would discard the payload. */
+    /* Clear the previous command's sense so an old CHECK CONDITION cannot be
+     * mistaken for this command's. A write caller has already filled the
+     * staging buffer; only reads need it cleared. */
+    if (fPageBuffer != NULL) {
+        memset((UInt8 *)fPageBuffer->getBytesNoCopy() + MPR_SENSE_OFFSET,
+               0, 96);
+    }
     if (!write) {
         memset(fDataBuffer->getBytesNoCopy(), 0, fDataBytes);
     }
@@ -1885,6 +1896,9 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
         return false;
     }
     if (replyKind == 2) {
+        if (outStatus != NULL) {
+            *outStatus = kIOReturnSuccess;
+        }
         if (diagnostics) {
             setProperty("MPRReadIOCStatus", 0ULL, 16);
             setProperty("MPRReadScsiStatus", 0ULL, 8);
@@ -1901,12 +1915,44 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
     }
     if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS &&
         reply->SCSIStatus == 0) {
+        if (reply->TransferCount < dataLen) {
+            setProperty("MPRLastIOFailure", "short-transfer");
+            setProperty("MPRLastIOTransferCount",
+                        (unsigned long long)reply->TransferCount, 32);
+            setProperty("MPRLastIOExpected",
+                        (unsigned long long)dataLen, 32);
+            if (outStatus != NULL) {
+                *outStatus = kIOReturnUnderrun;
+            }
+            return false;
+        }
+        if (outStatus != NULL) {
+            *outStatus = kIOReturnSuccess;
+        }
         return true;
+    }
+    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
+        mapped = kIOReturnDeviceError;
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_CHECK_CONDITION) {
+        if ((reply->SCSIState & MPI2_SCSI_STATE_AUTOSENSE_VALID) == 0 ||
+            reply->SenseCount < 8) {
+            mapped = kIOReturnDeviceError;
+        } else {
+            mapped = decodeSense(kIOReturnIOError);
+        }
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_BUSY ||
+               reply->SCSIStatus == MPI2_SCSI_STATUS_TASK_SET_FULL ||
+               reply->SCSIStatus == MPI2_SCSI_STATUS_RESERVATION_CONFLICT) {
+        mapped = kIOReturnBusy;
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_TASK_ABORTED) {
+        mapped = kIOReturnAborted;
+    }
+    if (outStatus != NULL) {
+        *outStatus = mapped;
     }
     if (!diagnostics) {
         UInt8 *sense;
         UInt64 words[4];
-        IOReturn mapped;
 
         setProperty("MPRLastIOFailure", "scsi-status");
         setProperty("MPRLastIOSmid", (unsigned long long)smid, 16);
@@ -1935,7 +1981,6 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
         }
         /* Auto sense: the IOC already copied the sense data into our buffer;
          * translate it into a meaningful IOReturn for the storage stack. */
-        mapped = decodeSense(kIOReturnIOError);
         setProperty("MPRSenseStatus",
                     (unsigned long long)(UInt32)mapped, 32);
     }
@@ -2091,6 +2136,7 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
         UInt32 smid, attempt;
         UInt64 lba;
         bool ok = false;
+        IOReturn ioStatus = kIOReturnSuccess;
         /* A write whose result is unknown must not be replayed blindly. */
         UInt32 maxAttempts = write ? 1 : 3;
 
@@ -2125,7 +2171,7 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
 
         for (attempt = 0; attempt < maxAttempts && !ok; attempt++) {
             ok = scsiReadWrite(write, lba, chunkBlocks, fBlockSize,
-                               smid, false);
+                               smid, false, &ioStatus);
             if (!ok) {
                 fIoRetryCount++;
                 IOSleep(10);
@@ -2141,7 +2187,7 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
             setProperty("MPRBlockIORetryCount",
                         (unsigned long long)fIoRetryCount, 32);
             setProperty("MPRBlockIODoneBytes", done, 64);
-            status = kIOReturnDeviceError;
+            status = ioStatus;
             break;
         }
         if (!write) {
@@ -2590,7 +2636,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.14.3");
+    setProperty("MPRBuild", "0.15.0");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {

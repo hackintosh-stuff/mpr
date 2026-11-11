@@ -174,7 +174,8 @@ private:
     bool   probeCapacity(void);
 
     bool   scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
-                         UInt32 blockSize, UInt32 smid, bool diagnostics);
+                         UInt32 blockSize, UInt32 smid, bool diagnostics,
+                         IOReturn *status = NULL);
     bool   probeBlockRead(void);
 
     bool   allocateResidentBuffers(void);
