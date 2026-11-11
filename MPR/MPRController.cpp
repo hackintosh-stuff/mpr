@@ -882,7 +882,9 @@ MPRController::processReplyQueue(void)
                      * the watchdog schedules a thread that compares the
                      * discovered DevHandle before rebuilding anything. */
                     fTopologyChanged = true;
-                    fHotplugPending = true;
+                    if (fHotplugCooldown == 0) {
+                        fHotplugPending = true;
+                    }
                 }
                 if (fLastEventAckRequired == MPI2_EVENT_NOTIFICATION_ACK_REQUIRED) {
                     sendEventAck(fLastEvent, fLastEventContext);
@@ -2700,6 +2702,7 @@ MPRController::start(IOService *provider)
     fWatchdogTimer = NULL;
     fHotplugCall = NULL;
     fHotplugPending = false;
+    fHotplugCooldown = 0;
     fInjectTimeout = false;
     fInjectTmfFail = 0;
     fFastPathEnabled = false;
@@ -2741,7 +2744,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.0");
+    setProperty("MPRBuild", "0.17.4");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3398,6 +3401,9 @@ MPRController::watchdogTimeout(IOTimerEventSource *sender)
         fHotplugPending = false;
         thread_call_enter(fHotplugCall);
     }
+    if (fHotplugCooldown > 0) {
+        fHotplugCooldown--;
+    }
     if (sender != NULL) {
         sender->setTimeoutMS(1000);
     }
@@ -3414,58 +3420,23 @@ MPRController::hotplugCall(thread_call_param_t param0,
 void
 MPRController::hotplugThread(void)
 {
-    UInt32 oldHandle, newHandle;
-
-    if (fStopping || fReinitInProgress || fIOLock == NULL) {
+    if (fStopping || fReinitInProgress) {
         return;
     }
-    IOLockLock(fIOLock);
-    fReinitInProgress = true;
-    oldHandle = fAttachedDevHandle;
-    fAttachedDevHandle = 0;
-    removeProperty("MPRAttachedDevHandle");
-    if (!readSasIOUnitPage0()) {
-        setProperty("MPRHotplugState", "discovery-failed");
-        fReinitInProgress = false;
-        IOLockUnlock(fIOLock);
-        return;
-    }
-    newHandle = fAttachedDevHandle;
-    if (newHandle == 0 && oldHandle != 0) {
-        if (fBlockDev != NULL) {
-            fBlockDev->setController(NULL);
-            fBlockDev->terminate();
-            fBlockDev->detach(this);
-            fBlockDev->release();
-            fBlockDev = NULL;
-        }
-        fCapacityBlocks = 0;
-        fDeviceOffline = true;
-        fTopologyChanged = false;
-        setProperty("MPRHotplugState", "removed");
-    } else if (newHandle != 0 && newHandle != oldHandle) {
-        if (probeScsiIdentity() && probeCapacity()) {
-            if (fBlockDev != NULL) {
-                fBlockDev->setController(NULL);
-                fBlockDev->terminate();
-                fBlockDev->detach(this);
-                fBlockDev->release();
-                fBlockDev = NULL;
-            }
-            fDeviceOffline = false;
-            fTopologyChanged = false;
-            setProperty("MPRHotplugState",
-                        publishBlockDevice() ? "rebuilt" : "rebuild-failed");
-        } else {
-            setProperty("MPRHotplugState", "identify-failed");
-        }
+    /* The event is followed by a full controller reset: it quiesces the IOC,
+     * re-runs discovery and rebuilds the nub/media. A same-handle discovery
+     * retry ends up here once, then fHotplugPending stays clear. */
+    if (resetAndReinitialize()) {
+        setProperty("MPRHotplugState",
+                    fAttachedDevHandle != 0 ? "rebuilt" : "removed");
     } else {
-        /* Same handle: a discovery retry, not a device change. */
-        fTopologyChanged = false;
-        setProperty("MPRHotplugState", "unchanged");
+        setProperty("MPRHotplugState", "reset-failed");
     }
-    fReinitInProgress = false;
-    IOLockUnlock(fIOLock);
+    /* Discovery completes for several seconds after the reset; do not let
+     * those events trigger another rebuild. */
+    fHotplugPending = false;
+    fTopologyChanged = false;
+    fHotplugCooldown = 5;
 }
 
 void
@@ -3528,6 +3499,7 @@ bool
 MPRController::resetAndReinitialize(void)
 {
     bool ok = false;
+    UInt32 retry;
 
     if (fReinitInProgress || fStopping) {
         return false;
@@ -3562,7 +3534,19 @@ MPRController::resetAndReinitialize(void)
          * property so the topology read accepts the new devhandle. */
         removeProperty("MPRAttachedDevHandle");
         fAttachedDevHandle = 0;
-        if (readSasIOUnitPage0() && fAttachedDevHandle != 0) {
+        /* After diag reset the target needs a moment to reappear; retry the
+         * topology read instead of failing the whole recovery immediately. */
+        IOSleep(500);
+        for (retry = 0; retry < 5; retry++) {
+            fReplyCount = 0;
+            fLastReplyKind = 0;
+            fLastReplySmid = 0xFFFF;
+            if (readSasIOUnitPage0() && fAttachedDevHandle != 0) {
+                break;
+            }
+            IOSleep(200);
+        }
+        if (fAttachedDevHandle != 0) {
             char oldVendor[16], oldProduct[20];
             UInt64 oldBlocks = fCapacityBlocks;
             UInt32 oldBlockSize = fBlockSize;

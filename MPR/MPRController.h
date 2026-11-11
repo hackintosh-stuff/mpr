@@ -110,6 +110,7 @@ private:
     IOTimerEventSource        *fWatchdogTimer;
     thread_call_t              fHotplugCall;
     volatile bool              fHotplugPending;
+    volatile UInt32            fHotplugCooldown;
     UInt32                     fHighPriorityCredit;
     volatile UInt32            fEventReplyCount;
     volatile UInt32            fEventAckCount;
