@@ -176,7 +176,7 @@ private:
 
     bool   scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
                          UInt32 blockSize, UInt32 smid, bool diagnostics,
-                         IOReturn *status = NULL);
+                         bool fua, IOReturn *status = NULL);
     bool   probeBlockRead(void);
 
     bool   allocateResidentBuffers(void);
@@ -192,7 +192,8 @@ private:
                             const UInt8 *outData, UInt32 dataLen,
                             UInt32 smid, IOReturn *status);
     bool   scsiInquiryVpd(UInt8 page, UInt8 *buf, UInt32 len);
-    IOReturn scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid);
+    IOReturn scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid,
+                                  bool barrier);
     IOReturn scsiUnmap(const IOBlockStorageDeviceExtent *extents,
                        UInt32 extentsCount, UInt32 smid);
     bool   sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid);
@@ -208,11 +209,13 @@ public:
     IOReturn readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
                         UInt64 nblks, UInt64 *actualBytes);
     IOReturn transferBlocks(bool write, IOMemoryDescriptor *buffer,
-                            UInt64 block, UInt64 nblks, UInt64 *actualBytes);
-    IOReturn synchronizeCache(UInt64 block, UInt64 nblks);
+                            UInt64 block, UInt64 nblks, bool fua,
+                            UInt64 *actualBytes);
+    IOReturn synchronizeCache(UInt64 block, UInt64 nblks, bool barrier);
     IOReturn unmapBlocks(const IOBlockStorageDeviceExtent *extents,
                          UInt32 extentsCount);
     UInt64   getCapacityBlocks(void) const { return fCapacityBlocks; }
+    bool     isDeviceOffline(void) const { return fDeviceOffline; }
     UInt32   getBlockSize(void) const { return fBlockSize; }
     char    *getVendorString(void) { return fVendor; }
     char    *getProductString(void) { return fProduct; }

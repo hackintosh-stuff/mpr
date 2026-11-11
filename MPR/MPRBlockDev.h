@@ -15,6 +15,7 @@ class MPRBlockDev : public IOBlockStorageDevice
 
 private:
     MPRController *fController;
+    bool           fLastMediaPresent;
 
 public:
     virtual bool init(OSDictionary *properties) APPLE_KEXT_OVERRIDE;

@@ -12,6 +12,7 @@ bool
 MPRBlockDev::init(OSDictionary *properties)
 {
     fController = NULL;
+    fLastMediaPresent = false;
     return super::init(properties);
 }
 
@@ -135,12 +136,16 @@ MPRBlockDev::reportMediaState(bool *mediaPresent, bool *changedState)
     if (mediaPresent == NULL) {
         return kIOReturnBadArgument;
     }
-    *mediaPresent = (fController != NULL) &&
-                    (fController->getCapacityBlocks() != 0) &&
-                    (fController->getBlockSize() != 0);
+    bool present = (fController != NULL) &&
+                   !fController->isDeviceOffline() &&
+                   (fController->getCapacityBlocks() != 0) &&
+                   (fController->getBlockSize() != 0);
+
+    *mediaPresent = present;
     if (changedState != NULL) {
-        *changedState = false;
+        *changedState = (present != fLastMediaPresent);
     }
+    fLastMediaPresent = present;
     return kIOReturnSuccess;
 }
 
@@ -160,9 +165,11 @@ MPRBlockDev::reportWriteProtection(bool *isWriteProtected)
     if (isWriteProtected == NULL) {
         return kIOReturnBadArgument;
     }
-    /* The media is writable. UNMAP is still gated in the controller and
-     * is disabled at runtime on the first failure (risk R11). */
-    *isWriteProtected = false;
+    /* Only publish a writable media once the target and capacity are known.
+     * UNMAP is still gated in the controller and is disabled at runtime on
+     * the first failure (risk R11). */
+    *isWriteProtected = (fController == NULL ||
+                         fController->getCapacityBlocks() == 0);
     return kIOReturnSuccess;
 }
 
@@ -174,7 +181,7 @@ MPRBlockDev::doAsyncReadWrite(IOMemoryDescriptor *buffer,
 {
     UInt64  actualBytes = 0;
     IOReturn status;
-    bool    write;
+    bool    write, fua;
 
     if (buffer == NULL || completion == NULL || fController == NULL) {
         return kIOReturnBadArgument;
@@ -183,12 +190,14 @@ MPRBlockDev::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     /* A descriptor with kIODirectionOut carries data from memory to the
      * device; kIODirectionIn carries data read from the device. */
     write = (buffer->getDirection() & kIODirectionOut) != 0;
+    fua = (attributes != NULL &&
+           (attributes->options & kIOStorageOptionForceUnitAccess) != 0);
 
     /* MPRController::transferBlocks() completes synchronously; the completion
      * is invoked after the controller lock has been released, so a client that
      * immediately issues another request cannot deadlock on that lock. */
     status = fController->transferBlocks(write, buffer, block, nblks,
-                                         &actualBytes);
+                                         fua, &actualBytes);
     if (completion->action != NULL) {
         completion->action(completion->target, completion->parameter,
                            status, actualBytes);
@@ -200,7 +209,7 @@ IOReturn
 MPRBlockDev::doSynchronizeCache(void)
 {
     /* Deprecated entry point, kept for older IOStorageFamily clients. */
-    return (fController != NULL) ? fController->synchronizeCache(0, 0)
+    return (fController != NULL) ? fController->synchronizeCache(0, 0, false)
                                  : kIOReturnNotReady;
 }
 
@@ -208,10 +217,12 @@ IOReturn
 MPRBlockDev::doSynchronize(UInt64 block, UInt64 nblks,
                            IOStorageSynchronizeOptions options)
 {
+    bool barrier = (options & kIOStorageSynchronizeOptionBarrier) != 0;
+
     if (fController == NULL) {
         return kIOReturnNotReady;
     }
-    return fController->synchronizeCache(block, nblks);
+    return fController->synchronizeCache(block, nblks, barrier);
 }
 
 IOReturn

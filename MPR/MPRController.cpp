@@ -1827,7 +1827,7 @@ MPRController::scsiReadCapacity10(void)
 bool
 MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
                              UInt32 blockSize, UInt32 smid, bool diagnostics,
-                             IOReturn *outStatus)
+                             bool fua, IOReturn *outStatus)
 {
     UInt8 cdb[10];
     MPRScsiIoRequest *request;
@@ -1864,6 +1864,9 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
 
     memset(cdb, 0, sizeof(cdb));
     cdb[0] = write ? 0x2A : 0x28;           /* WRITE(10) / READ(10) */
+    if (write && fua) {
+        cdb[1] |= 0x08;                     /* force unit access */
+    }
     cdb[2] = (UInt8)(lba >> 24);
     cdb[3] = (UInt8)(lba >> 16);
     cdb[4] = (UInt8)(lba >> 8);
@@ -2057,7 +2060,7 @@ MPRController::probeBlockRead(void)
             setProperty("MPRReadProbeState", "failed-alloc");
         } else {
             /* Read the first 8 blocks and decode the MBR/GPT protective entry. */
-            ok = scsiReadWrite(false, 0, 8, 512, 9, true);
+            ok = scsiReadWrite(false, 0, 8, 512, 9, true, false);
             setProperty("MPRReadProbeState", ok ? "ok" : "failed");
 
             data = (UInt8 *)fDataBuffer->getBytesNoCopy();
@@ -2114,7 +2117,8 @@ MPRController::probeBlockRead(void)
 
 IOReturn
 MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
-                              UInt64 block, UInt64 nblks, UInt64 *actualBytes)
+                              UInt64 block, UInt64 nblks, bool fua,
+                              UInt64 *actualBytes)
 {
     UInt8 *staging;
     UInt64 byteCount, done = 0, maxBlocks, remaining, want;
@@ -2208,7 +2212,7 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
 
         for (attempt = 0; attempt < maxAttempts && !ok; attempt++) {
             ok = scsiReadWrite(write, lba, chunkBlocks, fBlockSize,
-                               smid, false, &ioStatus);
+                               smid, false, fua, &ioStatus);
             if (!ok) {
                 fIoRetryCount++;
                 IOSleep(10);
@@ -2707,7 +2711,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.15.3");
+    setProperty("MPRBuild", "0.15.4");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -2813,7 +2817,7 @@ IOReturn
 MPRController::readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
                           UInt64 nblks, UInt64 *actualBytes)
 {
-    return transferBlocks(false, buffer, block, nblks, actualBytes);
+    return transferBlocks(false, buffer, block, nblks, false, actualBytes);
 }
 
 void
@@ -3095,7 +3099,8 @@ MPRController::scsiInquiryVpd(UInt8 page, UInt8 *buf, UInt32 len)
 }
 
 IOReturn
-MPRController::scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid)
+MPRController::scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid,
+                                    bool barrier)
 {
     UInt8 cdb[10];
     IOReturn status = kIOReturnNotReady;
@@ -3113,6 +3118,10 @@ MPRController::scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid)
                           NULL, 0, smid, &status)) {
         return status;
     }
+    /* SYNCHRONIZE CACHE completes only after the cached data is on media;
+     * that completion is what satisfies a barrier request. */
+    setProperty("MPRSyncBarrier",
+                (unsigned long long)(barrier ? 1 : 0), 8);
     return kIOReturnSuccess;
 }
 
@@ -3356,7 +3365,7 @@ MPRController::resetAndReinitialize(void)
 }
 
 IOReturn
-MPRController::synchronizeCache(UInt64 block, UInt64 nblks)
+MPRController::synchronizeCache(UInt64 block, UInt64 nblks, bool barrier)
 {
     UInt32 blocks;
     IOReturn status;
@@ -3378,7 +3387,7 @@ MPRController::synchronizeCache(UInt64 block, UInt64 nblks)
     blocks = (nblks > 0xFFFFULL) ? 0 : (UInt32)nblks;
 
     IOLockLock(fIOLock);
-    status = scsiSynchronizeCache(block, blocks, MPR_SM_SYNC_CACHE);
+    status = scsiSynchronizeCache(block, blocks, MPR_SM_SYNC_CACHE, barrier);
     IOLockUnlock(fIOLock);
     return status;
 }
