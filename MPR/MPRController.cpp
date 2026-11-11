@@ -898,6 +898,24 @@ MPRController::waitForReply(UInt32 timeoutMs)
     return fReplyCount > 0;
 }
 
+bool
+MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
+{
+    UInt32 i;
+
+    /* A reply left over from an earlier command must not be mistaken for the
+     * completion of this one. Each M3-d command uses a rotating SMID, so the
+     * SMID in the reply descriptor identifies the command unambiguously. */
+    for (i = 0; i < timeoutMs; i++) {
+        if (fReplyCount > 0 && fLastReplySmid == (UInt16)smid) {
+            return true;
+        }
+        IOSleep(1);
+    }
+    processReplyQueue();
+    return fReplyCount > 0 && fLastReplySmid == (UInt16)smid;
+}
+
 /* ------------------------------------------------------------------------ */
 /* M2-b: install the event mask and enable the SAS port. Firmware events are  */
 /* collected asynchronously by processReplyQueue().                          */
@@ -1699,10 +1717,17 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
     fLastReplyKind = 0;
     fLastReplySmid = 0xFFFF;
     postScsiIo(smid);
-    posted = waitForReply(15000) && (fLastReplySmid == (UInt16)smid);
+    posted = waitForSmid(15000, smid);
     if (!posted) {
         if (diagnostics) {
             setProperty("MPRM3cFailure", "transfer timeout");
+        } else {
+            setProperty("MPRM3dLastFailure", "reply-timeout");
+            setProperty("MPRM3dLastFailSmid", (unsigned long long)smid, 16);
+            setProperty("MPRM3dLastFailReplySmid",
+                        (unsigned long long)fLastReplySmid, 16);
+            setProperty("MPRM3dLastFailReplyCount",
+                        (unsigned long long)fReplyCount, 32);
         }
         return false;
     }
@@ -1721,8 +1746,24 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
         setProperty("MPRReadScsiStatus", (unsigned long long)reply->SCSIStatus, 8);
         setProperty("MPRReadTransferCount", (unsigned long long)reply->TransferCount, 32);
     }
-    return (reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS &&
-           reply->SCSIStatus == 0;
+    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS &&
+        reply->SCSIStatus == 0) {
+        return true;
+    }
+    if (!diagnostics) {
+        setProperty("MPRM3dLastFailure", "scsi-status");
+        setProperty("MPRM3dLastFailSmid", (unsigned long long)smid, 16);
+        setProperty("MPRM3dLastFailKind", (unsigned long long)fLastReplyKind, 8);
+        setProperty("MPRM3dLastFailIOCStatus",
+                    (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+        setProperty("MPRM3dLastFailScsiStatus",
+                    (unsigned long long)reply->SCSIStatus, 8);
+        setProperty("MPRM3dLastFailTransferCount",
+                    (unsigned long long)reply->TransferCount, 32);
+        setProperty("MPRM3dLastFailSCSIState",
+                    (unsigned long long)reply->SCSIState, 8);
+    }
+    return false;
 }
 
 bool
@@ -1856,15 +1897,22 @@ MPRController::readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
 
     status = buffer->prepare();
     if (status != kIOReturnSuccess) {
+        setProperty("MPRM3dFailure", "prepare");
+        setProperty("MPRM3dFailureStatus",
+                    (unsigned long long)(UInt32)status, 32);
         return status;
     }
     status = kIOReturnSuccess;
 
-    /* One SMID, one reply slot and one staging buffer are shared by the whole
-     * driver, so the SCSI IO path must be serialized. The completion callback
-     * runs in MPRBlockDev after this method returns and the lock is released. */
+    /* One reply slot and one staging buffer are shared by the whole driver,
+     * so the SCSI IO path must be serialized. The completion callback runs in
+     * MPRBlockDev after this method returns and the lock is released. */
     IOLockLock(fIOLock);
     while (done < byteCount) {
+        UInt32 smid, attempt;
+        UInt64 lba;
+        bool ok = false;
+
         remaining = byteCount - done;
         want = remaining / fBlockSize;
         if (want > maxBlocks) {
@@ -1872,14 +1920,41 @@ MPRController::readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
         }
         chunkBlocks = (UInt32)want;
         chunkBytes = (IOByteCount)((UInt64)chunkBlocks * fBlockSize);
-        if (!scsiReadWrite(false, block + done / fBlockSize, chunkBlocks,
-                           fBlockSize, 9, false)) {
+        lba = block + done / fBlockSize;
+
+        /* Rotating SMIDs keep a late reply from an earlier command from
+         * satisfying waitForSmid() for this one. SMIDs 5..9 belong to the
+         * startup probes; 10..25 are the runtime IO window. */
+        smid = 10 + (fM3dNextSmid & 15);
+        fM3dNextSmid++;
+        fM3dIoCount++;
+
+        for (attempt = 0; attempt < 3 && !ok; attempt++) {
+            ok = scsiReadWrite(false, lba, chunkBlocks, fBlockSize,
+                               smid, false);
+            if (!ok) {
+                fM3dRetryCount++;
+                IOSleep(10);
+            }
+        }
+        if (!ok) {
+            setProperty("MPRM3dFailure", "scsi-io");
+            setProperty("MPRM3dFailureLba", lba, 64);
+            setProperty("MPRM3dFailureSmid", (unsigned long long)smid, 16);
+            setProperty("MPRM3dIoCount",
+                        (unsigned long long)fM3dIoCount, 32);
+            setProperty("MPRM3dRetryCount",
+                        (unsigned long long)fM3dRetryCount, 32);
+            setProperty("MPRM3dDoneBytes", done, 64);
             status = kIOReturnDeviceError;
             break;
         }
         copied = buffer->writeBytes((IOByteCount)done, staging, chunkBytes);
         done += (UInt64)copied;
         if (copied != chunkBytes) {
+            setProperty("MPRM3dFailure", "copy");
+            setProperty("MPRM3dFailureCopied", (unsigned long long)copied, 64);
+            setProperty("MPRM3dDoneBytes", done, 64);
             status = kIOReturnUnderrun;
             break;
         }
@@ -2260,6 +2335,9 @@ MPRController::start(IOService *provider)
     fIOLock = IOLockAlloc();
     fCapacityBlocks = 0;
     fBlockSize = 0;
+    fM3dNextSmid = 0;
+    fM3dIoCount = 0;
+    fM3dRetryCount = 0;
     memset(fVendor, 0, sizeof(fVendor));
     memset(fProduct, 0, sizeof(fProduct));
     memset(fRevision, 0, sizeof(fRevision));
@@ -2293,7 +2371,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M3d");
-    setProperty("MPRBuild", "0.12.0");
+    setProperty("MPRBuild", "0.12.1");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one

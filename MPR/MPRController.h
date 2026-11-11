@@ -74,6 +74,9 @@ private:
     IOLock                    *fIOLock;
     UInt64                     fCapacityBlocks;
     UInt32                     fBlockSize;
+    UInt32                     fM3dNextSmid;
+    volatile UInt32            fM3dIoCount;
+    volatile UInt32            fM3dRetryCount;
     char                       fVendor[16];
     char                       fProduct[20];
     char                       fRevision[8];
@@ -112,6 +115,7 @@ private:
                                 int index);
     void   processReplyQueue(void);
     bool   waitForReply(UInt32 timeoutMs);
+    bool   waitForSmid(UInt32 timeoutMs, UInt32 smid);
 
     bool   sendEventNotification(void);
     bool   sendPortEnable(void);
