@@ -835,9 +835,23 @@ MPRController::processReplyQueue(void)
         if (flags == MPI2_RPY_DESCRIPT_FLAGS_ADDRESS_REPLY &&
             baddr >= (UInt32)fReplyPhys &&
             baddr < (UInt32)fReplyPhys + replyBytes) {
-            memcpy(fLastReply, replyBase + (baddr - (UInt32)fReplyPhys),
-                   sizeof(fLastReply));
-            fReplyCount++;
+            UInt8 *replyFrame = replyBase + (baddr - (UInt32)fReplyPhys);
+
+            if (replyFrame[3] == MPI2_FUNCTION_EVENT_NOTIFICATION) {
+                MPREventNotifyReply *event = (MPREventNotifyReply *)replyFrame;
+
+                /* Asynchronous firmware event (also carries the reply to the
+                 * mask-setting request itself). */
+                memcpy(fLastEventData, replyFrame, sizeof(fLastEventData));
+                fLastEvent = event->Event;
+                fLastEventDataLength = event->EventDataLength;
+                fLastEventAckRequired = event->AckRequired;
+                fLastEventContext = event->EventContext;
+                fEventCount++;
+            } else {
+                memcpy(fLastReply, replyFrame, sizeof(fLastReply));
+                fReplyCount++;
+            }
         }
     }
     writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, fReplyPostIndex);
@@ -858,6 +872,103 @@ MPRController::waitForReply(UInt32 timeoutMs)
     /* Fallback when the interrupt source could not be installed. */
     processReplyQueue();
     return fReplyCount > 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* M2-b: install the event mask and enable the SAS port. Firmware events are  */
+/* collected asynchronously by processReplyQueue().                          */
+
+static void
+mprSetEventBit(UInt32 *masks, UInt32 event)
+{
+    masks[event / 32] |= (1U << (event % 32));
+}
+
+bool
+MPRController::sendEventNotification(void)
+{
+    UInt8 *frame;
+    MPREventNotifyRequest *request;
+    UInt32 value32;
+
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return false;
+    }
+    frame += 2 * fRequestFrameSize;     /* SMID 2 */
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPREventNotifyRequest *)frame;
+
+    request->Function = MPI2_FUNCTION_EVENT_NOTIFICATION;
+    mprSetEventBit(request->EventMasks, MPI2_EVENT_STATE_CHANGE);
+    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_DEVICE_STATUS_CHANGE);
+    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_DISCOVERY);
+    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_BROADCAST_PRIMITIVE);
+    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST);
+    mprSetEventBit(request->EventMasks, MPI2_EVENT_LOG_ENTRY_ADDED);
+    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_DEVICE_DISCOVERY_ERROR);
+
+    value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (2U << 16);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+    return true;
+}
+
+bool
+MPRController::sendPortEnable(void)
+{
+    UInt8 *frame;
+    MPRPortEnableRequest *request;
+    UInt32 value32;
+
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return false;
+    }
+    frame += 3 * fRequestFrameSize;     /* SMID 3 */
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPRPortEnableRequest *)frame;
+    request->Function = MPI2_FUNCTION_PORT_ENABLE;
+    request->PortFlags = 0;
+
+    fReplyCount = 0;
+    value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (3U << 16);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+    return waitForReply(MPR_M2_REPLY_TIMEOUT_MS);
+}
+
+bool
+MPRController::runM2b(void)
+{
+    bool notified, enabled;
+
+    notified = sendEventNotification();
+    setProperty("MPREventNotify", notified ? "posted" : "failed");
+    if (!notified) {
+        setProperty("MPRM2bState", "failed-notify");
+        return false;
+    }
+
+    enabled = sendPortEnable();
+    setProperty("MPRPortEnable", enabled ? "ok" : "failed");
+    if (!enabled) {
+        setProperty("MPRM2bState", "failed-portenable");
+        return false;
+    }
+
+    /* Let the IOC raise discovery/topology events before sampling counters. */
+    IOSleep(1500);
+
+    setProperty("MPREventCount", (unsigned long long)fEventCount, 32);
+    setProperty("MPRLastEvent", (unsigned long long)fLastEvent, 16);
+    setProperty("MPRLastEventDataLength", (unsigned long long)fLastEventDataLength, 16);
+    setProperty("MPRLastEventAck", (unsigned long long)fLastEventAckRequired, 8);
+    setProperty("MPRM2bState", "ok");
+    IOLog("MPR M2b: events=%u last=0x%04x len=%u ack=%u\n",
+          (unsigned int)fEventCount, (unsigned int)fLastEvent,
+          (unsigned int)fLastEventDataLength, (unsigned int)fLastEventAckRequired);
+    return true;
 }
 
 bool
@@ -1057,7 +1168,13 @@ MPRController::start(IOService *provider)
     fReplyCount = 0;
     fInterruptCount = 0;
     fReplyViaIrq = 0;
+    fEventCount = 0;
+    fLastEvent = 0;
+    fLastEventDataLength = 0;
+    fLastEventAckRequired = 0;
+    fLastEventContext = 0;
     memset(fLastReply, 0, sizeof(fLastReply));
+    memset(fLastEventData, 0, sizeof(fLastEventData));
 
     pci = OSDynamicCast(IOPCIDevice, provider);
     if (pci == NULL) {
@@ -1085,8 +1202,8 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M2a");
-    setProperty("MPRBuild", "0.6.1");
+    setProperty("MPRStage", "M2b");
+    setProperty("MPRBuild", "0.7.0");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
@@ -1094,14 +1211,18 @@ MPRController::start(IOService *provider)
     setupInterrupts();
     if (runM1a() && runM1b()) {
         runM1c();
+        runM2b();
     } else {
         setProperty("MPRM1cState", "skipped-earlier-stage-failed");
     }
 
     setProperty("MPRIntCount", (unsigned long long)fInterruptCount, 32);
     setProperty("MPRReplyViaIrq", (unsigned long long)fReplyViaIrq, 32);
-    IOLog("MPR M2a: start complete, irq=%u replyViaIrq=%u\n",
-          (unsigned int)fInterruptCount, (unsigned int)fReplyViaIrq);
+    setProperty("MPREventCount", (unsigned long long)fEventCount, 32);
+    setProperty("MPRLastEvent", (unsigned long long)fLastEvent, 16);
+    IOLog("MPR M2b: start complete, irq=%u replyViaIrq=%u events=%u last=0x%04x\n",
+          (unsigned int)fInterruptCount, (unsigned int)fReplyViaIrq,
+          (unsigned int)fEventCount, (unsigned int)fLastEvent);
     return true;
 }
 

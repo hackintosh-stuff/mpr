@@ -374,4 +374,106 @@ static_assert(sizeof(MPRConfigPageMan0) == 0x4C, "manufacturing page 0 layout");
 static_assert(offsetof(MPRConfigRequest, SgeFlagsLength) == 0x1C, "config SGE offset");
 static_assert(offsetof(MPRConfigPageMan0, ChipName) == 0x04, "ChipName offset");
 
+/* ---------------------------------------------------------------------- */
+/* M2-b: EventNotification and PortEnable.                                 */
+
+/* Event numbers (mpi2_ioc.h:581-614) */
+#define MPI2_EVENT_STATE_CHANGE                    0x0002
+#define MPI2_EVENT_SAS_DEVICE_STATUS_CHANGE        0x000F
+#define MPI2_EVENT_SAS_DISCOVERY                   0x0016
+#define MPI2_EVENT_SAS_BROADCAST_PRIMITIVE         0x0017
+#define MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST        0x001C
+#define MPI2_EVENT_LOG_ENTRY_ADDED                 0x0021
+#define MPI2_EVENT_SAS_DEVICE_DISCOVERY_ERROR      0x0035
+
+#define MPR_EVENT_MASK_WORDS                       4
+
+#pragma pack(push, 1)
+
+/* MPI2_PORT_ENABLE_REQUEST: 0x0C bytes (mpi2_ioc.h:492-505) */
+typedef struct {
+    UInt16  Reserved1;      /* 0x00 */
+    UInt8   ChainOffset;    /* 0x02 */
+    UInt8   Function;       /* 0x03 */
+    UInt8   Reserved2;      /* 0x04 */
+    UInt8   PortFlags;      /* 0x05 */
+    UInt8   Reserved3;      /* 0x06 */
+    UInt8   MsgFlags;       /* 0x07 */
+    UInt8   VP_ID;          /* 0x08 */
+    UInt8   VF_ID;          /* 0x09 */
+    UInt16  Reserved4;      /* 0x0A */
+} MPRPortEnableRequest;
+
+/* MPI2_PORT_ENABLE_REPLY: 0x14 bytes (mpi2_ioc.h:508-524) */
+typedef struct {
+    UInt16  Reserved1;      /* 0x00 */
+    UInt8   MsgLength;      /* 0x02 */
+    UInt8   Function;       /* 0x03 */
+    UInt8   Reserved2;      /* 0x04 */
+    UInt8   PortFlags;      /* 0x05 */
+    UInt8   Reserved3;      /* 0x06 */
+    UInt8   MsgFlags;       /* 0x07 */
+    UInt8   VP_ID;          /* 0x08 */
+    UInt8   VF_ID;          /* 0x09 */
+    UInt16  Reserved4;      /* 0x0A */
+    UInt16  Reserved5;      /* 0x0C */
+    UInt16  IOCStatus;      /* 0x0E */
+    UInt32  IOCLogInfo;     /* 0x10 */
+} MPRPortEnableReply;
+
+/* MPI2_EVENT_NOTIFICATION_REQUEST: 0x2C bytes (mpi2_ioc.h:533-552) */
+typedef struct {
+    UInt16  Reserved1;      /* 0x00 */
+    UInt8   ChainOffset;    /* 0x02 */
+    UInt8   Function;       /* 0x03 */
+    UInt16  Reserved2;      /* 0x04 */
+    UInt8   Reserved3;      /* 0x06 */
+    UInt8   MsgFlags;       /* 0x07 */
+    UInt8   VP_ID;          /* 0x08 */
+    UInt8   VF_ID;          /* 0x09 */
+    UInt16  Reserved4;      /* 0x0A */
+    UInt32  Reserved5;      /* 0x0C */
+    UInt32  Reserved6;      /* 0x10 */
+    UInt32  EventMasks[MPR_EVENT_MASK_WORDS];   /* 0x14 */
+    UInt16  SASBroadcastPrimitiveMasks;         /* 0x24 */
+    UInt16  SASNotifyPrimitiveMasks;            /* 0x26 */
+    UInt32  Reserved8;      /* 0x28 */
+} MPREventNotifyRequest;
+
+/* MPI2_EVENT_NOTIFICATION_REPLY header: 0x1C bytes (mpi2_ioc.h:555-574) */
+typedef struct {
+    UInt16  EventDataLength;    /* 0x00 */
+    UInt8   MsgLength;          /* 0x02 */
+    UInt8   Function;           /* 0x03 */
+    UInt16  Reserved1;          /* 0x04 */
+    UInt8   AckRequired;        /* 0x06 */
+    UInt8   MsgFlags;           /* 0x07 */
+    UInt8   VP_ID;              /* 0x08 */
+    UInt8   VF_ID;              /* 0x09 */
+    UInt16  Reserved2;          /* 0x0A */
+    UInt16  Reserved3;          /* 0x0C */
+    UInt16  IOCStatus;          /* 0x0E */
+    UInt32  IOCLogInfo;         /* 0x10 */
+    UInt16  Event;              /* 0x14 */
+    UInt16  Reserved4;          /* 0x16 */
+    UInt32  EventContext;       /* 0x18 */
+} MPREventNotifyReply;
+
+/* MPI2_EVENT_DATA_SAS_DISCOVERY: 0x0C bytes */
+typedef struct {
+    UInt32  DiscoveryStatus;    /* 0x00 */
+    UInt32  Reserved1;          /* 0x04 */
+    UInt16  ReasonCode;         /* 0x08 */
+    UInt16  PhysicalPort;       /* 0x0A */
+} MPREventDataSasDiscovery;
+
+#pragma pack(pop)
+
+static_assert(sizeof(MPRPortEnableRequest) == 0x0C, "PortEnable request layout");
+static_assert(sizeof(MPRPortEnableReply) == 0x14, "PortEnable reply layout");
+static_assert(sizeof(MPREventNotifyRequest) == 0x2C, "EventNotify request layout");
+static_assert(offsetof(MPREventNotifyReply, Event) == 0x14, "event number offset");
+static_assert(offsetof(MPREventNotifyReply, EventContext) == 0x18, "event context offset");
+static_assert(sizeof(MPREventDataSasDiscovery) == 0x0C, "SAS discovery data layout");
+
 #endif /* MPR_MPI2_MIN_H */

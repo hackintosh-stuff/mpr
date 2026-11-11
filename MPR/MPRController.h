@@ -51,6 +51,14 @@ private:
     volatile UInt32            fReplyViaIrq;
     UInt8                      fLastReply[64];
 
+    /* M2-b: firmware event notifications. */
+    volatile UInt32            fEventCount;
+    UInt16                     fLastEvent;
+    UInt16                     fLastEventDataLength;
+    UInt8                      fLastEventAckRequired;
+    UInt32                     fLastEventContext;
+    UInt8                      fLastEventData[64];
+
     UInt32 readReg(UInt32 offset);
     void   writeReg(UInt32 offset, UInt32 value);
 
@@ -79,6 +87,10 @@ private:
                                 int index);
     void   processReplyQueue(void);
     bool   waitForReply(UInt32 timeoutMs);
+
+    bool   sendEventNotification(void);
+    bool   sendPortEnable(void);
+    bool   runM2b(void);
 
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
