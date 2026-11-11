@@ -1,6 +1,6 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.7（2026-11-11；M3-d 完成：`MPRBlockDev` nub 与 `IOMedia` 已在真机生成，ESP 部署 0.12.2；1 GiB 顺序读验收待换盘，测试盘不可读扇区已由 Debian `mpt3sas` 交叉验证）
+状态：草案 v0.7（2026-11-11；M3-d 完成：`MPRBlockDev` nub 与 `IOMedia` 已在真机生成，ESP 部署 0.12.2；测试盘不可读扇区已由 Debian `mpt3sas` 交叉验证，Windows 格式化后 4 GiB 读写正常，M4 前需接回 SAS3008 复测）
 目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**已接入；已接 1 块 SATA SSD 测试盘，允许读写**）
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
@@ -433,6 +433,6 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **已验证（重启后）**：`com.ling.MPR (0.12.2)`；`MPRStage=M3d`、`MPRM3dState=ok`、`MPRM3dMediaBlocks=468862128`、`MPRM3dMediaBlockSize=512`；`diskutil list` 出现 240.1 GB 的 `ATA PCCOOLER SSD T20 Media`，GPT 四个分区，`IOMedia` 及其子分区 `Writable=No`；LBA0 `0xAA55`、part0 type `0xEE`、LBA1 `EFI PART` 与 M3-c 一致；600 MiB 顺序读两次 SHA256 相同，无新增 panic。
 
-**验收边界**：§6 的「1 GB 顺序读无错」需更换测试盘后重跑。已在 Debian 13 救援环境用上游 `mpt3sas` 对同一块盘交叉验证：按型号/序列号/容量/分区布局确定为 `/dev/sdb`，`dd bs=1M count=1024` 同样在读过程中报 `Input/output error`，内核日志为 `Sense Key : Medium Error` / `Add. Sense: Unrecovered read error` / `critical medium error, dev sdb`；macOS 侧稳定失败的 LBA 1255072–1255074 在 Debian 下用 `O_DIRECT` 单扇区读同样 9/9 失败，其它 LBA 正常。两套驱动得到相同的 sense，故这是测试盘样本的物理属性，不计为驱动缺陷，也不能用来掩盖驱动缺陷。
+**验收边界**：§6 的「1 GB 顺序读无错」需更换测试盘后重跑。已在 Debian 13 救援环境用上游 `mpt3sas` 对同一块盘交叉验证：按型号/序列号/容量/分区布局确定为 `/dev/sdb`，`dd bs=1M count=1024` 同样在读过程中报 `Input/output error`，内核日志为 `Sense Key : Medium Error` / `Add. Sense: Unrecovered read error` / `critical medium error, dev sdb`；macOS 侧稳定失败的 LBA 1255072–1255074 在 Debian 下用 `O_DIRECT` 单扇区读同样 9/9 失败，其它 LBA 正常。两套驱动得到相同的 sense，故这是测试盘样本的物理属性，不计为驱动缺陷，也不能用来掩盖驱动缺陷。该盘改接 Windows（`Realtek RTL9210B-CG` USB 桥）并格式化为 exFAT 后，1 GiB 与 4 GiB 两轮写后回读（含 `FILE_FLAG_NO_BUFFERING` 直读）均为 0 错误、事件日志无磁盘错误；写入/格式化可能已触发主控重映射或改变了链路行为，但这不能证明 SAS3008 下已恢复。
 
-**下一步 M4**：WRITE(10) / SYNCHRONIZE CACHE / UNMAP、auto sense、超时与 TMF、diag reset 恢复。继续前需先更换可连续读写的测试盘，并重新取得 kext 部署与必要重启的授权。
+**下一步 M4**：WRITE(10) / SYNCHRONIZE CACHE / UNMAP、auto sense、超时与 TMF、diag reset 恢复。继续前需把盘接回 SAS3008 复测（仍报错则换盘），并重新取得 kext 部署与必要重启的授权。
