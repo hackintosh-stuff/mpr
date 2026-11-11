@@ -715,4 +715,39 @@ static_assert(offsetof(MPRScsiTaskMgmtRequest, TaskMID) == 0x30,
 static_assert(offsetof(MPRScsiTaskMgmtReply, TerminationCount) == 0x14,
               "TM TerminationCount offset");
 
+/* ---------------------------------------------------------------------- */
+/* M4 fixes: high-priority TM descriptor, EventAck and event mask polarity.  */
+
+/* mpi2.h:420-421 */
+#define MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY      0x06
+/* mpi2.h:671 */
+#define MPI2_FUNCTION_EVENT_ACK                    0x08
+/* mpi2_ioc.h:577-578: 1 in an EventMasks bit DISABLES that event */
+#define MPI2_EVENT_NOTIFICATION_ACK_REQUIRED       0x01
+
+#pragma pack(push, 1)
+
+/* MPI2_EVENT_ACK_REQUEST: 0x14 bytes (mpi2_ioc.h:1378-1393) */
+typedef struct {
+    UInt16  Reserved1;              /* 0x00 */
+    UInt8   ChainOffset;            /* 0x02 */
+    UInt8   Function;               /* 0x03 */
+    UInt16  Reserved2;              /* 0x04 */
+    UInt8   Reserved3;              /* 0x06 */
+    UInt8   MsgFlags;               /* 0x07 */
+    UInt8   VP_ID;                  /* 0x08 */
+    UInt8   VF_ID;                  /* 0x09 */
+    UInt16  Reserved4;              /* 0x0A */
+    UInt16  Event;                  /* 0x0C */
+    UInt16  Reserved5;              /* 0x0E */
+    UInt32  EventContext;           /* 0x10 */
+} MPREventAckRequest;
+
+#pragma pack(pop)
+
+static_assert(sizeof(MPREventAckRequest) == 0x14, "EventAck request layout");
+static_assert(offsetof(MPREventAckRequest, Event) == 0x0C, "EventAck Event offset");
+static_assert(offsetof(MPREventAckRequest, EventContext) == 0x10,
+              "EventAck EventContext offset");
+
 #endif /* MPR_MPI2_MIN_H */

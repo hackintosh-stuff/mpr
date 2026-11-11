@@ -84,6 +84,12 @@ private:
     UInt16                     fTimedOutSmid;    /* last waitForSmid() timeout */
     bool                       fUnmapEnabled;
     bool                       fReinitInProgress;
+    bool                       fDeviceOffline;   /* recovery failed: reject new IO */
+    bool                       fStopping;
+    UInt32                     fHighPriorityCredit;
+    volatile UInt32            fEventReplyCount;
+    volatile UInt32            fEventAckCount;
+    volatile UInt32            fReplyFrameReturned;
     volatile UInt32            fM4CommandCount;
     volatile UInt32            fM4TmfCount;
     volatile UInt32            fM4ResetCount;
@@ -159,6 +165,9 @@ private:
 
     /* M4: command submission, auto sense, task management and recovery. */
     void   postDefaultRequest(UInt32 smid);
+    void   postHighPriorityRequest(UInt32 smid);
+    void   releaseReplyFrame(UInt32 baddr);
+    void   sendEventAck(UInt16 event, UInt32 context);
     IOReturn decodeSense(IOReturn fallback);
     bool   issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen, UInt32 control,
                             const UInt8 *outData, UInt32 dataLen,

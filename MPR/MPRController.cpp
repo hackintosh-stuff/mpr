@@ -440,9 +440,10 @@ MPRController::getIOCFacts(void)
         /* Keep the geometry for M1-b; both frame sizes are in 32-bit words. */
         fRequestFrameSize = (UInt32)facts.IOCRequestFrameSize * 4;
         fReplyFrameSize   = (UInt32)facts.ReplyFrameSize * 4;
-        fRequestCredit    = facts.RequestCredit;
-        fMaxReplyDepth    = facts.MaxReplyDescriptorPostQueueDepth;
-        fFactsValid       = true;
+        fRequestCredit      = facts.RequestCredit;
+        fMaxReplyDepth      = facts.MaxReplyDescriptorPostQueueDepth;
+        fHighPriorityCredit = facts.HighPriorityCredit;
+        fFactsValid         = true;
     }
     return ok;
 }
@@ -862,12 +863,19 @@ MPRController::processReplyQueue(void)
                     fEventSeen[fLastEvent / 32] |= (1U << (fLastEvent % 32));
                 }
                 fEventCount++;
+                fEventReplyCount++;
+                if (fLastEventAckRequired == MPI2_EVENT_NOTIFICATION_ACK_REQUIRED) {
+                    sendEventAck(fLastEvent, fLastEventContext);
+                }
             } else {
                 memcpy(fLastReply, replyFrame, sizeof(fLastReply));
                 fLastReplySmid = (UInt16)((entry >> 16) & 0xFFFF);
                 fLastReplyKind = 1;
                 fReplyCount++;
             }
+            /* D1: each AddressReply consumes exactly one reply frame; return
+             * it to the free queue (mpr_free_reply, mprvar.h:559-565). */
+            releaseReplyFrame(baddr);
         } else if (flags == MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS ||
                    flags == MPI25_RPY_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO_SUCCESS) {
             /* A successful SCSI IO carries no reply frame; only the SMID. */
@@ -908,6 +916,10 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
      * completion of this one. Each M3-d command uses a rotating SMID, so the
      * SMID in the reply descriptor identifies the command unambiguously. */
     for (i = 0; i < timeoutMs; i++) {
+        if (fStopping) {
+            fTimedOutSmid = (UInt16)smid;
+            return false;
+        }
         if (fReplyCount > 0 && fLastReplySmid == (UInt16)smid) {
             return true;
         }
@@ -928,9 +940,9 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
 /* collected asynchronously by processReplyQueue().                          */
 
 static void
-mprSetEventBit(UInt32 *masks, UInt32 event)
+mprClearEventBit(UInt32 *masks, UInt32 event)
 {
-    masks[event / 32] |= (1U << (event % 32));
+    masks[event / 32] &= ~(1U << (event % 32));
 }
 
 bool
@@ -938,7 +950,7 @@ MPRController::sendEventNotification(void)
 {
     UInt8 *frame;
     MPREventNotifyRequest *request;
-    UInt32 value32;
+    UInt32 value32, before, i;
 
     frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
     if (frame == NULL) {
@@ -949,20 +961,52 @@ MPRController::sendEventNotification(void)
     request = (MPREventNotifyRequest *)frame;
 
     request->Function = MPI2_FUNCTION_EVENT_NOTIFICATION;
-    mprSetEventBit(request->EventMasks, MPI2_EVENT_STATE_CHANGE);
-    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_DEVICE_STATUS_CHANGE);
-    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_DISCOVERY);
-    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_BROADCAST_PRIMITIVE);
-    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST);
-    mprSetEventBit(request->EventMasks, MPI2_EVENT_LOG_ENTRY_ADDED);
-    mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_DEVICE_DISCOVERY_ERROR);
+    /* A set bit DISABLES an event (mpr.c:2769-2791): mask everything first,
+     * then clear the seven events this driver subscribes to. */
+    memset(request->EventMasks, 0xFF, sizeof(request->EventMasks));
+    mprClearEventBit(request->EventMasks, MPI2_EVENT_STATE_CHANGE);
+    mprClearEventBit(request->EventMasks, MPI2_EVENT_SAS_DEVICE_STATUS_CHANGE);
+    mprClearEventBit(request->EventMasks, MPI2_EVENT_SAS_DISCOVERY);
+    mprClearEventBit(request->EventMasks, MPI2_EVENT_SAS_BROADCAST_PRIMITIVE);
+    mprClearEventBit(request->EventMasks, MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST);
+    mprClearEventBit(request->EventMasks, MPI2_EVENT_LOG_ENTRY_ADDED);
+    mprClearEventBit(request->EventMasks, MPI2_EVENT_SAS_DEVICE_DISCOVERY_ERROR);
 
     setProperty("MPREventMask0", (unsigned long long)request->EventMasks[0], 32);
     setProperty("MPREventMask1", (unsigned long long)request->EventMasks[1], 32);
+    setProperty("MPREventMask2", (unsigned long long)request->EventMasks[2], 32);
+    setProperty("MPREventMask3", (unsigned long long)request->EventMasks[3], 32);
+    setProperty("MPREventMaskCheck",
+                (request->EventMasks[0] == 0xEF3F7FFBU &&
+                 request->EventMasks[1] == 0xFFDFFFFDU &&
+                 request->EventMasks[2] == 0xFFFFFFFFU &&
+                 request->EventMasks[3] == 0xFFFFFFFFU) ? "ok" : "mismatch");
 
+    /* The subscription reply is itself an EVENT_NOTIFICATION reply; wait for
+     * it and check IOCStatus instead of assuming the write succeeded. */
+    before = fEventReplyCount;
+    fReplyCount = 0;
+    fLastReplyKind = 0;
+    fLastReplySmid = 0xFFFF;
     value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (2U << 16);
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+    for (i = 0; i < MPR_M2_REPLY_TIMEOUT_MS && fEventReplyCount == before; i++) {
+        IOSleep(1);
+    }
+    if (fEventReplyCount == before) {
+        setProperty("MPREventNotifyState", "no-subscription-reply");
+        return false;
+    }
+    {
+        MPREventNotifyReply *reply = (MPREventNotifyReply *)fLastEventData;
+
+        setProperty("MPREventNotifyIOCStatus",
+                    (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+        setProperty("MPREventNotifyState",
+                    ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) ==
+                     MPI2_IOCSTATUS_SUCCESS) ? "ok" : "failed-status");
+    }
     return true;
 }
 
@@ -1502,8 +1546,11 @@ MPRController::scsiInquiry(void)
 bool
 MPRController::scsiReadCapacity16(void)
 {
+    /* READ CAPACITY(16) is SERVICE ACTION IN(16). The allocation length is
+     * a 32-bit field at bytes 10..13 and byte 15 is CONTROL (SBC-3); the
+     * previous encoding put 0x20 in the CONTROL byte. */
     static const UInt8 cdb[16] = {
-        0x9E, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20
+        0x9E, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0
     };
     MPRScsiIoRequest *request;
     MPRScsiIoReply *reply;
@@ -1644,6 +1691,12 @@ MPRController::scsiReadCapacity10(void)
     blockSize = ((UInt32)data[4] << 24) | ((UInt32)data[5] << 16) |
                 ((UInt32)data[6] << 8) | (UInt32)data[7];
 
+    /* 0xffffffff means "capacity too large for RC10"; RC16 is mandatory. */
+    if (lastLba == 0xFFFFFFFFU) {
+        setProperty("MPRM3bFailure", "RC10 sentinel requires RC16");
+        return false;
+    }
+
     setProperty("MPRCapacityLastLba", (unsigned long long)lastLba, 64);
     setProperty("MPRCapacityBlockSize", (unsigned long long)blockSize, 32);
     setProperty("MPRCapacityBlocks", (unsigned long long)lastLba + 1, 64);
@@ -1672,6 +1725,10 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
     UInt32 dataLen = blocks * blockSize;
     bool posted;
 
+    if (fDeviceOffline || fStopping ||
+        (fFrozenSmid != 0 && fFrozenSmid == (UInt16)smid)) {
+        return false;
+    }
     if (fAttachedDevHandle == 0 || fRequestBuffer == NULL ||
         fPageBuffer == NULL || fDataBuffer == NULL) {
         if (diagnostics) {
@@ -1903,6 +1960,9 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
     if (actualBytes != NULL) {
         *actualBytes = 0;
     }
+    if (fDeviceOffline || fStopping) {
+        return kIOReturnDeviceError;
+    }
     if (buffer == NULL || fIOLock == NULL || fDataBuffer == NULL ||
         fPageBuffer == NULL || fCapacityBlocks == 0 || fBlockSize == 0) {
         return kIOReturnNotReady;
@@ -1948,6 +2008,8 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
         UInt32 smid, attempt;
         UInt64 lba;
         bool ok = false;
+        /* A write whose result is unknown must not be replayed blindly. */
+        UInt32 maxAttempts = write ? 1 : 3;
 
         remaining = byteCount - done;
         want = remaining / fBlockSize;
@@ -1978,7 +2040,7 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
             }
         }
 
-        for (attempt = 0; attempt < 3 && !ok; attempt++) {
+        for (attempt = 0; attempt < maxAttempts && !ok; attempt++) {
             ok = scsiReadWrite(write, lba, chunkBlocks, fBlockSize,
                                smid, false);
             if (!ok) {
@@ -2402,6 +2464,12 @@ MPRController::start(IOService *provider)
     fLastSenseKey = 0xFF;
     fLastASC = 0;
     fLastASCQ = 0;
+    fDeviceOffline = false;
+    fStopping = false;
+    fHighPriorityCredit = 0;
+    fEventReplyCount = 0;
+    fEventAckCount = 0;
+    fReplyFrameReturned = 0;
     memset(fVendor, 0, sizeof(fVendor));
     memset(fProduct, 0, sizeof(fProduct));
     memset(fRevision, 0, sizeof(fRevision));
@@ -2471,6 +2539,7 @@ MPRController::start(IOService *provider)
 void
 MPRController::stop(IOService *provider)
 {
+    fStopping = true;
     teardownInterrupts();
     if (fBlockDev != NULL) {
         fBlockDev->setController(NULL);
@@ -2511,6 +2580,7 @@ MPRController::stop(IOService *provider)
 #define MPR_SM_TMF_BASE         26
 #define MPR_SM_SYNC_CACHE       29
 #define MPR_SM_UNMAP            30
+#define MPR_SM_EVENT_ACK        31
 #define MPR_MAX_UNMAP_EXTENTS   32
 
 IOReturn
@@ -2523,11 +2593,74 @@ MPRController::readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
 void
 MPRController::postDefaultRequest(UInt32 smid)
 {
-    /* Config and task-management messages use the default descriptor type;
+    /* Config and EventAck messages use the default descriptor type;
      * only SCSI IO uses the fast-path descriptor (see postScsiIo). */
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET,
              MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (smid << 16));
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+}
+
+void
+MPRController::postHighPriorityRequest(UInt32 smid)
+{
+    /* FreeBSD allocates TM requests from the high-priority pool
+     * (mpr_sas.c:224-236); the descriptor type is 0x06, not 0x08. */
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET,
+             MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY | (smid << 16));
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+}
+
+void
+MPRController::releaseReplyFrame(UInt32 baddr)
+{
+    UInt32 *freeQueue;
+    UInt32  offset;
+
+    if (fQueueBuffer == NULL || fFqDepth == 0 || fReplyFrameSize == 0 ||
+        fReplyPhys == 0) {
+        return;
+    }
+    if (baddr < (UInt32)fReplyPhys ||
+        baddr >= (UInt32)fReplyPhys + fReplyFrameSize * fFqDepth) {
+        return;
+    }
+    offset = baddr - (UInt32)fReplyPhys;
+    if ((offset % fReplyFrameSize) != 0) {
+        return;
+    }
+    freeQueue = (UInt32 *)fQueueBuffer->getBytesNoCopy();
+    if (freeQueue == NULL) {
+        return;
+    }
+    /* Mirrors mpr_free_reply(): pre-increment the index, write the frame
+     * address back, then publish the new host index. */
+    fReplyFreeIndex = (fReplyFreeIndex + 1) % fFqDepth;
+    freeQueue[fReplyFreeIndex] = baddr;
+    writeReg(MPI2_REPLY_FREE_HOST_INDEX_OFFSET, fReplyFreeIndex);
+    fReplyFrameReturned++;
+}
+
+void
+MPRController::sendEventAck(UInt16 event, UInt32 context)
+{
+    UInt8 *frame;
+    MPREventAckRequest *request;
+
+    if (fRequestBuffer == NULL) {
+        return;
+    }
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return;
+    }
+    frame += MPR_SM_EVENT_ACK * fRequestFrameSize;
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPREventAckRequest *)frame;
+    request->Function = MPI2_FUNCTION_EVENT_ACK;
+    request->Event = event;
+    request->EventContext = context;
+    fEventAckCount++;
+    postDefaultRequest(MPR_SM_EVENT_ACK);
 }
 
 IOReturn
@@ -2604,6 +2737,12 @@ MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
 
     if (status != NULL) {
         *status = kIOReturnNotReady;
+    }
+    if (fDeviceOffline || fStopping) {
+        if (status != NULL) {
+            *status = kIOReturnDeviceError;
+        }
+        return false;
     }
     if (fRequestBuffer == NULL || fPageBuffer == NULL || fDataBuffer == NULL ||
         cdb == NULL || cdbLen == 0 || cdbLen > 32 || smid == 0 ||
@@ -2789,6 +2928,10 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
         smid == 0 || smid >= fRequestCount) {
         return false;
     }
+    if (fHighPriorityCredit == 0) {
+        setProperty("MPRM4TmfState", "no-high-priority-credit");
+        return false;
+    }
     frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
     if (frame == NULL) {
         return false;
@@ -2805,7 +2948,7 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
     fReplyCount = 0;
     fLastReplyKind = 0;
     fLastReplySmid = 0xFFFF;
-    postDefaultRequest(smid);
+    postHighPriorityRequest(smid);
     if (waitForSmid(15000, smid) && fLastReplyKind == 1) {
         reply = (MPRScsiTaskMgmtReply *)fLastReply;
         ok = ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS) &&
@@ -2852,7 +2995,17 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
     if (!recovered) {
         recovered = resetAndReinitialize();
     }
-    fFrozenSmid = 0;
+    if (recovered) {
+        fFrozenSmid = 0;
+        fDeviceOffline = false;
+        setProperty("MPRM4FrozenSmid", 0ULL, 16);
+        setProperty("MPRM4DeviceOffline", false);
+    } else {
+        /* Recovery failed: keep the SMID frozen and the device offline. The
+         * firmware may still own the original request frame (risk R6). */
+        fDeviceOffline = true;
+        setProperty("MPRM4DeviceOffline", true);
+    }
     setProperty("MPRM4Recovery", recovered ? "ok" : "failed");
     return recovered;
 }
@@ -2862,33 +3015,36 @@ MPRController::resetAndReinitialize(void)
 {
     bool ok = false;
 
-    if (fReinitInProgress) {
+    if (fReinitInProgress || fStopping) {
         return false;
     }
     fReinitInProgress = true;
     fM4ResetCount++;
 
-    /* Follow the same order as start(): drop the interrupt source and DMA
-     * pools, force the adapter into RESET, then rebuild from IOC Facts. */
+    /* Quiesce first: stop the interrupt source, then reset the IOC so it no
+     * longer touches host DMA. Only afterwards release and rebuild pools. */
     teardownInterrupts();
+    if (!diagReset()) {
+        fReinitInProgress = false;
+        setProperty("MPRM4ReinitState", "diag-reset-failed");
+        return false;
+    }
     freeQueueMemory();
     fReplyPostIndex = 0;
     fReplyCount = 0;
     fLastReplySmid = 0xFFFF;
     fLastReplyKind = 0;
 
-    if (diagReset()) {
-        setupInterrupts();
-        if (runM1a() && runM1b()) {
-            sendEventNotification();
-            sendPortEnable();
-            /* The firmware rebuilt its device table. Clear the cached handle
-             * property so the topology read accepts the new devhandle. */
-            removeProperty("MPRAttachedDevHandle");
-            fAttachedDevHandle = 0;
-            if (readSasIOUnitPage0()) {
-                ok = (fAttachedDevHandle != 0);
-            }
+    setupInterrupts();
+    if (runM1a() && runM1b()) {
+        sendEventNotification();
+        sendPortEnable();
+        /* The firmware rebuilt its device table. Clear the cached handle
+         * property so the topology read accepts the new devhandle. */
+        removeProperty("MPRAttachedDevHandle");
+        fAttachedDevHandle = 0;
+        if (readSasIOUnitPage0()) {
+            ok = (fAttachedDevHandle != 0);
         }
     }
 
@@ -2904,6 +3060,9 @@ MPRController::synchronizeCache(UInt64 block, UInt64 nblks)
     UInt32 blocks;
     IOReturn status;
 
+    if (fDeviceOffline || fStopping) {
+        return kIOReturnDeviceError;
+    }
     if (fIOLock == NULL || fDataBuffer == NULL || fPageBuffer == NULL ||
         fCapacityBlocks == 0 || fBlockSize == 0) {
         return kIOReturnNotReady;
@@ -2930,6 +3089,9 @@ MPRController::unmapBlocks(const IOBlockStorageDeviceExtent *extents,
     UInt32 i;
     IOReturn status;
 
+    if (fDeviceOffline || fStopping) {
+        return kIOReturnDeviceError;
+    }
     if (!fUnmapEnabled) {
         return kIOReturnUnsupported;
     }
