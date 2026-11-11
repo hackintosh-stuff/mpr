@@ -380,6 +380,16 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **待办**：`0x71` / `0xAA` 的位含义需按 `mpi2_sas.h` 逐位核对后再落到 STP/SATA/SSP 判定；下一步用 devhandle 9 读 `SAS Device Page0`，取 SAS address、`DeviceInfo`、`ParentDevHandle`、`PhyNum`、`Slot`，建立 M3 的目标表。
 
+### 9.8 M2-d：SAS Device Page0 读取（2026-11-11，已验证）
+
+用 `MPI2_SAS_DEVICE_PGAD_FORM_HANDLE | devhandle`（extended page `0x12`）读取挂载盘的 SAS Device Page0，解析 `Slot`、`EnclosureHandle`、`SASAddress`、`ParentDevHandle`、`PhyNum`、`DevHandle`、`DeviceInfo`。
+
+**已验证（重启后）**：`com.ling.MPR (0.8.1)`；`MPRSasDeviceHandle=9`、`MPRSasDeviceSasAddress=4433221104000000`、`MPRSasDeviceInfo=0x0881`（`END_DEVICE | SATA_DEVICE | DIRECT_ATTACH`）、`MPRSasDeviceType=SATA`、`MPRSasDeviceParent=1`、`MPRSasDevicePhyNum=4`、`MPRSasDeviceSlot=4`、`MPRSasDeviceEnclosure=1`、`MPRSasDevicePageBytes=0x38`。SAS address 与 Debian 侧 `0x4433221104…` 一致，phy 4 / handle 9 与 `sdb` 一致；无新增 panic。
+
+**M2 状态**：中断（M2-a）、事件通知与 PortEnable（M2-b）、SAS IO Unit Page0（M2-c）、SAS Device Page0（M2-d）均已实机验证。`SAS_DISCOVERY` 事件仍未观察到，主动读取路径已可替代。剩余：`MPI2_FUNCTION_EVENT_ACK` 未实现；多设备遍历未做（当前只取第一个非零 devhandle）；"事件不丢不重"的长时观察未做。
+
+**下一步 M3**：以 `MPRSasDevice*` 建单盘目标表 → `IOBlockStorageDevice` nub → INQUIRY / READ CAPACITY(16) / READ(16) → `IOMedia`。
+
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
