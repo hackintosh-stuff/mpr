@@ -106,6 +106,7 @@ private:
     bool   readSasDevicePage0(UInt32 devHandle);
     bool   runM2c(void);
 
+    bool   scsiTur(void);
     bool   scsiInquiry(void);
     bool   runM3a(void);
 

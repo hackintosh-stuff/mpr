@@ -1201,6 +1201,9 @@ MPRController::readSasDevicePage0(UInt32 devHandle)
     setProperty("MPRSasDevicePhyNum", (unsigned long long)phyNum, 8);
     setProperty("MPRSasDeviceSlot", (unsigned long long)slot, 16);
     setProperty("MPRSasDeviceEnclosure", (unsigned long long)enclHandle, 16);
+    setProperty("MPRSasDeviceAccessStatus", (unsigned long long)page[0x17], 8);
+    setProperty("MPRSasDeviceFlags",
+                (unsigned long long)((UInt32)page[0x20] | ((UInt32)page[0x21] << 8)), 16);
     setProperty("MPRSasDevicePageBytes", (unsigned long long)actual, 32);
     IOLog("MPR M2d: dev handle=%u sas=%s info=0x%08x type=%s\n",
           (unsigned int)pageDevHandle, sasText,
@@ -1242,6 +1245,79 @@ MPRController::runM2c(void)
 /* ------------------------------------------------------------------------ */
 /* M3-a: SCSI INQUIRY through the request/reply queues, validating the SCSI  */
 /* IO path before the block-storage nub is added.                            */
+
+bool
+MPRController::scsiTur(void)
+{
+    MPRScsiIoRequest *request;
+    MPRScsiIoReply *reply;
+    UInt8 *frame;
+    UInt32 value32, sgeFlags, attempt;
+    bool posted;
+
+    if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fPageBuffer == NULL) {
+        setProperty("MPRTurFailure", "no attached device or buffer");
+        return false;
+    }
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return false;
+    }
+    frame += 6 * fRequestFrameSize;     /* SMID 6 */
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPRScsiIoRequest *)frame;
+
+    request->DevHandle = (UInt16)fAttachedDevHandle;
+    request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
+    request->SenseBufferLowAddress = (UInt32)(fPagePhys + MPR_SENSE_OFFSET);
+    request->SenseBufferLength = 96;
+    request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
+    request->DataLength = 0;
+    request->IoFlags = 6;
+    request->Control = MPI2_SCSIIO_CONTROL_NODATATRANSFER;
+    request->CDB[0] = 0x00;                 /* TEST UNIT READY */
+
+    /* A zero-length SGE is still required for a data-less command. */
+    sgeFlags = (UInt32)(MPI2_SGE_FLAGS_SIMPLE_ELEMENT | MPI2_SGE_FLAGS_LAST_ELEMENT |
+                        MPI2_SGE_FLAGS_END_OF_BUFFER | MPI2_SGE_FLAGS_64_BIT_ADDRESSING);
+    value32 = (sgeFlags << MPI2_SGE_FLAGS_SHIFT) | 0;
+    memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4, &value32, sizeof(value32));
+    memcpy(frame + MPR_SCSIIO_SGE_DWORDS * 4 + 4, &fPagePhys, sizeof(fPagePhys));
+
+    posted = false;
+    for (attempt = 0; attempt < 10 && !posted; attempt++) {
+        fReplyCount = 0;
+        fLastReplyKind = 0;
+        fLastReplySmid = 0xFFFF;
+        value32 = MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO | (6U << 16);
+        writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
+        writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+        if (waitForReply(MPR_M2_REPLY_TIMEOUT_MS) && fLastReplySmid == 6) {
+            posted = true;
+            break;
+        }
+        IOSleep(1000);
+    }
+    setProperty("MPRTurAttempts", (unsigned long long)(attempt + 1), 32);
+    if (!posted) {
+        setProperty("MPRTurFailure", "TEST UNIT READY timeout");
+        return false;
+    }
+
+    reply = (MPRScsiIoReply *)fLastReply;
+    setProperty("MPRTurKind", (unsigned long long)fLastReplyKind, 32);
+    setProperty("MPRTurSCSIState", (unsigned long long)reply->SCSIState, 8);
+    if (fLastReplyKind == 1) {
+        setProperty("MPRTurIOCStatus",
+                    (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+        setProperty("MPRTurScsiStatus", (unsigned long long)reply->SCSIStatus, 8);
+        return (reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS &&
+               reply->SCSIStatus == 0;
+    }
+    setProperty("MPRTurIOCStatus", 0ULL, 16);
+    setProperty("MPRTurScsiStatus", 0ULL, 8);
+    return true;
+}
 
 bool
 MPRController::scsiInquiry(void)
@@ -1393,6 +1469,8 @@ MPRController::runM3a(void)
         return false;
     }
 
+    ok = scsiTur();
+    setProperty("MPRM3aTur", ok ? "ok" : "failed");
     ok = scsiInquiry();
     setProperty("MPRM3aState", ok ? "ok" : "failed");
 
@@ -1641,7 +1719,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M3a");
-    setProperty("MPRBuild", "0.9.2");
+    setProperty("MPRBuild", "0.9.3");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
