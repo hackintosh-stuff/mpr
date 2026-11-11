@@ -1751,6 +1751,9 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
         return true;
     }
     if (!diagnostics) {
+        UInt8 *sense;
+        UInt64 words[4];
+
         setProperty("MPRM3dLastFailure", "scsi-status");
         setProperty("MPRM3dLastFailSmid", (unsigned long long)smid, 16);
         setProperty("MPRM3dLastFailKind", (unsigned long long)fLastReplyKind, 8);
@@ -1762,6 +1765,20 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
                     (unsigned long long)reply->TransferCount, 32);
         setProperty("MPRM3dLastFailSCSIState",
                     (unsigned long long)reply->SCSIState, 8);
+        setProperty("MPRM3dLastFailSenseCount",
+                    (unsigned long long)reply->SenseCount, 32);
+        setProperty("MPRM3dLastFailResponseInfo",
+                    (unsigned long long)reply->ResponseInfo, 32);
+        if (fPageBuffer != NULL) {
+            sense = (UInt8 *)fPageBuffer->getBytesNoCopy();
+            if (sense != NULL) {
+                memcpy(words, sense + MPR_SENSE_OFFSET, sizeof(words));
+                setProperty("MPRM3dSenseW0", words[0], 64);
+                setProperty("MPRM3dSenseW1", words[1], 64);
+                setProperty("MPRM3dSenseW2", words[2], 64);
+                setProperty("MPRM3dSenseW3", words[3], 64);
+            }
+        }
     }
     return false;
 }
@@ -2371,7 +2388,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M3d");
-    setProperty("MPRBuild", "0.12.1");
+    setProperty("MPRBuild", "0.12.2");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
