@@ -410,6 +410,14 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **下一步 M3-c**：`IOBlockStorageDevice` 子类（`doAsyncReadWrite` / `reportBlockSize` / `reportMaxValidBlock` / `getVendorString` 等）注册为 nub，由 IOStorageFamily 的 `IOBlockStorageDriver` 生成 `IOMedia`；读写用 READ(16)/WRITE(16)（必要时回退 10 字节），数据缓冲需扩展为按块传输的低 4GB 池。
 
+### 9.11 M3-c：多块读写与分区表解码（2026-11-11，已验证）
+
+新增 64 KB 低 4GB 数据暂存缓冲与 `scsiReadWrite(write, lba, blocks, blockSize, smid)`：READ(10)/WRITE(10)（`0x28`/`0x2A`），32 位 LBA、16 位块计数，`IoFlags = 10 | FAST_PATH`，IEEE SGE，经 fast-path 描述符提交并等待完成。`runM3c` 从 LBA 0 读 8 个块（4096 B）并解码 MBR 分区项。
+
+**已验证（重启后）**：`com.ling.MPR (0.11.0)`；`MPRM3cState=ok`、`MPRReadIOCStatus=0`、`MPRReadScsiStatus=0`、`MPRReadTransferCount=4096`；`MPRReadSig=0xAA55`、`MPRPart0Type=0xEE`（GPT 保护性 MBR）、`MPRPart0Start=1`、`MPRReadGptSig=1`（LBA 1 为 `EFI PART`）。无新增 panic。
+
+**下一步 M3-d**：`IOBlockStorageDevice` 子类（`doAsyncReadWrite`/`reportBlockSize`/`reportMaxValidBlock`/`getVendorString` 等）注册为 nub，由 IOStorageFamily 的 `IOBlockStorageDriver` 生成 `IOMedia`。
+
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
