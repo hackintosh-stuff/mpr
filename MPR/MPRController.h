@@ -47,6 +47,8 @@ private:
     IOWorkLoop                *fWorkLoop;
     IOFilterInterruptEventSource *fInterrupt;
     volatile UInt32            fReplyCount;
+    volatile UInt32            fInterruptCount;
+    volatile UInt32            fReplyViaIrq;
     UInt8                      fLastReply[64];
 
     UInt32 readReg(UInt32 offset);

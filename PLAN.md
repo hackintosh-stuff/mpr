@@ -356,6 +356,14 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **M1 退出条件达成**：无需中断即可收发一条同步 config 请求（Manufacturing Page0）。下一步 M2：MSI-X 中断、PortEnable、EventNotification、拓扑发现与目标表；DMA 队列与 config 通路已就绪。
 
+### 9.5 M2-a：reply 中断（2026-11-11，已验证）
+
+新增 `IOWorkLoop` + `IOFilterInterruptEventSource`（provider 为 `IOPCIDevice`，`intIndex=0`）。filter 只读 `HostInterruptStatus`：命中 `MPI2_HIS_REPLY_DESCRIPTOR_INTERRUPT` 时 W1C 清除并返回 true；action 在 workloop 中调用 `processReplyQueue()` 排空 post queue、把 reply frame 拷入 `fLastReply`、回写 `ReplyPostHostIndex`。`IOCInit` 的 `HostMSIxVectors` 在事件源安装成功时置 1；`HostInterruptMask` 只解屏蔽 reply 位（`~MPI2_HIM_REPLY_INT_MASK`），其余保持屏蔽，避免卡住的状态位造成中断风暴。`readManufacturingPage0` 改为 `waitForReply(2000 ms)`，超时后回退一次轮询。
+
+**已验证（重启后）**：`com.ling.MPR (0.6.1)`；`MPRIntState=ok`、`MPRIntType=1`（edge）、`MPRIntCount=1`、`MPRReplyViaIrq=1`，说明 Manufacturing Page0 的 reply 由中断路径完成而非超时回退；`MPRM1cState=ok`、`MPRIOCState=0x20000000` 保持；无新增 panic。
+
+**M2 剩余**：EventNotification、PortEnable、固件事件队列与拓扑目标表；`HostMSIxVectors=1` 是否真正启用 MSI-X（而非退化 INTx）需用 `IOPCIDevice` 的 interrupt specifier 进一步核对。
+
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。

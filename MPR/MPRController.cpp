@@ -787,6 +787,7 @@ MPRController::interruptFilter(OSObject *owner, IOFilterInterruptEventSource *se
     /* HostInterruptStatus is write-one-to-clear. */
     self->writeReg(MPI2_HOST_INTERRUPT_STATUS_OFFSET,
                    MPI2_HIS_REPLY_DESCRIPTOR_INTERRUPT);
+    self->fInterruptCount++;
     return true;
 }
 
@@ -849,6 +850,7 @@ MPRController::waitForReply(UInt32 timeoutMs)
 
     for (i = 0; i < timeoutMs; i++) {
         if (fReplyCount > 0) {
+            fReplyViaIrq++;
             return true;
         }
         IOSleep(1);
@@ -1053,6 +1055,8 @@ MPRController::start(IOService *provider)
     fWorkLoop = NULL;
     fInterrupt = NULL;
     fReplyCount = 0;
+    fInterruptCount = 0;
+    fReplyViaIrq = 0;
     memset(fLastReply, 0, sizeof(fLastReply));
 
     pci = OSDynamicCast(IOPCIDevice, provider);
@@ -1082,7 +1086,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M2a");
-    setProperty("MPRBuild", "0.6.0");
+    setProperty("MPRBuild", "0.6.1");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
@@ -1094,7 +1098,10 @@ MPRController::start(IOService *provider)
         setProperty("MPRM1cState", "skipped-earlier-stage-failed");
     }
 
-    IOLog("MPR M1c: start complete\n");
+    setProperty("MPRIntCount", (unsigned long long)fInterruptCount, 32);
+    setProperty("MPRReplyViaIrq", (unsigned long long)fReplyViaIrq, 32);
+    IOLog("MPR M2a: start complete, irq=%u replyViaIrq=%u\n",
+          (unsigned int)fInterruptCount, (unsigned int)fReplyViaIrq);
     return true;
 }
 
