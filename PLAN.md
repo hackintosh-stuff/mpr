@@ -1,6 +1,6 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.9（2026-11-11；源码版本 0.14.2 已部署到 ESP 并重启加载，命名已去除轮次编号；M4 的写后回读、UNMAP、ABORT→LUN→TARGET reset 级联与 resetAndReinitialize 均已完成实机注入验证，24 h 混合 I/O 和 D3/D8–D12 缺口仍未完成，最近部署/加载记录见 §9.1）
+状态：草案 v0.9（2026-11-11；源码版本 0.14.3 已部署到 ESP 并重启加载，命名已去除轮次编号；M4 的写后回读、UNMAP、ABORT→LUN→TARGET reset 级联与 resetAndReinitialize 均已完成实机注入验证；D3 的按 SMID 完成槽已实现并回归通过，24 h 混合 I/O 与 D8–D12 缺口仍未完成，最近部署/加载记录见 §9.1）
 目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA；已有 1 块获准用于破坏性测试的 SATA SSD，2026-11-11 已接回 SAS3008，Debian 下为 `/dev/sdd`、macOS 下为 `disk5`，均按型号/序列号/容量现场核对（状态见 §9.1），不得沿用历史设备号推断当前身份。
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
@@ -198,7 +198,7 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 | Interrupt / Completion | filter 做有界状态判定，单一串行上下文消费 reply，按命令保存完成结果 | 已有 interrupt event source；轮询与 IRQ 消费仍缺统一同步 |
 | Config / Discovery | Facts/config page、正确事件订阅与 ACK、稳定身份目标表、nub 增删 | 已能读取单盘 config；掩码极性错误、ACK 和完整拓扑生命周期待实现 |
 | BlockDev | 块设备契约、CDB、完成回调、写缓存和 UNMAP 能力报告 | 已有 `IOBlockStorageDevice` 子类；当前同步串行 I/O，返回前在锁外调用 completion |
-| Recovery / PM | 超时、TMF、复位、安全停止、重新关联同一设备、睡眠/唤醒 | 0.14.2 的 D1/D2/D4/D5/D6/D7 修改已随加载生效，写与 UNMAP 成功路径过一次实机；`mpr_tmf_fail=1/2/3` 分别验证了 `LUN_RESET`、`TARGET_RESET` 与 `resetAndReinitialize`，reset 后盘重新枚举为 `disk6` 且读写正常；安全停止与 PM 未验收 |
+| Recovery / PM | 超时、TMF、复位、安全停止、重新关联同一设备、睡眠/唤醒 | 0.14.3 的 D1/D2/D3/D4/D5/D6/D7 修改已随加载生效，写与 UNMAP 成功路径过一次实机；`mpr_tmf_fail=1/2/3` 分别验证了 `LUN_RESET`、`TARGET_RESET` 与 `resetAndReinitialize`，reset 后盘重新枚举为 `disk6` 且读写正常；安全停止与 PM 未验收 |
 | UserClient（M6） | 受限诊断、config/事件/寄存器导出 | 尚未实现，首版先用 IORegistry 与现有工具 |
 
 目标中的 `MPRCommand` 绑定 completion、活动 SMID、请求类型、目标身份/拓扑代次、request/SGL/sense、DMA 映射、超时及完成状态。参考 FreeBSD `struct mpr_command`（`mprvar.h:242-291`）、Linux `struct scsiio_tracker`（`mpt3sas_base.h:884-892`）的职责及 §4.0 的 macOS 命令模型。正常生命周期为准备映射 → 提交 → 确认完成 → 解除映射 → 释放资源；超时不能跳过硬件停止访问的确认。即使首版保持单条数据 I/O，原请求、管理命令、事件和迟到完成也需要独立状态，不能共用一个“最后回复”槽。
@@ -309,11 +309,11 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 
 | 对象 | 可确认的状态 | 边界 |
 |---|---|---|
-| 仓库源码 | `MPR/Info.plist` 与构建脚本标记 0.14.2；属性名、方法名、成员名与宏名已去除里程碑轮次编号，包含读写、UNMAP、sense、TMF/复位，以及仅在 `mpr_timeout_test=1` 时启用的一次性超时注入（`mpr_tmf_fail=1/2/3` 控制级联） | §9.3 的 D1/D2/D4/D5/D6/D7 已有源码修改且随 0.14.2 加载；D6 的 ABORT_TASK、LUN_RESET、TARGET_RESET 与 resetAndReinitialize 已通过 `mpr_tmf_fail=1/2/3` 逐级实机验证；D3、D8–D12 仍未处理，M4 不能标记“代码完成” |
-| 最近编译/部署记录 | 0.14.0、0.14.1 与 0.14.2 均经 `tools/build-noxcode.sh` 在目标 macOS 26.7.2 使用 Apple clang 21 构建、链接及 ad-hoc 签名；`plutil -lint`、bundle 类型和内部符号校验通过。0.14.2 已按名称/容量/ESP UUID 动态定位替换内部 SanDisk ESP 的 MPR.kext（备份 `MPR.kext.bak_namefix_20261111`、`MPR.kext.bak_timeout_inject_20261111`、`MPR.kext.bak_tmf_cascade_20261111`）；注入用 `config.plist` 已恢复，SHA-256 回到 `71b96d2b…` | 部署记录本身不证明加载后的行为；0.14.2 的加载结果见下一行 |
-| 最近实际加载记录 | 2026-11-11 重启后 `com.ling.MPR (0.14.2)`；`MPRStage=read-write`、`MPRBlockDeviceState=ok`、`MPRMediaBlocks=468862128`、`MPRMediaBlockSize=512`，`MPRBlockDev` 经系统 `IOBlockStorageDriver` 生成可写 `IOMedia`；`MPREventMaskCheck=ok`、`MPREventNotifyState=ok`、`MPRFactsHighPriorityCredit=128` | 只验证了当前 0.14.2 的一次加载；D3/D8–D12 缺口与 24 h 不在本次验证范围 |
+| 仓库源码 | `MPR/Info.plist` 与构建脚本标记 0.14.3；属性名、方法名、成员名与宏名已去除里程碑轮次编号，包含读写、UNMAP、sense、TMF/复位、按 SMID 完成槽，以及仅在 `mpr_timeout_test=1` 时启用的一次性超时注入（`mpr_tmf_fail=1/2/3` 控制级联） | §9.3 的 D1/D2/D3/D4/D5/D6/D7 已有源码修改且随 0.14.3 加载；D3 的 `fReplySlots[128]` + 自旋锁串行消费已实现，D6 的三级 TMF/reset 已逐级实机验证；D8–D12 仍未处理，M4 不能标记“代码完成” |
+| 最近编译/部署记录 | 0.14.0 至 0.14.3 均经 `tools/build-noxcode.sh` 在目标 macOS 26.7.2 使用 Apple clang 21 构建、链接及 ad-hoc 签名；`plutil -lint`、bundle 类型和内部符号校验通过。0.14.3 已按名称/容量/ESP UUID 动态定位替换内部 SanDisk ESP 的 MPR.kext（备份 `MPR.kext.bak_namefix_20261111`、`MPR.kext.bak_timeout_inject_20261111`、`MPR.kext.bak_tmf_cascade_20261111`、`MPR.kext.bak_smid_slots_20261111`）；注入用 `config.plist` 已恢复，SHA-256 回到 `71b96d2b…` | 部署记录本身不证明加载后的行为；0.14.3 的加载结果见下一行 |
+| 最近实际加载记录 | 2026-11-11 重启后 `com.ling.MPR (0.14.3)`；`MPRStage=read-write`、`MPRBlockDeviceState=ok`、`MPRMediaBlocks=468862128`、`MPRMediaBlockSize=512`，`MPRBlockDev` 经系统 `IOBlockStorageDriver` 生成可写 `IOMedia`；`MPREventMaskCheck=ok`、`MPREventNotifyState=ok`、`MPRFactsHighPriorityCredit=128` | 只验证了当前 0.14.3 的一次加载；D8–D12 缺口与 24 h 不在本次验证范围 |
 | SAS3008 / 固件 | PCI `0x1000:0x0097`；MPI 2.5；FW `09.00.00.00`；`IOCCapabilities=0x6985c` 包含 `INTEGRATED_RAID=0x1000`，此前未枚举 IR 卷 | 已验证对象是带 IR 能力固件下的独立 SATA 盘；尚非完整 IT/IR 兼容矩阵 |
-| 测试盘 | PCCOOLER SSD T200 240GB，468,862,128 × 512 B = 240,057,409,536 B；Windows USB 桥下已格式化为 exFAT（卷标 `testdisk`）。2026-11-11 重新直连 SAS3008，Debian 下现场核对为 `/dev/sdd`（SN `AA000000000000000458`，`phy-1:5` 6.0 Gbit，`sdd1` 16 MiB + `sdd2` exFAT） | 只读复测通过：整盘前 1 GiB 顺序读 1024/1024 完成、两次 SHA-256 一致；旧坏 LBA 1255072–1255074 用 `O_DIRECT` 单扇区读成功；内核 exFAT 只读挂载成功。Debian 内核 exFAT rw 挂载下又完成受控压力测试：3 轮 × 1 GiB 写后回读（清页缓存前后 SHA-256 一致）、100 个 4 KiB 小文件元数据压力、卸载后只读重挂的持久化校验，全部一致，内核日志错误计数 0，测试文件已清理。macOS 侧 0.14.0 加载后完成 1 GiB 顺序读、256 MiB 随机写后回读（两次 SHA-256 一致）、64 MiB 零写与源哈希一致、16 MiB UNMAP（偏移 8 GiB）且卷可重新挂载；0.14.1 注入一次超时后 `ABORT_TASK` 成功，恢复阶段出现一次 `UNIT ATTENTION`（ASC 0x29），重试后 45/64/256 MiB 读均成功；0.14.2 以 `mpr_tmf_fail=1/2/3` 逐级验证 `LUN_RESET`、`TARGET_RESET` 与 `resetAndReinitialize`，reset 后盘重新枚举为 `disk6` 且读写正常。**仍非 24 h / 满盘 / 并发压测，§9.3 的 D3/D8–D12 缺口未验证**；历史 GPT/四分区信息不能用于推断当前分区布局，破坏性测试仅限重新核对身份后的这块获准测试盘 |
+| 测试盘 | PCCOOLER SSD T200 240GB，468,862,128 × 512 B = 240,057,409,536 B；Windows USB 桥下已格式化为 exFAT（卷标 `testdisk`）。2026-11-11 重新直连 SAS3008，Debian 下现场核对为 `/dev/sdd`（SN `AA000000000000000458`，`phy-1:5` 6.0 Gbit，`sdd1` 16 MiB + `sdd2` exFAT） | 只读复测通过：整盘前 1 GiB 顺序读 1024/1024 完成、两次 SHA-256 一致；旧坏 LBA 1255072–1255074 用 `O_DIRECT` 单扇区读成功；内核 exFAT 只读挂载成功。Debian 内核 exFAT rw 挂载下又完成受控压力测试：3 轮 × 1 GiB 写后回读（清页缓存前后 SHA-256 一致）、100 个 4 KiB 小文件元数据压力、卸载后只读重挂的持久化校验，全部一致，内核日志错误计数 0，测试文件已清理。macOS 侧 0.14.0 加载后完成 1 GiB 顺序读、256 MiB 随机写后回读（两次 SHA-256 一致）、64 MiB 零写与源哈希一致、16 MiB UNMAP（偏移 8 GiB）且卷可重新挂载；0.14.1 注入一次超时后 `ABORT_TASK` 成功，恢复阶段出现一次 `UNIT ATTENTION`（ASC 0x29），重试后 45/64/256 MiB 读均成功；0.14.2 以 `mpr_tmf_fail=1/2/3` 逐级验证 `LUN_RESET`、`TARGET_RESET` 与 `resetAndReinitialize`，reset 后盘重新枚举为 `disk6` 且读写正常；0.14.3 的按 SMID 完成槽又通过 64 MiB 读写、16 MiB UNMAP 与一次 `ABORT_TASK` 注入回归。**仍非 24 h / 满盘 / 并发压测，§9.3 的 D8–D12 缺口未验证**；历史 GPT/四分区信息不能用于推断当前分区布局，破坏性测试仅限重新核对身份后的这块获准测试盘 |
 | 内部启动盘 / ESP | 原记录中 SanDisk SD8SNAT-128G-1006（128 GB、SATA）已由 `diskutil` 确认为 Internal；MPR 仅注入其 ESP | 每次部署重新核对整盘位置、型号/容量和 ESP UUID，不沿用 `disk0s1` 等编号；系统/数据卷与 USB EFI 不用于部署 |
 
 原有回退资料包括内部 ESP 同目录的 `config.plist.bak_mpr-m0_20261111`、`config.plist.bak_sata_internal_20261111` 和 `MPR.kext.bak_m4_20261111`、`MPR.kext.bak_namefix_20261111`，实际存在性与对应内容应在执行前确认。最新部署记录为仅替换 kext、config 校验和不变；不得为了“重新完成 M0”覆盖现有配置或清理历史备份。
@@ -329,13 +329,13 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 | M2：事件观测 | 旧代码掩码为 `0x10C08004` / `0x00200002`，曾见 EVENT_CHANGE `0x0A`、SAS_ENCL_DEVICE_STATUS_CHANGE `0x1D`，未见期望的 discovery/topology 事件 | 已找到订阅掩码极性错误，不能再推断为“固件不自发 discovery”。修正及确认订阅回复后重新观察（§9.3） |
 | M3：SCSI 与容量 | TUR/INQUIRY 成功，vendor=ATA、product=PCCOOLER SSD T20、revision=5B；RC10 得到 last LBA 468862127、块大小 512。使用过 fast-path 请求并接受普通/fast-path success reply | 证明该配置的命令通路及 RC10 容量。RC16 的 CDB 编码有错，旧 CHECK CONDITION 不能证明 SAT/SATA 不支持 RC16；fast-path 也必须按目标能力选择 |
 | M3：块读取与只读 nub | READ(10) 从 LBA0 读 4096 B，曾见 MBR `0xAA55`、保护分区 `0xEE`、LBA1 `EFI PART`；0.12.2 的 `MPRBlockDev` 经系统 `IOBlockStorageDriver` 生成只读 `IOMedia`，600 MiB 两次顺序读 SHA-256 相同 | 只读链路已部分实测。尚未完成 §6 的 1 GiB 完整顺序读与一致性退出条件；这些记录没有验证 WRITE、flush、UNMAP 或恢复 |
-| M4：实现与初步验证 | 0.14.0 已加载并完成写/UNMAP 成功路径；0.14.2 以 `mpr_timeout_test=1` + `mpr_tmf_fail=1/2/3` 逐级注入，验证 `ABORT_TASK`（TM_COMPLETE、termination count 1）、`LUN_RESET`、`TARGET_RESET` 和 `resetAndReinitialize`（`MPRResetCount=1`、`MPRReinitState=ok`、盘重新枚举后可读写），全程设备未离线 | 只覆盖成功路径；错误注入与 24 h 混合 I/O 未验收；D3/D8–D12 缺口仍成立 |
+| M4：实现与初步验证 | 0.14.0 已加载并完成写/UNMAP 成功路径；0.14.2 逐级验证 `ABORT_TASK`、`LUN_RESET`、`TARGET_RESET` 与 `resetAndReinitialize`；0.14.3 用 `fReplySlots[128]` 按 SMID 保存完成结果，`IOSimpleLock` 串行化 `processReplyQueue`，读写/UNMAP/TMF 注入回归通过 | 只覆盖成功路径；错误注入与 24 h 混合 I/O 未验收；D8–D12 缺口仍成立 |
 
 **测试盘健康与归因边界**：原记录中，macOS 与 Debian 13 上游 `mpt3sas` 对同一盘都出现介质读取错误；固定 LBA 1255072–1255074 在 Debian `O_DIRECT` 单扇区读取中也失败（记录为 9/9），其它位置正常。该交叉结果支持先调查测试盘/设备路径，不能把该处错误直接归为本驱动独有缺陷，也不能据此豁免驱动的错误传播、超时和恢复问题。随后 Windows 的 RTL9210B-CG USB 桥下格式化并做 1 GiB、4 GiB 写后回读均无错，只说明那次路径/状态下的结果；重映射或链路差异只是可能解释。2026-11-11 接回 SAS3008 后按现场身份完成只读复测：前 1 GiB 顺序读两次 SHA-256 均为 `7ce1c096…c183e`、旧坏 LBA 可读、无新介质错误，故此前阻碍 1 GiB 验收的样本异常在该路径下未复现。随后按现场身份在 Debian 内核 exFAT 下完成受控读写压力测试：3 轮 × 1 GiB 写后回读 SHA-256 一致、100 个 4 KiB 小文件元数据压力、跨卸载重挂持久化一致，内核日志 0 错误，测试文件已清理。这仍不等于 24 h / 满盘 / 并发稳定性已验证。macOS 侧 0.14.0 加载后另行完成 256 MiB 随机写后回读、64 MiB 零写与 16 MiB UNMAP，均无错误，事件掩码自检与订阅应答也通过；这不替代故障注入与长期稳定性。M4 缺口按 §9.3 处理，进一步扩大写入须先按 §9.4 完成核对并取得授权。
 
 ### 9.3 已确认的实现缺口与修正要求
 
-以下依据当前 `MPR/MPRController.cpp`、`MPR/MPRBlockDev.cpp`、`MPR/MPI/mpi2_min.h` 及 §2 固定参考源码。表中按函数定位，不将易漂移的本仓库行号作为唯一依据。**当前状态**：D1、D2、D4、D5、D6、D7 已在源码中做了对应修改，并随 0.14.0 部署/加载；其中 D2 的事件掩码自检与订阅应答已在实机通过，D1 的回复帧归还有写后回读与 UNMAP 间接覆盖，D5 的失败分支未做故障注入，D6 的 ABORT_TASK、LUN_RESET、TARGET_RESET 与 resetAndReinitialize 已通过 `mpr_tmf_fail=1/2/3` 逐级实机触发。D3（按 SMID 保存结果、串行消费回复队列）与 D8–D12 仍未处理。表中「必须完成的修正与验收」仍是完整要求，不能因部分改动而标记完成。
+以下依据当前 `MPR/MPRController.cpp`、`MPR/MPRBlockDev.cpp`、`MPR/MPI/mpi2_min.h` 及 §2 固定参考源码。表中按函数定位，不将易漂移的本仓库行号作为唯一依据。**当前状态**：D1、D2、D4、D5、D6、D7 已在源码中做了对应修改，并随 0.14.0 部署/加载；其中 D2 的事件掩码自检与订阅应答已在实机通过，D1 的回复帧归还有写后回读与 UNMAP 间接覆盖，D5 的失败分支未做故障注入，D6 的 ABORT_TASK、LUN_RESET、TARGET_RESET 与 resetAndReinitialize 已通过 `mpr_tmf_fail=1/2/3` 逐级实机触发。D3（按 SMID 保存结果、串行消费回复队列）已在 0.14.3 实现并通过读写/UNMAP/TMF 回归；D8–D12 仍未处理。表中「必须完成的修正与验收」仍是完整要求，不能因部分改动而标记完成。
 
 | # | 当前实现 / 问题 | 必须完成的修正与验收 |
 |---|---|---|
@@ -362,4 +362,4 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 4. **接回并重新确认测试盘，先恢复 M2/M3 验收**：核对身份、当前分区及健康状态；先做回复池绕环、事件/ACK、config 和只读回读。达成 1 GiB 一致性条件后，才扩大写入测试；样本异常与驱动缺陷分别定位。
 5. **按 M4 → M5 扩展**：小范围写后回读与持久化、按能力验证 UNMAP、错误/超时/TMF/复位故障注入，随后 24 h 混合 I/O，再做热插拔、换盘和 PM。失败时按可执行回退方案停止，不把失败后的自动续写作为恢复成功。
 
-§9.1 的部署记录、既有测试盘许可和本文的实施顺序不等于已完成全部 M4 验收。2026-11-11 的补充更新了远程核实结果（接线、身份、只读复测、Debian 侧受控读写压力测试），以及 0.14.0/0.14.1/0.14.2 的构建/部署/加载、macOS 侧 256 MiB 写后回读、64 MiB 零写、16 MiB UNMAP、超时注入与 LUN/TARGET/reset 级联；D3/D8–D12 与 24 h 仍按 §9.3/§9.4 处理。
+§9.1 的部署记录、既有测试盘许可和本文的实施顺序不等于已完成全部 M4 验收。2026-11-11 的补充更新了远程核实结果（接线、身份、只读复测、Debian 侧受控读写压力测试），以及 0.14.0/0.14.1/0.14.2/0.14.3 的构建/部署/加载、macOS 侧 256 MiB 写后回读、64 MiB 零写、16 MiB UNMAP、超时注入、LUN/TARGET/reset 级联与按 SMID 完成槽回归；D8–D12 与 24 h 仍按 §9.3/§9.4 处理。

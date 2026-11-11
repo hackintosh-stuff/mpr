@@ -14,6 +14,18 @@ class IOPCIDevice;
 class MPRBlockDev;
 struct IOBlockStorageDeviceExtent;
 
+/* One completion slot per SMID. processReplyQueue() fills it under
+ * fReplyLock; each waiter consumes only its own slot, so a late reply can no
+ * longer be mistaken for the completion of another command. */
+struct MPRReplySlot
+{
+    volatile UInt32 valid;
+    UInt16          smid;
+    UInt8           kind;       /* 1 = address reply, 2 = fast-path success */
+    UInt8           reserved;
+    UInt8           reply[64];
+};
+
 class MPRController : public IOService
 {
     OSDeclareDefaultStructors(MPRController)
@@ -53,6 +65,8 @@ private:
     volatile UInt32            fInterruptCount;
     volatile UInt32            fReplyViaIrq;
     UInt8                      fLastReply[64];
+    MPRReplySlot               fReplySlots[128];
+    IOSimpleLock              *fReplyLock;
 
     /* firmware event notifications. */
     volatile UInt32            fEventCount;
@@ -138,6 +152,7 @@ private:
     void   processReplyQueue(void);
     bool   waitForReply(UInt32 timeoutMs);
     bool   waitForSmid(UInt32 timeoutMs, UInt32 smid);
+    bool   takeReplySlot(UInt32 smid, UInt8 *reply, UInt32 replyLen, UInt8 *kind);
 
     bool   sendEventNotification(void);
     bool   sendPortEnable(void);

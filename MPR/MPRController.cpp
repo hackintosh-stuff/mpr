@@ -834,6 +834,14 @@ MPRController::processReplyQueue(void)
     post = queue + fFqDepth * 4;
     replyBytes = fReplyFrameSize * fFqDepth;
 
+    /* Only one consumer may walk the reply queue. The interrupt action and a
+     * waiter's fallback poll both call this method; the spin lock makes the
+     * post-index update and the per-SMID publication atomic. */
+    if (fReplyLock == NULL) {
+        return;
+    }
+    IOSimpleLockLock(fReplyLock);
+
     for (i = 0; i < fPqDepth; i++) {
         memcpy(&entry, post + fReplyPostIndex * 8, sizeof(entry));
         flags = (UInt8)(entry & MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK);
@@ -869,8 +877,18 @@ MPRController::processReplyQueue(void)
                     sendEventAck(fLastEvent, fLastEventContext);
                 }
             } else {
+                UInt16 rsmid = (UInt16)((entry >> 16) & 0xFFFF);
+
+                if (rsmid < 128) {
+                    MPRReplySlot *slot = &fReplySlots[rsmid];
+
+                    memcpy(slot->reply, replyFrame, sizeof(slot->reply));
+                    slot->smid = rsmid;
+                    slot->kind = 1;
+                    slot->valid = 1;
+                }
                 memcpy(fLastReply, replyFrame, sizeof(fLastReply));
-                fLastReplySmid = (UInt16)((entry >> 16) & 0xFFFF);
+                fLastReplySmid = rsmid;
                 fLastReplyKind = 1;
                 fReplyCount++;
             }
@@ -880,13 +898,24 @@ MPRController::processReplyQueue(void)
         } else if (flags == MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS ||
                    flags == MPI25_RPY_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO_SUCCESS) {
             /* A successful SCSI IO carries no reply frame; only the SMID. */
-            fLastReplySmid = (UInt16)((entry >> 16) & 0xFFFF);
+            UInt16 rsmid = (UInt16)((entry >> 16) & 0xFFFF);
+
+            if (rsmid < 128) {
+                MPRReplySlot *slot = &fReplySlots[rsmid];
+
+                slot->smid = rsmid;
+                slot->kind = 2;
+                memset(slot->reply, 0, sizeof(slot->reply));
+                slot->valid = 1;
+            }
+            fLastReplySmid = rsmid;
             fLastReplyKind = 2;
             memset(fLastReply, 0, sizeof(fLastReply));
             fScsiSuccess++;
             fReplyCount++;
         }
     }
+    IOSimpleLockUnlock(fReplyLock);
     writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, fReplyPostIndex);
 }
 
@@ -911,6 +940,7 @@ bool
 MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
 {
     UInt32 i;
+    bool ready;
 
     fTimedOutSmid = 0;
     /* Fault injection: with mpr_timeout_test=1 in boot-args, fail exactly one
@@ -922,27 +952,62 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
         fTimedOutSmid = (UInt16)smid;
         return false;
     }
-    /* A reply left over from an earlier command must not be mistaken for the
-     * completion of this one. Each block device command uses a rotating SMID, so the
-     * SMID in the reply descriptor identifies the command unambiguously. */
+    /* Only the slot owned by this SMID can satisfy the wait; a late reply for
+     * another command is published to that command's slot instead. */
+    if (smid >= 128 || fReplyLock == NULL) {
+        fTimedOutSmid = (UInt16)smid;
+        return false;
+    }
     for (i = 0; i < timeoutMs; i++) {
         if (fStopping) {
             fTimedOutSmid = (UInt16)smid;
             return false;
         }
-        if (fReplyCount > 0 && fLastReplySmid == (UInt16)smid) {
+        IOSimpleLockLock(fReplyLock);
+        ready = (fReplySlots[smid].valid != 0);
+        IOSimpleLockUnlock(fReplyLock);
+        if (ready) {
             return true;
         }
         IOSleep(1);
     }
     processReplyQueue();
-    if (fReplyCount > 0 && fLastReplySmid == (UInt16)smid) {
+    IOSimpleLockLock(fReplyLock);
+    ready = (fReplySlots[smid].valid != 0);
+    IOSimpleLockUnlock(fReplyLock);
+    if (ready) {
         return true;
     }
     /* A real timeout needs task management; a SCSI status error needs
      * sense decoding instead. */
     fTimedOutSmid = (UInt16)smid;
     return false;
+}
+
+bool
+MPRController::takeReplySlot(UInt32 smid, UInt8 *reply, UInt32 replyLen,
+                             UInt8 *kind)
+{
+    bool ok = false;
+
+    if (smid >= 128 || reply == NULL || replyLen == 0 ||
+        fReplyLock == NULL) {
+        return false;
+    }
+    IOSimpleLockLock(fReplyLock);
+    if (fReplySlots[smid].valid) {
+        UInt32 n = replyLen < (UInt32)sizeof(fReplySlots[smid].reply)
+                       ? replyLen : (UInt32)sizeof(fReplySlots[smid].reply);
+
+        memcpy(reply, fReplySlots[smid].reply, n);
+        if (kind != NULL) {
+            *kind = fReplySlots[smid].kind;
+        }
+        fReplySlots[smid].valid = 0;
+        ok = true;
+    }
+    IOSimpleLockUnlock(fReplyLock);
+    return ok;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1732,6 +1797,8 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
     MPRScsiIoRequest *request;
     MPRScsiIoReply   *reply;
     UInt8 *frame;
+    UInt8 replyBuf[64];
+    UInt8 replyKind = 0;
     UInt32 dataLen = blocks * blockSize;
     bool posted;
 
@@ -1811,7 +1878,13 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
         }
         return false;
     }
-    if (fLastReplyKind == 2) {
+    if (!takeReplySlot(smid, replyBuf, sizeof(replyBuf), &replyKind)) {
+        if (!diagnostics) {
+            setProperty("MPRLastIOFailure", "reply-slot-missing");
+        }
+        return false;
+    }
+    if (replyKind == 2) {
         if (diagnostics) {
             setProperty("MPRReadIOCStatus", 0ULL, 16);
             setProperty("MPRReadScsiStatus", 0ULL, 8);
@@ -1819,7 +1892,7 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
         }
         return true;
     }
-    reply = (MPRScsiIoReply *)fLastReply;
+    reply = (MPRScsiIoReply *)replyBuf;
     if (diagnostics) {
         setProperty("MPRReadIOCStatus",
                     (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
@@ -2459,6 +2532,8 @@ MPRController::start(IOService *provider)
     fScsiSuccess = 0;
     fBlockDev = NULL;
     fIOLock = IOLockAlloc();
+    fReplyLock = IOSimpleLockAlloc();
+    memset(fReplySlots, 0, sizeof(fReplySlots));
     fCapacityBlocks = 0;
     fBlockSize = 0;
     fNextIoSmid = 0;
@@ -2515,7 +2590,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.14.2");
+    setProperty("MPRBuild", "0.14.3");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -2598,6 +2673,10 @@ MPRController::stop(IOService *provider)
     if (fIOLock != NULL) {
         IOLockFree(fIOLock);
         fIOLock = NULL;
+    }
+    if (fReplyLock != NULL) {
+        IOSimpleLockFree(fReplyLock);
+        fReplyLock = NULL;
     }
     super::stop(provider);
 }
@@ -2952,6 +3031,8 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
     UInt8 *frame;
     MPRScsiTaskMgmtRequest *request;
     MPRScsiTaskMgmtReply *reply;
+    UInt8 replyBuf[64];
+    UInt8 replyKind = 0;
     bool ok = false;
 
     if (fRequestBuffer == NULL || fAttachedDevHandle == 0 ||
@@ -2979,8 +3060,10 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
     fLastReplyKind = 0;
     fLastReplySmid = 0xFFFF;
     postHighPriorityRequest(smid);
-    if (waitForSmid(15000, smid) && fLastReplyKind == 1) {
-        reply = (MPRScsiTaskMgmtReply *)fLastReply;
+    if (waitForSmid(15000, smid) &&
+        takeReplySlot(smid, replyBuf, sizeof(replyBuf), &replyKind) &&
+        replyKind == 1) {
+        reply = (MPRScsiTaskMgmtReply *)replyBuf;
         ok = ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS) &&
              (reply->ResponseCode == MPI2_SCSITASKMGMT_RSP_TM_COMPLETE ||
               reply->ResponseCode == MPI2_SCSITASKMGMT_RSP_TM_SUCCEEDED);
@@ -3077,6 +3160,11 @@ MPRController::resetAndReinitialize(void)
     fReplyCount = 0;
     fLastReplySmid = 0xFFFF;
     fLastReplyKind = 0;
+    if (fReplyLock != NULL) {
+        IOSimpleLockLock(fReplyLock);
+        memset(fReplySlots, 0, sizeof(fReplySlots));
+        IOSimpleLockUnlock(fReplyLock);
+    }
 
     setupInterrupts();
     if (initializeController() && initializeQueues()) {
