@@ -1288,26 +1288,42 @@ MPRController::readSasIOUnitPage0(void)
         snprintf(name, sizeof(name), "MPRPhy%uLinkRate", (unsigned int)i);
         setProperty(name, (unsigned long long)linkRate, 8);
 
-        if (devHandle != 0 && !getProperty("MPRAttachedDevHandle")) {
-            setProperty("MPRAttachedDevHandle", (unsigned long long)devHandle, 16);
-            setProperty("MPRAttachedDeviceInfo", (unsigned long long)deviceInfo, 32);
-            setProperty("MPRAttachedPhy", (unsigned long long)i, 8);
-            setProperty("MPRAttachedPortFlags", (unsigned long long)phy[0x01], 8);
-            setProperty("MPRAttachedPhyFlags", (unsigned long long)phy[0x02], 8);
-            setProperty("MPRAttachedDiscoveryStatus",
-                        (unsigned long long)((UInt32)phy[0x0C] |
-                                             ((UInt32)phy[0x0D] << 8) |
-                                             ((UInt32)phy[0x0E] << 16) |
-                                             ((UInt32)phy[0x0F] << 24)), 32);
+        /* Only a directly attached end device (SATA/STP/SSP target) is a
+         * usable media target; expanders and IR volumes are skipped. */
+        if (devHandle != 0 && fAttachedDevHandle == 0) {
+            UInt32 sasInfo = 0;
+
             fAttachedDevHandle = devHandle;
-            readSasDevicePage0(devHandle);
+            if (readSasDevicePage0(devHandle, &sasInfo) &&
+                (sasInfo & MPI2_SAS_DEVICE_INFO_END_DEVICE) != 0 &&
+                (sasInfo & (MPI2_SAS_DEVICE_INFO_SATA_DEVICE |
+                            MPI2_SAS_DEVICE_INFO_STP_TARGET |
+                            MPI2_SAS_DEVICE_INFO_SSP_TARGET)) != 0 &&
+                (sasInfo & MPI2_SAS_DEVICE_INFO_DIRECT_ATTACH) != 0) {
+                setProperty("MPRAttachedDevHandle",
+                            (unsigned long long)devHandle, 16);
+                setProperty("MPRAttachedDeviceInfo",
+                            (unsigned long long)sasInfo, 32);
+                setProperty("MPRAttachedPhy", (unsigned long long)i, 8);
+                setProperty("MPRAttachedPortFlags", (unsigned long long)phy[0x01], 8);
+                setProperty("MPRAttachedPhyFlags", (unsigned long long)phy[0x02], 8);
+                setProperty("MPRAttachedDiscoveryStatus",
+                            (unsigned long long)((UInt32)phy[0x0C] |
+                                                 ((UInt32)phy[0x0D] << 8) |
+                                                 ((UInt32)phy[0x0E] << 16) |
+                                                 ((UInt32)phy[0x0F] << 24)), 32);
+            } else {
+                fAttachedDevHandle = 0;
+                removeProperty("MPRAttachedDevHandle");
+                removeProperty("MPRAttachedDeviceInfo");
+            }
         }
     }
     return true;
 }
 
 bool
-MPRController::readSasDevicePage0(UInt32 devHandle)
+MPRController::readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo)
 {
     UInt8 page[MPR_PAGE_BUF_BYTES];
     UInt32 actual = 0, pageAddress, deviceInfo;
@@ -1352,9 +1368,22 @@ MPRController::readSasDevicePage0(UInt32 devHandle)
     setProperty("MPRSasDeviceSlot", (unsigned long long)slot, 16);
     setProperty("MPRSasDeviceEnclosure", (unsigned long long)enclHandle, 16);
     setProperty("MPRSasDeviceAccessStatus", (unsigned long long)page[0x17], 8);
-    setProperty("MPRSasDeviceFlags",
-                (unsigned long long)((UInt32)page[0x20] | ((UInt32)page[0x21] << 8)), 16);
+    {
+        UInt16 deviceFlags = (UInt16)((UInt32)page[0x20] |
+                                      ((UInt32)page[0x21] << 8));
+
+        fFastPathEnabled =
+            ((deviceFlags & MPI25_SAS_DEVICE0_FLAGS_FAST_PATH_CAPABLE) != 0) &&
+            ((deviceFlags & MPI25_SAS_DEVICE0_FLAGS_ENABLED_FAST_PATH) != 0);
+        setProperty("MPRSasDeviceFlags",
+                    (unsigned long long)deviceFlags, 16);
+        setProperty("MPRFastPathEnabled",
+                    (unsigned long long)(fFastPathEnabled ? 1 : 0), 8);
+    }
     setProperty("MPRSasDevicePageBytes", (unsigned long long)actual, 32);
+    if (outDeviceInfo != NULL) {
+        *outDeviceInfo = deviceInfo;
+    }
     IOLog("MPR dev handle=%u sas=%s info=0x%08x type=%s\n",
           (unsigned int)pageDevHandle, sasText,
           (unsigned int)deviceInfo, type);
@@ -1413,12 +1442,14 @@ mprFillIeeeSge(UInt8 *sge, UInt64 address, UInt32 length)
 void
 MPRController::postScsiIo(UInt32 smid)
 {
-    UInt32 low = MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO | (smid << 16);
+    UInt32 flags = fFastPathEnabled
+                       ? MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO
+                       : MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE;
+    UInt32 low = flags | (smid << 16);
 
-    /* The IOC has fast path enabled for this device (SAS Device Page0 Flags
-     * bit 0x4000), so the target devhandle travels in descriptor word 1.
-     * MPI2_SCSI_IO_REQUEST_DESCRIPTOR puts LMID at 0x04 and DevHandle at
-     * 0x06, i.e. DevHandle occupies the high half of word 1. */
+    /* Fast path is used only when SAS Device Page0 reports both CAPABLE and
+     * ENABLED. Otherwise the default SCSI IO descriptor is posted; the
+     * devhandle still travels in descriptor word 1. */
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, low);
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET,
              (fAttachedDevHandle & 0xFFFF) << 16);
@@ -1451,7 +1482,8 @@ MPRController::scsiTur(void)
     request->SenseBufferLength = 96;
     request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
     request->DataLength = 0;
-    request->IoFlags = 6 | MPI25_SCSIIO_IOFLAGS_FAST_PATH;
+    request->IoFlags = (UInt16)(6 | (fFastPathEnabled
+                                   ? MPI25_SCSIIO_IOFLAGS_FAST_PATH : 0));
     request->Control = MPI2_SCSIIO_CONTROL_NODATATRANSFER;
     request->CDB[0] = 0x00;                 /* TEST UNIT READY */
 
@@ -1519,7 +1551,8 @@ MPRController::scsiInquiry(void)
     request->SenseBufferLength = 96;
     request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
     request->DataLength = 36;
-    request->IoFlags = 6 | MPI25_SCSIIO_IOFLAGS_FAST_PATH;   /* six-byte CDB */
+    request->IoFlags = (UInt16)(6 | (fFastPathEnabled
+                                   ? MPI25_SCSIIO_IOFLAGS_FAST_PATH : 0));   /* six-byte CDB */
     request->Control = MPI2_SCSIIO_CONTROL_READ;
     request->CDB[0] = 0x12;                 /* INQUIRY */
     request->CDB[4] = 36;                   /* allocation length */
@@ -1652,7 +1685,8 @@ MPRController::scsiReadCapacity16(void)
     request->SenseBufferLength = 96;
     request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
     request->DataLength = 32;
-    request->IoFlags = (UInt16)(16 | MPI25_SCSIIO_IOFLAGS_FAST_PATH);
+    request->IoFlags = (UInt16)(16 | (fFastPathEnabled
+                                    ? MPI25_SCSIIO_IOFLAGS_FAST_PATH : 0));
     request->Control = MPI2_SCSIIO_CONTROL_READ;
     memcpy(request->CDB, cdb, sizeof(cdb));
     mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fPagePhys, 32);
@@ -1730,7 +1764,8 @@ MPRController::scsiReadCapacity10(void)
     request->SenseBufferLength = 96;
     request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
     request->DataLength = 8;
-    request->IoFlags = (UInt16)(10 | MPI25_SCSIIO_IOFLAGS_FAST_PATH);
+    request->IoFlags = (UInt16)(10 | (fFastPathEnabled
+                                    ? MPI25_SCSIIO_IOFLAGS_FAST_PATH : 0));
     request->Control = MPI2_SCSIIO_CONTROL_READ;
     memcpy(request->CDB, cdb, sizeof(cdb));
     mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fPagePhys, 8);
@@ -1850,7 +1885,9 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
     request->SenseBufferLength = 96;
     request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
     request->DataLength = dataLen;
-    request->IoFlags = (UInt16)(sizeof(cdb) | MPI25_SCSIIO_IOFLAGS_FAST_PATH);
+    request->IoFlags = (UInt16)(sizeof(cdb) |
+                                (fFastPathEnabled
+                                     ? MPI25_SCSIIO_IOFLAGS_FAST_PATH : 0));
     request->Control = write ? MPI2_SCSIIO_CONTROL_WRITE : MPI2_SCSIIO_CONTROL_READ;
     memcpy(request->CDB, cdb, sizeof(cdb));
     mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fDataPhys, dataLen);
@@ -2256,8 +2293,17 @@ MPRController::publishBlockDevice(void)
         setProperty("MPRBlockDeviceState", "skipped-no-media");
         return false;
     }
-    if (fIOLock == NULL || !allocateResidentBuffers()) {
+    if (fIOLock == NULL) {
         setProperty("MPRBlockDeviceState", "failed-alloc");
+        return false;
+    }
+    if (fPageBuffer == NULL && fDataBuffer == NULL) {
+        if (!allocateResidentBuffers()) {
+            setProperty("MPRBlockDeviceState", "failed-alloc");
+            return false;
+        }
+    } else if (fPageBuffer == NULL || fDataBuffer == NULL) {
+        setProperty("MPRBlockDeviceState", "failed-buffer-state");
         return false;
     }
 
@@ -2599,6 +2645,7 @@ MPRController::start(IOService *provider)
     fStopping = false;
     fInjectTimeout = false;
     fInjectTmfFail = 0;
+    fFastPathEnabled = false;
     fHighPriorityCredit = 0;
     fEventReplyCount = 0;
     fEventAckCount = 0;
@@ -2636,7 +2683,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.15.0");
+    setProperty("MPRBuild", "0.15.2");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -2927,7 +2974,8 @@ MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
     request->SenseBufferLength = 96;
     request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
     request->DataLength = dataLen;
-    request->IoFlags = (UInt16)(cdbLen | MPI25_SCSIIO_IOFLAGS_FAST_PATH);
+    request->IoFlags = (UInt16)(cdbLen | (fFastPathEnabled
+                                          ? MPI25_SCSIIO_IOFLAGS_FAST_PATH : 0));
     request->Control = control;
     memcpy(request->CDB, cdb, cdbLen);
 
@@ -3220,8 +3268,32 @@ MPRController::resetAndReinitialize(void)
          * property so the topology read accepts the new devhandle. */
         removeProperty("MPRAttachedDevHandle");
         fAttachedDevHandle = 0;
-        if (readSasIOUnitPage0()) {
-            ok = (fAttachedDevHandle != 0);
+        if (readSasIOUnitPage0() && fAttachedDevHandle != 0) {
+            char oldVendor[16], oldProduct[20];
+            UInt64 oldBlocks = fCapacityBlocks;
+            UInt32 oldBlockSize = fBlockSize;
+            bool changed;
+
+            memcpy(oldVendor, fVendor, sizeof(oldVendor));
+            memcpy(oldProduct, fProduct, sizeof(oldProduct));
+            if (probeScsiIdentity() && probeCapacity()) {
+                changed =
+                    (memcmp(oldVendor, fVendor, sizeof(oldVendor)) != 0) ||
+                    (memcmp(oldProduct, fProduct, sizeof(oldProduct)) != 0) ||
+                    (oldBlocks != fCapacityBlocks) ||
+                    (oldBlockSize != fBlockSize);
+                if (changed && fBlockDev != NULL) {
+                    /* A different target or geometry must not keep the old
+                     * media contract; tear the nub down and republish. */
+                    fBlockDev->setController(NULL);
+                    fBlockDev->terminate();
+                    fBlockDev->detach(this);
+                    fBlockDev->release();
+                    fBlockDev = NULL;
+                    setProperty("MPRBlockDeviceState", "identity-changed");
+                }
+                ok = (fBlockDev != NULL) || publishBlockDevice();
+            }
         }
     }
 

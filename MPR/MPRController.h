@@ -102,6 +102,7 @@ private:
     bool                       fStopping;
     bool                       fInjectTimeout;   /* mpr_timeout_test boot-arg */
     UInt32                     fInjectTmfFail;   /* mpr_tmf_fail boot-arg */
+    bool                       fFastPathEnabled; /* SAS Device Page0 flags */
     UInt32                     fHighPriorityCredit;
     volatile UInt32            fEventReplyCount;
     volatile UInt32            fEventAckCount;
@@ -162,7 +163,7 @@ private:
                              UInt8 *buffer, UInt32 bufferBytes,
                              UInt32 *actualBytes);
     bool   readSasIOUnitPage0(void);
-    bool   readSasDevicePage0(UInt32 devHandle);
+    bool   readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo = NULL);
     bool   discoverTopology(void);
 
     void   postScsiIo(UInt32 smid);
