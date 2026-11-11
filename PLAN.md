@@ -364,6 +364,14 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **M2 剩余**：EventNotification、PortEnable、固件事件队列与拓扑目标表；`HostMSIxVectors=1` 是否真正启用 MSI-X（而非退化 INTx）需用 `IOPCIDevice` 的 interrupt specifier 进一步核对。
 
+### 9.6 M2-b：EventNotification 与 PortEnable（2026-11-11，部分验证）
+
+`MPI2_EVENT_NOTIFICATION_REQUEST` 在 IOC 进入 OPERATIONAL 后发出，掩码覆盖 `STATE_CHANGE (0x02)`、`SAS_DEVICE_STATUS_CHANGE (0x0F)`、`SAS_DISCOVERY (0x16)`、`SAS_BROADCAST_PRIMITIVE (0x17)`、`SAS_TOPOLOGY_CHANGE_LIST (0x1C)`、`LOG_ENTRY_ADDED (0x21)`、`SAS_DEVICE_DISCOVERY_ERROR (0x35)`，实测 `MPREventMask0=0x10C08004`、`MPREventMask1=0x00200002`。随后用 SMID 3 发 `MPI2_PORT_ENABLE_REQUEST` 并同步等待 reply。`processReplyQueue` 按 reply 的 `Function==0x07` 区分固件事件与命令应答，记录事件号、`EventDataLength`、`AckRequired`、`EventContext` 与前 64 字节，并维护 128 位"已见事件"位图。
+
+**已验证（重启后）**：`com.ling.MPR (0.7.2)`；`MPRPortEnable=ok`、`MPRPortEnableStatus=0`、`MPRPortEnableLogInfo=0`；`MPREventCount=2`、`MPREventSeen0=0x20000400`（事件 `0x0A EVENT_CHANGE` 与 `0x1D SAS_ENCL_DEVICE_STATUS_CHANGE`）、`MPRLastEventDataLength=5`；中断计数正常、无新增 panic。
+
+**未达成**：`SAS_DISCOVERY (0x16)` 与 `SAS_TOPOLOGY_CHANGE_LIST (0x1C)` 未出现，尽管掩码已置位、PortEnable 返回成功。可能原因是该固件在 SAS3008 + SATA 直连配置下不自发 discovery 事件，或事件发生在掩码生效之前。下一步改为**主动读取 config page**（SAS IO Unit Page0/2、SAS Device Page0）建立目标表，不依赖事件；`MPI2_FUNCTION_EVENT_ACK` 尚未实现。
+
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。

@@ -57,6 +57,7 @@ private:
     UInt16                     fLastEventDataLength;
     UInt8                      fLastEventAckRequired;
     UInt32                     fLastEventContext;
+    UInt32                     fEventSeen[4];
     UInt8                      fLastEventData[64];
 
     UInt32 readReg(UInt32 offset);

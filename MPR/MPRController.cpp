@@ -847,6 +847,9 @@ MPRController::processReplyQueue(void)
                 fLastEventDataLength = event->EventDataLength;
                 fLastEventAckRequired = event->AckRequired;
                 fLastEventContext = event->EventContext;
+                if (fLastEvent < 128) {
+                    fEventSeen[fLastEvent / 32] |= (1U << (fLastEvent % 32));
+                }
                 fEventCount++;
             } else {
                 memcpy(fLastReply, replyFrame, sizeof(fLastReply));
@@ -908,6 +911,9 @@ MPRController::sendEventNotification(void)
     mprSetEventBit(request->EventMasks, MPI2_EVENT_LOG_ENTRY_ADDED);
     mprSetEventBit(request->EventMasks, MPI2_EVENT_SAS_DEVICE_DISCOVERY_ERROR);
 
+    setProperty("MPREventMask0", (unsigned long long)request->EventMasks[0], 32);
+    setProperty("MPREventMask1", (unsigned long long)request->EventMasks[1], 32);
+
     value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (2U << 16);
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
@@ -935,7 +941,18 @@ MPRController::sendPortEnable(void)
     value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (3U << 16);
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
     writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
-    return waitForReply(MPR_M2_REPLY_TIMEOUT_MS);
+    if (!waitForReply(MPR_M2_REPLY_TIMEOUT_MS)) {
+        return false;
+    }
+    {
+        MPRPortEnableReply *reply = (MPRPortEnableReply *)fLastReply;
+
+        setProperty("MPRPortEnableStatus",
+                    (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+        setProperty("MPRPortEnableLogInfo",
+                    (unsigned long long)reply->IOCLogInfo, 32);
+    }
+    return true;
 }
 
 bool
@@ -958,12 +975,16 @@ MPRController::runM2b(void)
     }
 
     /* Let the IOC raise discovery/topology events before sampling counters. */
-    IOSleep(1500);
+    IOSleep(5000);
 
     setProperty("MPREventCount", (unsigned long long)fEventCount, 32);
     setProperty("MPRLastEvent", (unsigned long long)fLastEvent, 16);
     setProperty("MPRLastEventDataLength", (unsigned long long)fLastEventDataLength, 16);
     setProperty("MPRLastEventAck", (unsigned long long)fLastEventAckRequired, 8);
+    setProperty("MPREventSeen0", (unsigned long long)fEventSeen[0], 32);
+    setProperty("MPREventSeen1", (unsigned long long)fEventSeen[1], 32);
+    setProperty("MPREventSeen2", (unsigned long long)fEventSeen[2], 32);
+    setProperty("MPREventSeen3", (unsigned long long)fEventSeen[3], 32);
     setProperty("MPRM2bState", "ok");
     IOLog("MPR M2b: events=%u last=0x%04x len=%u ack=%u\n",
           (unsigned int)fEventCount, (unsigned int)fLastEvent,
@@ -1173,6 +1194,7 @@ MPRController::start(IOService *provider)
     fLastEventDataLength = 0;
     fLastEventAckRequired = 0;
     fLastEventContext = 0;
+    fEventSeen[0] = fEventSeen[1] = fEventSeen[2] = fEventSeen[3] = 0;
     memset(fLastReply, 0, sizeof(fLastReply));
     memset(fLastEventData, 0, sizeof(fLastEventData));
 
@@ -1203,7 +1225,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "M2b");
-    setProperty("MPRBuild", "0.7.0");
+    setProperty("MPRBuild", "0.7.2");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
