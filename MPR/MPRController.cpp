@@ -46,6 +46,9 @@ OSDefineMetaClassAndStructors(MPRController, IOService)
 /* M3-a: sense buffer lives in the upper half of the page staging buffer. */
 #define MPR_SENSE_OFFSET        0x100
 
+/* M3-c: bulk transfer staging buffer. */
+#define MPR_DATA_BUF_BYTES      65536
+
 struct MPRRegisterInfo
 {
     const char *name;
@@ -1612,6 +1615,170 @@ MPRController::scsiReadCapacity10(void)
     return blockSize != 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* M3-c: multi-block READ(10)/WRITE(10) through the same fast-path SCSI IO    */
+/* path, staged in the low-4GB bulk buffer.                                  */
+
+bool
+MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
+                             UInt32 blockSize, UInt32 smid)
+{
+    UInt8 cdb[10];
+    MPRScsiIoRequest *request;
+    MPRScsiIoReply   *reply;
+    UInt8 *frame;
+    UInt32 dataLen = blocks * blockSize;
+    bool posted;
+
+    if (fAttachedDevHandle == 0 || fRequestBuffer == NULL ||
+        fPageBuffer == NULL || fDataBuffer == NULL) {
+        setProperty("MPRM3cFailure", "no device or staging buffer");
+        return false;
+    }
+    if (dataLen == 0 || dataLen > fDataBytes || lba > 0xFFFFFFFFULL ||
+        blocks == 0 || blocks > 0xFFFF) {
+        setProperty("MPRM3cFailure", "transfer out of range");
+        return false;
+    }
+
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = write ? 0x2A : 0x28;           /* WRITE(10) / READ(10) */
+    cdb[2] = (UInt8)(lba >> 24);
+    cdb[3] = (UInt8)(lba >> 16);
+    cdb[4] = (UInt8)(lba >> 8);
+    cdb[5] = (UInt8)lba;
+    cdb[7] = (UInt8)(blocks >> 8);
+    cdb[8] = (UInt8)blocks;
+
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return false;
+    }
+    frame += smid * fRequestFrameSize;
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPRScsiIoRequest *)frame;
+
+    request->DevHandle = (UInt16)fAttachedDevHandle;
+    request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
+    request->SenseBufferLowAddress = (UInt32)(fPagePhys + MPR_SENSE_OFFSET);
+    request->SenseBufferLength = 96;
+    request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
+    request->DataLength = dataLen;
+    request->IoFlags = (UInt16)(sizeof(cdb) | MPI25_SCSIIO_IOFLAGS_FAST_PATH);
+    request->Control = write ? MPI2_SCSIIO_CONTROL_WRITE : MPI2_SCSIIO_CONTROL_READ;
+    memcpy(request->CDB, cdb, sizeof(cdb));
+    mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fDataPhys, dataLen);
+
+    memset(fDataBuffer->getBytesNoCopy(), 0, fDataBytes);
+    fReplyCount = 0;
+    fLastReplyKind = 0;
+    fLastReplySmid = 0xFFFF;
+    postScsiIo(smid);
+    posted = waitForReply(15000) && (fLastReplySmid == (UInt16)smid);
+    if (!posted) {
+        setProperty("MPRM3cFailure", "transfer timeout");
+        return false;
+    }
+    if (fLastReplyKind == 2) {
+        setProperty("MPRReadIOCStatus", 0ULL, 16);
+        setProperty("MPRReadScsiStatus", 0ULL, 8);
+        setProperty("MPRReadTransferCount", (unsigned long long)dataLen, 32);
+        return true;
+    }
+    reply = (MPRScsiIoReply *)fLastReply;
+    setProperty("MPRReadIOCStatus",
+                (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+    setProperty("MPRReadScsiStatus", (unsigned long long)reply->SCSIStatus, 8);
+    setProperty("MPRReadTransferCount", (unsigned long long)reply->TransferCount, 32);
+    return (reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS &&
+           reply->SCSIStatus == 0;
+}
+
+bool
+MPRController::runM3c(void)
+{
+    IOByteCount segLength;
+    UInt64 pageSeg = 0, dataSeg = 0;
+    UInt8 *data;
+    bool ok = false;
+    UInt32 i;
+    char name[32];
+
+    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
+    fDataBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        MPR_DATA_BUF_BYTES, MPR_DMA_LOW_MASK);
+
+    if (fPageBuffer == NULL || fDataBuffer == NULL) {
+        setProperty("MPRM3cState", "failed-alloc");
+    } else {
+        fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+        pageSeg = segLength;
+        fDataPhys = fDataBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+        dataSeg = segLength;
+        fDataBytes = MPR_DATA_BUF_BYTES;
+
+        if (fPagePhys == 0 || fDataPhys == 0 ||
+            pageSeg < MPR_PAGE_BUF_BYTES || dataSeg < MPR_DATA_BUF_BYTES ||
+            (fPagePhys + MPR_PAGE_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1) ||
+            (fDataPhys + MPR_DATA_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
+            setProperty("MPRM3cState", "failed-alloc");
+        } else {
+            /* Read the first 8 blocks and decode the MBR/GPT protective entry. */
+            ok = scsiReadWrite(false, 0, 8, 512, 9);
+            setProperty("MPRM3cState", ok ? "ok" : "failed");
+
+            data = (UInt8 *)fDataBuffer->getBytesNoCopy();
+            if (ok && data != NULL) {
+                UInt64 w[2];
+
+                memcpy(w, data, sizeof(w));
+                setProperty("MPRReadWord0", w[0], 64);
+                setProperty("MPRReadWord1", w[1], 64);
+                setProperty("MPRReadSig",
+                            (unsigned long long)((UInt32)data[510] |
+                                                 ((UInt32)data[511] << 8)), 16);
+                setProperty("MPRReadGptSig",
+                            (unsigned long long)((*(const UInt64 *)(data + 512)) ==
+                                                 0x5452415020494645ULL), 8);
+
+                for (i = 0; i < 4; i++) {
+                    const UInt8 *entry = data + 0x1BE + i * 16;
+                    UInt32 start = (UInt32)entry[8] | ((UInt32)entry[9] << 8) |
+                                   ((UInt32)entry[10] << 16) | ((UInt32)entry[11] << 24);
+                    UInt32 count = (UInt32)entry[12] | ((UInt32)entry[13] << 8) |
+                                   ((UInt32)entry[14] << 16) | ((UInt32)entry[15] << 24);
+
+                    snprintf(name, sizeof(name), "MPRPart%uType", (unsigned int)i);
+                    setProperty(name, (unsigned long long)entry[4], 8);
+                    snprintf(name, sizeof(name), "MPRPart%uStart", (unsigned int)i);
+                    setProperty(name, (unsigned long long)start, 32);
+                    snprintf(name, sizeof(name), "MPRPart%uBlocks", (unsigned int)i);
+                    setProperty(name, (unsigned long long)count, 32);
+                }
+                IOLog("MPR M3c: LBA0 read ok, sig=0x%04x part0type=0x%02x\n",
+                      (unsigned int)((UInt32)data[510] | ((UInt32)data[511] << 8)),
+                      (unsigned int)data[0x1BE + 4]);
+            }
+        }
+    }
+
+    if (fPageBuffer != NULL) {
+        fPageBuffer->release();
+        fPageBuffer = NULL;
+    }
+    if (fDataBuffer != NULL) {
+        fDataBuffer->release();
+        fDataBuffer = NULL;
+    }
+    fPagePhys = 0;
+    fDataPhys = 0;
+    fDataBytes = 0;
+    return ok;
+}
+
 bool
 MPRController::runM3b(void)
 {
@@ -1871,7 +2038,10 @@ MPRController::start(IOService *provider)
     fReplyBuffer = NULL;
     fRequestBuffer = NULL;
     fPageBuffer = NULL;
+    fDataBuffer = NULL;
     fFreePhys = fPostPhys = fReplyPhys = fRequestPhys = fPagePhys = 0;
+    fDataPhys = 0;
+    fDataBytes = 0;
     fFqDepth = fPqDepth = fRequestCount = fReplyFreeIndex = 0;
     fRequestFrameSize = fReplyFrameSize = fRequestCredit = fMaxReplyDepth = 0;
     fReplyPostIndex = 0;
@@ -1920,8 +2090,8 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M3b");
-    setProperty("MPRBuild", "0.10.1");
+    setProperty("MPRStage", "M3c");
+    setProperty("MPRBuild", "0.11.0");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
@@ -1933,6 +2103,7 @@ MPRController::start(IOService *provider)
         runM2c();
         runM3a();
         runM3b();
+        runM3c();
     } else {
         setProperty("MPRM1cState", "skipped-earlier-stage-failed");
     }
@@ -1951,6 +2122,10 @@ void
 MPRController::stop(IOService *provider)
 {
     teardownInterrupts();
+    if (fDataBuffer != NULL) {
+        fDataBuffer->release();
+        fDataBuffer = NULL;
+    }
     if (fPageBuffer != NULL) {
         fPageBuffer->release();
         fPageBuffer = NULL;

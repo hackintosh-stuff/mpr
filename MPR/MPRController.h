@@ -60,6 +60,11 @@ private:
     UInt32                     fEventSeen[4];
     UInt8                      fLastEventData[64];
 
+    /* M3-c: bulk data buffer for block transfers. */
+    IOBufferMemoryDescriptor  *fDataBuffer;
+    UInt64                     fDataPhys;
+    UInt32                     fDataBytes;
+
     /* M3-a: SCSI IO completion tracking. */
     UInt32                     fAttachedDevHandle;
     UInt16                     fLastReplySmid;
@@ -113,6 +118,10 @@ private:
     bool   scsiReadCapacity16(void);
     bool   scsiReadCapacity10(void);
     bool   runM3b(void);
+
+    bool   scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
+                         UInt32 blockSize, UInt32 smid);
+    bool   runM3c(void);
 
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
