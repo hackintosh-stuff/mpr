@@ -86,6 +86,7 @@ private:
     bool                       fReinitInProgress;
     bool                       fDeviceOffline;   /* recovery failed: reject new IO */
     bool                       fStopping;
+    bool                       fInjectTimeout;   /* mpr_timeout_test boot-arg */
     UInt32                     fHighPriorityCredit;
     volatile UInt32            fEventReplyCount;
     volatile UInt32            fEventAckCount;

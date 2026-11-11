@@ -3,6 +3,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/OSByteOrder.h>
 #include <kern/task.h>
+#include <pexpert/pexpert.h>
 #include <string.h>
 #include "MPRController.h"
 #include "MPRBlockDev.h"
@@ -912,6 +913,15 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
     UInt32 i;
 
     fTimedOutSmid = 0;
+    /* Fault injection: with mpr_timeout_test=1 in boot-args, fail exactly one
+     * runtime SCSI command as if its reply were lost. This exercises the TMF
+     * and recovery path without touching the disk. */
+    if (fInjectTimeout && smid >= 10 && smid <= 25) {
+        fInjectTimeout = false;
+        setProperty("MPRInjectTimeout", 0ULL, 8);
+        fTimedOutSmid = (UInt16)smid;
+        return false;
+    }
     /* A reply left over from an earlier command must not be mistaken for the
      * completion of this one. Each block device command uses a rotating SMID, so the
      * SMID in the reply descriptor identifies the command unambiguously. */
@@ -2466,6 +2476,7 @@ MPRController::start(IOService *provider)
     fLastASCQ = 0;
     fDeviceOffline = false;
     fStopping = false;
+    fInjectTimeout = false;
     fHighPriorityCredit = 0;
     fEventReplyCount = 0;
     fEventAckCount = 0;
@@ -2503,9 +2514,20 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.14.0");
+    setProperty("MPRBuild", "0.14.1");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
+    {
+        /* Opt-in fault injection for the timeout/TMF path. The kernel ignores
+         * unknown boot-args, so this is inert unless explicitly requested. */
+        int inject = 0;
+
+        if (PE_parse_boot_argn("mpr_timeout_test", &inject, sizeof(inject))) {
+            fInjectTimeout = (inject != 0);
+        }
+        setProperty("MPRInjectTimeout",
+                    (unsigned long long)(fInjectTimeout ? 1 : 0), 8);
+    }
 
     /* Failures during bring-up are recorded in IORegistry and never panic
      * the machine or prevent the kext from loading. Config-page reads
