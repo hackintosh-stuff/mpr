@@ -372,6 +372,14 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **未达成**：`SAS_DISCOVERY (0x16)` 与 `SAS_TOPOLOGY_CHANGE_LIST (0x1C)` 未出现，尽管掩码已置位、PortEnable 返回成功。可能原因是该固件在 SAS3008 + SATA 直连配置下不自发 discovery 事件，或事件发生在掩码生效之前。下一步改为**主动读取 config page**（SAS IO Unit Page0/2、SAS Device Page0）建立目标表，不依赖事件；`MPI2_FUNCTION_EVENT_ACK` 尚未实现。
 
+### 9.7 M2-c：SAS IO Unit Page0 读取（2026-11-11，已验证）
+
+新增通用 `readExtConfigPage(extPageType, pageAddress, buffer, size, &actual)`：先发 `PAGE_HEADER`（无 SGE）取 `ExtPageLength`，再发 `PAGE_READ_CURRENT`（64 位 Simple SGE 指向低 4GB 的 512 B 暂存区），两次都用 SMID 4 并经中断等待完成。
+
+**已验证（重启后）**：`com.ling.MPR (0.8.0)`；`MPRM2cState=ok`、`MPRConfigExtStatus=0`、`MPRConfigExtDataStatus=0`、`MPRConfigExtLength=84`（dwords，对应 `MPRSasPageBytes=336`）；`MPRNumPhys=8`；`MPRPhy4DevHandle=9`、`MPRPhy4DeviceInfo=0x71`、`MPRPhy4LinkRate=0xAA`；`MPRAttachedDevHandle=9`、`MPRAttachedPhy=4`。与 Debian 侧只读基线（`sdb` 在 phy-2:4、handle `0x9`、6.0 Gbit）完全一致；无新增 panic。
+
+**待办**：`0x71` / `0xAA` 的位含义需按 `mpi2_sas.h` 逐位核对后再落到 STP/SATA/SSP 判定；下一步用 devhandle 9 读 `SAS Device Page0`，取 SAS address、`DeviceInfo`、`ParentDevHandle`、`PhyNum`、`Slot`，建立 M3 的目标表。
+
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
