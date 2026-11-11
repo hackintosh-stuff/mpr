@@ -1,5 +1,6 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/storage/IOBlockStorageDriver.h>
 #include <IOKit/storage/IOMedia.h>
@@ -875,6 +876,12 @@ MPRController::processReplyQueue(void)
                 }
                 fEventCount++;
                 fEventReplyCount++;
+                if (fLastEvent == MPI2_EVENT_SAS_DEVICE_STATUS_CHANGE ||
+                    fLastEvent == MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST) {
+                    /* Do not call setProperty() while fReplyLock is held;
+                     * the watchdog and the next IO pick this up. */
+                    fTopologyChanged = true;
+                }
                 if (fLastEventAckRequired == MPI2_EVENT_NOTIFICATION_ACK_REQUIRED) {
                     sendEventAck(fLastEvent, fLastEventContext);
                 }
@@ -2131,6 +2138,10 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
     if (actualBytes != NULL) {
         *actualBytes = 0;
     }
+    /* Topology changes are recorded for the watchdog and media state. An
+     * automatic reset here re-enters discovery and can loop on the same
+     * DEVICE_STATUS_CHANGE, so recovery stays on the TMF/offline path until
+     * the event carries a verified handle change. */
     if (fDeviceOffline || fStopping) {
         return kIOReturnDeviceError;
     }
@@ -2683,6 +2694,8 @@ MPRController::start(IOService *provider)
     fLastASCQ = 0;
     fDeviceOffline = false;
     fStopping = false;
+    fTopologyChanged = false;
+    fWatchdogTimer = NULL;
     fInjectTimeout = false;
     fInjectTmfFail = 0;
     fFastPathEnabled = false;
@@ -2724,7 +2737,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.15.10");
+    setProperty("MPRBuild", "0.16.3");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -2750,6 +2763,20 @@ MPRController::start(IOService *provider)
      * the machine or prevent the kext from loading. Config-page reads
      * poll the reply queue and take no interrupts. */
     setupInterrupts();
+    if (getWorkLoop() != NULL) {
+        fWatchdogTimer = IOTimerEventSource::timerEventSource(this,
+            OSMemberFunctionCast(IOTimerEventSource::Action, this,
+                                 &MPRController::watchdogTimeout));
+        if (fWatchdogTimer != NULL &&
+            getWorkLoop()->addEventSource(fWatchdogTimer) == kIOReturnSuccess) {
+            fWatchdogTimer->setTimeoutMS(1000);
+            setProperty("MPRWatchdogState", "armed");
+        } else {
+            setProperty("MPRWatchdogState", "arm-failed");
+        }
+    } else {
+        setProperty("MPRWatchdogState", "no-workloop");
+    }
     if (initializeController() && initializeQueues()) {
         readManufacturingInfo();
         enableEventsAndPort();
@@ -2761,6 +2788,9 @@ MPRController::start(IOService *provider)
         if (probeBlockRead()) {
             publishBlockDevice();
         }
+        /* Discovery completes during bring-up; only later device/topology
+         * changes should drive a reset. */
+        fTopologyChanged = false;
     } else {
         setProperty("MPRConfigPageState", "skipped-earlier-stage-failed");
     }
@@ -2779,6 +2809,11 @@ void
 MPRController::stop(IOService *provider)
 {
     fStopping = true;
+    if (fWatchdogTimer != NULL) {
+        fWatchdogTimer->cancelTimeout();
+        fWatchdogTimer->release();
+        fWatchdogTimer = NULL;
+    }
     teardownInterrupts();
     if (fBlockDev != NULL) {
         fBlockDev->setController(NULL);
@@ -3331,6 +3366,26 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
     }
     setProperty("MPRRecoveryState", recovered ? "ok" : "failed");
     return recovered;
+}
+
+void
+MPRController::watchdogTimeout(IOTimerEventSource *sender)
+{
+    if (fStopping) {
+        return;
+    }
+    if (fTopologyChanged) {
+        setProperty("MPRWatchdogState", "topology-change");
+    } else if (fDeviceOffline) {
+        setProperty("MPRWatchdogState", "offline");
+    } else if (fFrozenSmid != 0) {
+        setProperty("MPRWatchdogState", "frozen");
+    } else {
+        setProperty("MPRWatchdogState", "ok");
+    }
+    if (sender != NULL) {
+        sender->setTimeoutMS(1000);
+    }
 }
 
 void

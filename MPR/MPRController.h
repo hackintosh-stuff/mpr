@@ -12,6 +12,7 @@
 
 class IOPCIDevice;
 class MPRBlockDev;
+class IOTimerEventSource;
 struct IOBlockStorageDeviceExtent;
 
 /* One completion slot per SMID. processReplyQueue() fills it under
@@ -104,6 +105,8 @@ private:
     UInt32                     fInjectTmfFail;   /* mpr_tmf_fail boot-arg */
     bool                       fFastPathEnabled; /* SAS Device Page0 flags */
     bool                       fSuspended;       /* PM sleep in progress */
+    volatile bool              fTopologyChanged; /* SAS discovery event seen */
+    IOTimerEventSource        *fWatchdogTimer;
     UInt32                     fHighPriorityCredit;
     volatile UInt32            fEventReplyCount;
     volatile UInt32            fEventAckCount;
@@ -153,6 +156,7 @@ private:
                                 int index);
     void   processReplyQueue(void);
     void   rescanPartitions(void);
+    void   watchdogTimeout(IOTimerEventSource *sender);
     bool   waitForReply(UInt32 timeoutMs);
     bool   waitForSmid(UInt32 timeoutMs, UInt32 smid);
     bool   takeReplySlot(UInt32 smid, UInt8 *reply, UInt32 replyLen, UInt8 *kind);
