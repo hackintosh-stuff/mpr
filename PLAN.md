@@ -1,6 +1,6 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.8（2026-11-11；M4 代码完成于 0.13.0，尚未编译/部署/验证；待接盘后统一安排读写测试。M3-d 的 `IOMedia` 已在真机验证，ESP 当前仍是 0.12.2）
+状态：草案 v0.8（2026-11-11；M4 代码完成、0.13.0 已编译并部署到 ESP，**尚未重启/加载验证**，内核仍是 0.12.2；待接盘后统一安排读写测试）
 目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA（**已接入；已接 1 块 SATA SSD 测试盘，允许读写**）
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
@@ -439,7 +439,7 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 ### 9.13 M4：读写与恢复代码（2026-11-11，代码完成，未做真机验证）
 
-本轮只写代码：**没有部署 kext、没有重启、没有接测试盘**。ESP 仍是 0.12.2；0.13.0 只是源码与构建脚本版本。目标机当时处于 Debian，本机也没有可用的 macOS kext 编译工具链，因此本节所有功能都尚未编译或加载验证。
+代码完成后已编译并部署到 ESP，但**没有重启、没有接测试盘**：ESP 上是 0.13.0，内核仍加载 0.12.2。本节所有 M4 功能都尚未加载/真机验证。
 
 - **写**：`reportWriteProtection` 返回 false，`doAsyncReadWrite` 接受 `kIODirectionOut`；`readBlocks` 泛化为 `transferBlocks(write, ...)`，写时先把 `IOMemoryDescriptor` 的数据搬入常驻低 4GB 暂存缓冲，再提交 M3-c 已验证的 WRITE(10)（`0x2A`）。M3 的读路径保持同步分块、轮换 SMID 与三次重试。
 - **SYNCHRONIZE CACHE(10)**（`0x35`）：覆写 `doSynchronize` / `doSynchronizeCache`，无数据阶段、零长度 IEEE SGE；16 位块数为 0 表示刷到介质末尾。
@@ -449,4 +449,4 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 - **MPI**：`MPRScsiTaskMgmtRequest` / `Reply` 按 FreeBSD `mpi2_init.h` 布局落到 `MPI/mpi2_min.h`（0x34 / 0x1C，附 `static_assert`）。
 - **诊断属性**：`MPRM4Features`、`MPRM4SenseKey/ASC/ASCQ`、`MPRM4MappedStatus`、`MPRM4Tmf*`、`MPRM4FrozenSmid`、`MPRM4Recovery`、`MPRM4ReinitState`、`MPRM4ResetCount`、`MPRM4UnmapDisabled`。
 
-**验证状态**：本机 `py -3` 静态检查通过（控制器 12 个 / nub 5 个方法的声明与定义、MPI 常量、TM 结构布局、括号平衡）；WSL g++ 无法解析 MacKernelSDK 的 clang 专有头，故 **0.13.0 未经编译器验证**。接盘后的统一测试须先在 macOS 上执行 `tools/build-noxcode.sh`，编译通过后再部署与重启，并按 §6 的 M4 验收项安排 `dd` 写后回读、`diskutil` 分区/卸载、超时注入与 24 h 混合读写。
+**验证状态**：本机 `py -3` 静态检查通过（控制器 12 个 / nub 5 个方法的声明与定义、MPI 常量、TM 结构布局、括号平衡）；0.13.0 已在 macOS 26.7.2 用 Apple clang 21 执行 `tools/build-noxcode.sh` 完成编译、链接与 ad-hoc 签名，`plutil -lint`、`MH_KEXT_BUNDLE` 和全部驱动内部符号校验通过。已按名称 / Device Location / 容量 / ESP UUID 动态定位部署到内部 SanDisk 的 ESP（备份 `MPR.kext.bak_m4_20261111`，`config.plist` 校验和不变），**未重启**，因此尚未加载验证。接盘后的统一测试须先重启确认 `com.ling.MPR (0.13.0)` 与 `IOMedia` 正常，再按 §6 的 M4 验收项安排 `dd` 写后回读、`diskutil` 分区/卸载、超时注入与 24 h 混合读写。
