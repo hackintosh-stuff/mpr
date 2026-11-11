@@ -402,6 +402,14 @@ IOC Facts 与 Debian 侧只读基线交叉一致：固件 `MPRFactsFWVersion=0x0
 
 **下一步 M3-b**：以 `IOBlockStorageDevice` 子类暴露该盘，实现 READ CAPACITY(16) / READ(16)，注册 `IOMedia`。
 
+### 9.10 M3-b：READ CAPACITY（2026-11-11，已验证）
+
+先发 READ CAPACITY(16)（CDB `9E 10`），SATA 桥以 `SCSIStatus=2`（CHECK CONDITION）拒绝——SATA 走 SAT 翻译，不支持 SERVICE ACTION IN(16)；回退 READ CAPACITY(10)（CDB `25`）成功。16 字节 CDB 用 `IoFlags = 16 | FAST_PATH`，SGE 仍为 IEEE。
+
+**已验证（重启后）**：`com.ling.MPR (0.10.1)`；`MPRM3bState=ok`、`MPRCapacityKind=rc10`、`MPRCapacityLastLba=468862127`、`MPRCapacityBlocks=468862128`、`MPRCapacityBlockSize=512`，即 240,057,409,536 B（240.06 GB），与 Debian 侧 `PCCOOLER SSD T200 240GB` 一致。无新增 panic。
+
+**下一步 M3-c**：`IOBlockStorageDevice` 子类（`doAsyncReadWrite` / `reportBlockSize` / `reportMaxValidBlock` / `getVendorString` 等）注册为 nub，由 IOStorageFamily 的 `IOBlockStorageDriver` 生成 `IOMedia`；读写用 READ(16)/WRITE(16)（必要时回退 10 字节），数据缓冲需扩展为按块传输的低 4GB 池。
+
 **后续里程碑（本轮用户已授权 M1-a 部署与必要重启）**：
 
 1. 反编译 `AppleVirtIOBlockStorageDevice::start` / `doAsyncReadWrite` 作为 `MPRBlockDev` 实现模板；从 FreeBSD `mpi/*.h` 裁剪 MPI2.5 结构落到 `MPI/`，保留版权头。
