@@ -1465,6 +1465,113 @@ MPRController::scsiInquiry(void)
 }
 
 bool
+MPRController::scsiReadCapacity16(void)
+{
+    static const UInt8 cdb[16] = {
+        0x9E, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20
+    };
+    MPRScsiIoRequest *request;
+    MPRScsiIoReply *reply;
+    UInt8 *frame, *data;
+    UInt64 lastLba = 0;
+    UInt32 blockSize, i;
+    bool posted;
+
+    if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fPageBuffer == NULL) {
+        setProperty("MPRM3bFailure", "no attached device or buffer");
+        return false;
+    }
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return false;
+    }
+    frame += 7 * fRequestFrameSize;     /* SMID 7 */
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPRScsiIoRequest *)frame;
+
+    request->DevHandle = (UInt16)fAttachedDevHandle;
+    request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
+    request->SenseBufferLowAddress = (UInt32)(fPagePhys + MPR_SENSE_OFFSET);
+    request->SenseBufferLength = 96;
+    request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
+    request->DataLength = 32;
+    request->IoFlags = (UInt16)(16 | MPI25_SCSIIO_IOFLAGS_FAST_PATH);
+    request->Control = MPI2_SCSIIO_CONTROL_READ;
+    memcpy(request->CDB, cdb, sizeof(cdb));
+    mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fPagePhys, 32);
+
+    memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
+    fReplyCount = 0;
+    fLastReplyKind = 0;
+    fLastReplySmid = 0xFFFF;
+    postScsiIo(7);
+    posted = waitForReply(15000) && (fLastReplySmid == 7);
+    if (!posted) {
+        setProperty("MPRM3bFailure", "READ CAPACITY(16) timeout");
+        return false;
+    }
+    if (fLastReplyKind == 1) {
+        reply = (MPRScsiIoReply *)fLastReply;
+        setProperty("MPRScsiIOCStatus",
+                    (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+        setProperty("MPRScsiStatus", (unsigned long long)reply->SCSIStatus, 8);
+        if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS ||
+            reply->SCSIStatus != 0) {
+            setProperty("MPRM3bFailure", "READ CAPACITY(16) status");
+            return false;
+        }
+    }
+
+    data = (UInt8 *)fPageBuffer->getBytesNoCopy();
+    if (data == NULL) {
+        return false;
+    }
+    for (i = 0; i < 8; i++) {
+        lastLba = (lastLba << 8) | (UInt64)data[i];
+    }
+    blockSize = ((UInt32)data[8] << 24) | ((UInt32)data[9] << 16) |
+                ((UInt32)data[10] << 8) | (UInt32)data[11];
+
+    setProperty("MPRCapacityLastLba", lastLba, 64);
+    setProperty("MPRCapacityBlockSize", (unsigned long long)blockSize, 32);
+    setProperty("MPRCapacityBlocks", lastLba + 1, 64);
+    IOLog("MPR M3b: READ CAPACITY(16) blocks=%llu blockSize=%u\n",
+          (unsigned long long)(lastLba + 1), (unsigned int)blockSize);
+    return blockSize != 0;
+}
+
+bool
+MPRController::runM3b(void)
+{
+    IOByteCount segLength;
+    bool ok;
+
+    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
+    if (fPageBuffer == NULL) {
+        setProperty("MPRM3bState", "failed-alloc");
+        return false;
+    }
+    fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+    if (fPagePhys == 0 || segLength < MPR_PAGE_BUF_BYTES ||
+        (fPagePhys + MPR_PAGE_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
+        setProperty("MPRM3bState", "failed-alloc");
+        return false;
+    }
+
+    ok = scsiReadCapacity16();
+    setProperty("MPRM3bState", ok ? "ok" : "failed");
+
+    if (fPageBuffer != NULL) {
+        fPageBuffer->release();
+        fPageBuffer = NULL;
+    }
+    fPagePhys = 0;
+    return ok;
+}
+
+bool
 MPRController::runM3a(void)
 {
     IOByteCount segLength;
@@ -1733,8 +1840,8 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOBAR", "0x14");
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
-    setProperty("MPRStage", "M3a");
-    setProperty("MPRBuild", "0.9.7");
+    setProperty("MPRStage", "M3b");
+    setProperty("MPRBuild", "0.10.0");
 
     /* Failures inside M1-a/M1-b/M1-c are recorded in IORegistry and never
      * panic the machine or prevent the kext from loading. M1-c reads one
@@ -1745,6 +1852,7 @@ MPRController::start(IOService *provider)
         runM2b();
         runM2c();
         runM3a();
+        runM3b();
     } else {
         setProperty("MPRM1cState", "skipped-earlier-stage-failed");
     }

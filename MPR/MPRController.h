@@ -110,6 +110,8 @@ private:
     bool   scsiTur(void);
     bool   scsiInquiry(void);
     bool   runM3a(void);
+    bool   scsiReadCapacity16(void);
+    bool   runM3b(void);
 
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
