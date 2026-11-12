@@ -535,7 +535,11 @@ macOS 通过 FSKit 挂载卷后会写元数据。
 
 根因在 `recoverTimedOutCommand()`：`recovered` 虽为真，但 `removed = fRemovalPending` 被一条**没有物理拔插**的 `PHY_CHANGED` 锁存，于是走 `invalidateMedia()`。这正是 0.17.21「附着 phy 的任何变化即视为移除」规则的已知代价；该规则保证 2 秒快速拔插必定下线旧媒体，用户决定保留它，接受注入超时附带一次确定性重建。
 
-两轮结束后环境均已复原：MSR 窗口 `4fc4669e12c460f2`、`fsck_exfat -n` OK、`config.plist` 回到基线 `71b96d2b…857954f`、重启后 `MPRInjectEvery=0`。**完整的 30 分钟注入长跑仍待重跑**（脚本已修并部署）。
+两轮结束后环境均已复原：MSR 窗口 `4fc4669e12c460f2`、`fsck_exfat -n` OK、`config.plist` 回到基线 `71b96d2b…857954f`、重启后 `MPRInjectEvery=0`。
+
+**第三轮（04:31:43 → 04:36:45）**：修复版脚本已部署，标记正常落盘，`stop=unexpected-reset`。这轮的提前结束是**验收判据没改**：口头确定了"注入引起的复位属预期"，但脚本里仍把 `MPRResetCount` 变化当作失败。1 次注入后仍是同样的 ABORT 成功 → `invalidateMedia` → 一次 hotplug 复位 → generation 1→3、`RecoveryState=ok`、`StickyFaultCode=0`、参考区 `bf038d4f…` 不变；`ref: unavailable` 出现 3 次（容错生效，没有崩）。复位期间介质以新 BSD 号重新发布，脚本持有的旧 `/dev/rdisk5` 句柄失效，于是后续 I/O 以 0.01–0.02 ms 快速报错（约 3.4 万次），`nprops` 237→274 是恢复路径新发布的一次性诊断属性，不是持续膨胀。
+
+三轮给了同一个结论：单次注入的处理是确定、有界、可恢复的（无 panic、无 sticky fault、媒体总能回到在线），且该规则的代价就是一次重建。要跑满 30 分钟，需要重写测试夹具——介质重建后按新 BSD 号重新打开设备、把复位与短时错误纳入预期——这属于测试工具改造，不是驱动功能缺口。**注入长跑在此收口为"多轮短程已验证恢复链，完整长跑未跑满"**。环境已再次复原（窗口哈希、fsck、参考区、boot-args 基线、重启后 `MPRInjectEvery=0`）。
 
 ### 10.11 仍然不覆盖的范围
 
