@@ -441,7 +441,29 @@ macOS 通过 FSKit 挂载卷后会写元数据。
 `PHY_CHANGED` 现在本身就是移除等价条件（链路重协商只可能发生在断开之后），
 第 3 轮据此完成下线。全程无 panic，窗口每次测试后逐字节还原。
 
-### 10.6 仍然不覆盖的范围
+### 10.6 下一项：异步命令池（设计已定，未实施）
+
+实测决定了这一步的必要性：读 256 MiB 为 4.245 s（63.2 MB/s），写 15 MiB 为
+0.275 s（57.2 MB/s），恰好等于"64 KiB ÷ 每命令约 1 ms"。吞吐完全由单命令
+串行的往返延迟决定；`bs=512` 时 4 MiB 需要 8,192 次请求、耗时 8.9 s
+（0.47 MB/s）也是同一原因。
+
+实施顺序（两步一起验证，但保留可回退的中间态）：
+
+1. **拆半程**：从 `scsiReadWrite()` 抽出 `scsiPostIo()`（建帧、填 SGE、提交）
+   与 `scsiWaitChunk()`（`waitForSmid` → `takeReplySlot` → IOC/SCSI 状态、
+   短传输、sense 分类 → 超时进 `recoverTimedOutCommand`），`scsiReadWrite()`
+   变成两者串联，探针路径行为不变。
+2. **4 窗口批处理**：数据缓冲由 64 KiB 扩为 4 × 64 KiB 物理连续池，窗口 i 的
+   物理地址为 `fDataPhys + i * 65536`、SMID 固定为 `10 + i`；`transferBlocks()`
+   改为"填满 4 个 → 按序收割 → 再填 4 个"。`maxBlocks` 必须改成按**单窗口**
+   （128 块）计算，不能再用 `fDataBytes / fBlockSize`，否则分块会变成 256 KiB。
+3. **失败语义**：任一命令失败时，先收割其余已提交命令再返回，确保固件不再
+   占有这些窗口；收割超时则升级为受限 IOC 复位。写仍不重试。
+4. 验收：读/写吞吐对比、`bs=512` 小请求不退化、写在途与读在途各一轮真实
+   拔插、`MPRWriteCount` 计数口径与新批处理对齐。
+
+### 10.7 仍然不覆盖的范围
 
 单目标、直连 SATA 原型：没有多目标隔离，没有逐目标 TARGET_RESET /
 REMOVE_DEVICE 协议，没有 SAS expander 或 RAID 卷；仍是单一暂存缓冲 + `fIOLock`
