@@ -115,6 +115,9 @@ An async request carries the originating DevHandle, and the worker resolves
 geometry, admission and fast-path capability from that target's slot. The
 request frame supplies the DevHandle that `postOwnedRequestLocked()` records,
 so completions stay bound to the owning target.
+fast-path request descriptor from that same frame: the IOC takes the DevHandle
+from the descriptor's high word, so using the controller's default handle
+there would send every target's commands to one disk.
 
 Access is fail-closed. `MPRWritableDevices` in the kext personality is an array
 of Model/Serial rules; only a disk whose ATA model and serial match a rule with

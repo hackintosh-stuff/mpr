@@ -268,7 +268,7 @@ MPRBlockDev::reportWriteProtection(bool *isWriteProtected)
      * lifetime, so a newly attached ZFS member can never receive a write. */
     MPRController *controller = copyController();
     *isWriteProtected = fReadOnly || controller == NULL ||
-                        !controller->isMediaPresent();
+                        !controller->isMediaPresentForHandle(fDevHandle);
     if (controller != NULL) controller->release();
     return kIOReturnSuccess;
 }

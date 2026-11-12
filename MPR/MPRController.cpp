@@ -1746,6 +1746,16 @@ bool
 MPRController::postScsiIo(UInt32 smid)
 {
     if (fReplyLock == NULL || smid == 0 || smid >= 128) return false;
+    /* A fast-path request descriptor carries the DevHandle in its high word,
+     * and the IOC uses that copy rather than the request frame. It must come
+     * from the frame of this particular command, never from the controller's
+     * single default handle, or every target's I/O goes to one disk. */
+    UInt8 *base = fRequestBuffer != NULL ?
+        (UInt8 *)fRequestBuffer->getBytesNoCopy() : NULL;
+    if (base == NULL) return false;
+    const UInt8 *frame = base + (UInt64)smid * fRequestFrameSize;
+    UInt16 handle = (UInt16)((UInt16)frame[0] | ((UInt16)frame[1] << 8));
+    if (handle == 0) handle = (UInt16)fAttachedDevHandle;
     UInt32 flags = fFastPathEnabled
                        ? MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO
                        : MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO;
@@ -1759,7 +1769,7 @@ MPRController::postScsiIo(UInt32 smid)
         return false;
     }
     bool posted = postOwnedRequestLocked(smid, flags,
-                                        (fAttachedDevHandle & 0xFFFF) << 16);
+                                        (UInt32)handle << 16);
     IOSimpleLockUnlock(fReplyLock);
     if (!posted) cancelUnpostedCommand(smid);
     return posted;
@@ -2780,11 +2790,29 @@ MPRController::publishTargets(void)
         fTargetIdentityValid = false;
         fCapacityBlocks = 0;
         fBlockSize = 0;
-        if (!readSasDevicePage0(slot->handle) || !probeScsiIdentity() ||
-            !probeCapacity() || !probeBlockRead() || !prepareTargetMedia()) {
-            char name[40];
+        /* Identity strings are probed per target: SSP devices have no ATA
+         * IDENTIFY, so leaving the previous SATA serial in place would make
+         * the write rule match the wrong disk. */
+        fTargetModel[0] = 0;
+        fTargetSerial[0] = 0;
+        /* The topology enumeration already captured this target's device
+         * page fields. Reuse them instead of re-reading config pages while
+         * the start path still owns the shared management SMID. */
+        fTargetDeviceInfo = slot->deviceInfo;
+        fTargetDeviceFlags = slot->flags;
+        fTargetSasAddress = slot->sasAddress;
+        fFastPathEnabled = slot->fastPath;
+        const char *stage = NULL;
+        if (!probeScsiIdentity()) stage = "scsi-identity";
+        else if (!probeCapacity()) stage = "capacity";
+        else if (!probeBlockRead()) stage = "block-read";
+        else if (!prepareTargetMedia()) stage = "media";
+        if (stage != NULL) {
+            char name[48];
             snprintf(name, sizeof(name), "MPRTarget%uProbe", i);
             setProperty(name, "failed");
+            snprintf(name, sizeof(name), "MPRTarget%uProbeStage", i);
+            setProperty(name, stage);
             continue;
         }
         slot->capacityBlocks = fCapacityBlocks;
@@ -2793,7 +2821,13 @@ MPRController::publishTargets(void)
         strlcpy(slot->identity, fTargetIdentity, sizeof(slot->identity));
         strlcpy(slot->model, fTargetModel, sizeof(slot->model));
         strlcpy(slot->serial, fTargetSerial, sizeof(slot->serial));
-        slot->readOnly = !isWritableIdentity(slot->model, slot->serial);
+        /* Only a SATA/STP disk with an explicit identity rule may be writable.
+         * SSP targets such as the ZFS array member are always read-only, even
+         * if a rule would otherwise match a stale identity. */
+        bool sataTarget =
+            (slot->deviceInfo & MPI2_SAS_DEVICE_INFO_SATA_DEVICE) != 0;
+        slot->readOnly = !sataTarget ||
+                         !isWritableIdentity(slot->model, slot->serial);
         slot->generation = ++fMediaGeneration;
         slot->present = true;
         if (!publishTarget(slot)) {
@@ -4204,6 +4238,15 @@ MPRController::hotplugThread(void)
     physicalChange = fPhysicalChangePending;
     fPhysicalChangePending = false;
     IOSimpleLockUnlock(fReplyLock);
+
+    /* Per-target removal and recovery are not wired yet. With several
+     * published targets the single-target rebuild below would tear down every
+     * medium and republish one arbitrary disk, so keep the steady state. */
+    if (fTargetCount > 1 && !removal && !retryRequested &&
+        !fDeviceOffline && !fProtocolRecoveryPending && !fMediaOfflinePending) {
+        state = "multi-target-steady";
+        goto done;
+    }
 
     oldHandle = fAttachedDevHandle;
     if (physicalChange || retryRequested) fRequireSameIdentity = false;
