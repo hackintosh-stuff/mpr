@@ -2702,7 +2702,9 @@ MPRController::start(IOService *provider)
     fWatchdogTimer = NULL;
     fHotplugCall = NULL;
     fHotplugPending = false;
-    fHotplugCooldown = 0;
+    /* Ignore discovery noise for the first seconds after boot; the initial
+     * media is already published by start(). Real cable swaps happen later. */
+    fHotplugCooldown = 10;
     fInjectTimeout = false;
     fInjectTmfFail = 0;
     fFastPathEnabled = false;
@@ -2744,7 +2746,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.5");
+    setProperty("MPRBuild", "0.17.9");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3420,32 +3422,75 @@ MPRController::hotplugCall(thread_call_param_t param0,
 void
 MPRController::hotplugThread(void)
 {
+    bool resetOk;
+
     if (fStopping || fReinitInProgress) {
         return;
     }
-    /* The event is followed by a full controller reset: it quiesces the IOC,
-     * re-runs discovery and rebuilds the nub/media. A same-handle discovery
-     * retry ends up here once, then fHotplugPending stays clear. */
-    {
-        bool resetOk = resetAndReinitialize();
 
-        setProperty("MPRHotplugResetResult", resetOk ? "ok" : "failed");
-        setProperty("MPRHotplugBlockDev",
-                    (unsigned long long)(fBlockDev != NULL ? 1 : 0), 8);
-        setProperty("MPRHotplugHandle",
-                    (unsigned long long)fAttachedDevHandle, 16);
-        if (resetOk) {
-            setProperty("MPRHotplugState",
-                        fAttachedDevHandle != 0 ? "rebuilt" : "removed");
-        } else {
-            setProperty("MPRHotplugState", "reset-failed");
+    /* probeScsiIdentity()/probeCapacity() release the page buffer when they
+     * finish; a failed reset can therefore leave discovery without one. */
+    if (fPageBuffer == NULL) {
+        IOByteCount segLength;
+
+        fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+            MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
+        if (fPageBuffer != NULL) {
+            fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength,
+                                                        kIOMemoryMapperNone);
         }
     }
-    /* Discovery completes for several seconds after the reset; do not let
-     * those events trigger another rebuild. */
-    fHotplugPending = false;
-    fTopologyChanged = false;
-    fHotplugCooldown = 5;
+
+    /* While the target is gone, do not reset the controller on every retry.
+     * Probe discovery first; when it is still absent, drop the stale nub and
+     * keep a short retry armed. */
+    if (fAttachedDevHandle == 0) {
+        fReplyCount = 0;
+        fLastReplyKind = 0;
+        fLastReplySmid = 0xFFFF;
+        if (!readSasIOUnitPage0() || fAttachedDevHandle == 0) {
+            if (fBlockDev != NULL) {
+                fBlockDev->setController(NULL);
+                fBlockDev->terminate();
+                fBlockDev->detach(this);
+                fBlockDev->release();
+                fBlockDev = NULL;
+            }
+            fCapacityBlocks = 0;
+            fBlockSize = 0;
+            fDeviceOffline = true;
+            setProperty("MPRHotplugState", "removed");
+            setProperty("MPRHotplugResetResult", "waiting");
+            setProperty("MPRHotplugBlockDev", 0ULL, 8);
+            setProperty("MPRHotplugHandle", 0ULL, 16);
+            fHotplugPending = true;
+            fHotplugCooldown = 1;
+            return;
+        }
+    }
+
+    /* Present (or reappeared): rebuild via the verified reset path. Clear the
+     * offline gate so IOBlockStorageDriver can read LBA1 while probing. */
+    fDeviceOffline = false;
+    resetOk = resetAndReinitialize();
+    setProperty("MPRHotplugResetResult", resetOk ? "ok" : "failed");
+    setProperty("MPRHotplugBlockDev",
+                (unsigned long long)(fBlockDev != NULL ? 1 : 0), 8);
+    setProperty("MPRHotplugHandle",
+                (unsigned long long)fAttachedDevHandle, 16);
+    if (resetOk) {
+        setProperty("MPRHotplugState",
+                    fAttachedDevHandle != 0 ? "rebuilt" : "removed");
+        fHotplugPending = false;
+        fTopologyChanged = false;
+        fHotplugCooldown = 5;
+    } else {
+        setProperty("MPRHotplugState", "reset-failed");
+        fDeviceOffline = true;
+        fHotplugPending = true;
+        fHotplugCooldown = 1;
+    }
 }
 
 void
@@ -3603,7 +3648,7 @@ MPRController::resetAndReinitialize(void)
             fBlockDev->release();
             fBlockDev = NULL;
         }
-        IOSleep(100);
+        IOSleep(500);
         ok = publishBlockDevice();
     }
     return ok;
