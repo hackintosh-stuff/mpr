@@ -269,6 +269,10 @@ private:
     bool   scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
                          UInt32 blockSize, UInt32 smid, bool diagnostics,
                          bool fua, IOReturn *status = NULL);
+    bool   scsiPostIo(bool write, UInt64 lba, UInt32 blocks, UInt32 blockSize,
+                      UInt32 smid, bool fua, UInt64 dataPhys,
+                      IOReturn *status);
+    bool   scsiWaitChunk(UInt32 smid, UInt32 dataLen, IOReturn *status);
     bool   probeBlockRead(void);
 
     bool   allocatePageBuffer(void);

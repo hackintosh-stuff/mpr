@@ -59,8 +59,12 @@ OSDefineMetaClassAndStructors(MPRController, IOService)
 /* sense buffer lives in the upper half of the page staging buffer. */
 #define MPR_SENSE_OFFSET        0x100
 
-/* bulk transfer staging buffer. */
+/* bulk transfer staging buffers: one window per in-flight command so a single
+ * request can keep several chunk commands outstanding instead of paying the
+ * per-command round trip serially. fDataBytes stays the window size. */
 #define MPR_DATA_BUF_BYTES      65536
+#define MPR_IO_SLOTS            4
+#define MPR_DATA_POOL_BYTES     (MPR_DATA_BUF_BYTES * MPR_IO_SLOTS)
 #define MPR_SM_EVENT_ACK        31
 
 enum {
@@ -2405,6 +2409,154 @@ MPRController::probeBlockRead(void)
     return ok;
 }
 
+/* Split command submission from completion so one block request can keep
+ * MPR_IO_SLOTS chunk commands outstanding. Each slot owns SMID 10..13, its own
+ * request frame and its own 64 KiB window inside the staging pool; the sense
+ * area is shared, so on a multi-command failure only one sense may be valid
+ * and the SCSI/IOC status is what the caller acts on. */
+bool
+MPRController::scsiPostIo(bool write, UInt64 lba, UInt32 blocks,
+                          UInt32 blockSize, UInt32 smid, bool fua,
+                          UInt64 dataPhys, IOReturn *outStatus)
+{
+    UInt8 cdb[10];
+    MPRScsiIoRequest *request;
+    UInt8 *frame;
+    UInt32 dataLen = blocks * blockSize;
+
+    if (outStatus != NULL) *outStatus = kIOReturnNotReady;
+    if (fAttachedDevHandle == 0 || fRequestBuffer == NULL ||
+        fDataBuffer == NULL || fPageBuffer == NULL) {
+        return false;
+    }
+    if (dataLen == 0 || dataLen > MPR_DATA_BUF_BYTES || dataPhys == 0 ||
+        lba > 0xFFFFFFFFULL || blocks == 0 || blocks > 0xFFFF) {
+        return false;
+    }
+
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = write ? 0x2A : 0x28;           /* WRITE(10) / READ(10) */
+    if (write && fua) {
+        cdb[1] |= 0x08;                     /* force unit access */
+    }
+    cdb[2] = (UInt8)(lba >> 24);
+    cdb[3] = (UInt8)(lba >> 16);
+    cdb[4] = (UInt8)(lba >> 8);
+    cdb[5] = (UInt8)lba;
+    cdb[7] = (UInt8)(blocks >> 8);
+    cdb[8] = (UInt8)blocks;
+
+    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        return false;
+    }
+    frame += smid * fRequestFrameSize;
+    memset(frame, 0, fRequestFrameSize);
+    request = (MPRScsiIoRequest *)frame;
+    request->DevHandle = (UInt16)fAttachedDevHandle;
+    request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
+    request->SenseBufferLowAddress = (UInt32)(fPagePhys + MPR_SENSE_OFFSET);
+    request->SenseBufferLength = 96;
+    request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
+    request->DataLength = dataLen;
+    request->IoFlags = (UInt16)(sizeof(cdb) |
+                                (fFastPathEnabled
+                                     ? MPI25_SCSIIO_IOFLAGS_FAST_PATH : 0));
+    request->Control = write ? MPI2_SCSIIO_CONTROL_WRITE : MPI2_SCSIIO_CONTROL_READ;
+    memcpy(request->CDB, cdb, sizeof(cdb));
+    mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, dataPhys, dataLen);
+
+    if (!postScsiIo(smid)) {
+        if (outStatus != NULL) *outStatus = kIOReturnNoMedia;
+        return false;
+    }
+    if (outStatus != NULL) *outStatus = kIOReturnSuccess;
+    return true;
+}
+
+bool
+MPRController::scsiWaitChunk(UInt32 smid, UInt32 dataLen, IOReturn *outStatus)
+{
+    UInt8 replyBuf[64];
+    UInt8 replyKind = 0;
+    MPRScsiIoReply *reply;
+    IOReturn mapped = kIOReturnIOError;
+
+    if (outStatus != NULL) *outStatus = kIOReturnNotReady;
+    if (!waitForSmid(15000, smid)) {
+        setProperty("MPRLastIOFailure", "reply-timeout");
+        setProperty("MPRLastIOSmid", (unsigned long long)smid, 16);
+        if (fTimedOutSmid == (UInt16)smid) {
+            if (fReinitInProgress || fStarting) {
+                recordProtocolFault(kMPRProtocolManagementTimeout, smid);
+            } else {
+                recoverTimedOutCommand(smid);
+            }
+        }
+        return false;
+    }
+    if (!takeReplySlot(smid, replyBuf, sizeof(replyBuf), &replyKind)) {
+        setProperty("MPRLastIOFailure", "reply-slot-missing");
+        return false;
+    }
+    if (replyKind == 2) {
+        if (outStatus != NULL) *outStatus = kIOReturnSuccess;
+        return true;
+    }
+    if (replyKind != 1 || replyBuf[3] != MPI2_FUNCTION_SCSI_IO_REQUEST ||
+        replyBuf[2] * 4U < MPR_SCSIIO_REPLY_MIN_BYTES) {
+        noteBadReply(2, (UInt32)replyKind, smid, replyBuf, sizeof(replyBuf));
+        recordProtocolFault(kMPRProtocolManagementReply, smid);
+        if (outStatus != NULL) *outStatus = kIOReturnIOError;
+        return false;
+    }
+    reply = (MPRScsiIoReply *)replyBuf;
+    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS &&
+        reply->SCSIStatus == 0) {
+        if (reply->TransferCount < dataLen) {
+            setProperty("MPRLastIOFailure", "short-transfer");
+            setProperty("MPRLastIOTransferCount",
+                        (unsigned long long)reply->TransferCount, 32);
+            setProperty("MPRLastIOExpected", (unsigned long long)dataLen, 32);
+            if (outStatus != NULL) *outStatus = kIOReturnUnderrun;
+            return false;
+        }
+        if (outStatus != NULL) *outStatus = kIOReturnSuccess;
+        return true;
+    }
+    setProperty("MPRLastIOFailure", "scsi-status");
+    setProperty("MPRLastIOSmid", (unsigned long long)smid, 16);
+    setProperty("MPRLastIOReplyKind", (unsigned long long)replyKind, 8);
+    setProperty("MPRLastIOIOCStatus",
+                (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+    setProperty("MPRLastIOSCSIStatus", (unsigned long long)reply->SCSIStatus, 8);
+    setProperty("MPRLastIOTransferCount",
+                (unsigned long long)reply->TransferCount, 32);
+    setProperty("MPRLastIOSCSIState", (unsigned long long)reply->SCSIState, 8);
+    setProperty("MPRLastIOSenseCount", (unsigned long long)reply->SenseCount, 32);
+    setProperty("MPRLastIOResponseInfo",
+                (unsigned long long)reply->ResponseInfo, 32);
+    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
+        mapped = kIOReturnDeviceError;
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_CHECK_CONDITION) {
+        if ((reply->SCSIState & MPI2_SCSI_STATE_AUTOSENSE_VALID) == 0 ||
+            reply->SenseCount < 8) {
+            mapped = kIOReturnDeviceError;
+        } else {
+            mapped = decodeSense(kIOReturnIOError);
+        }
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_BUSY ||
+               reply->SCSIStatus == MPI2_SCSI_STATUS_TASK_SET_FULL ||
+               reply->SCSIStatus == MPI2_SCSI_STATUS_RESERVATION_CONFLICT) {
+        mapped = kIOReturnBusy;
+    } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_TASK_ABORTED) {
+        mapped = kIOReturnAborted;
+    }
+    setProperty("MPRSenseStatus", (unsigned long long)(UInt32)mapped, 32);
+    if (outStatus != NULL) *outStatus = mapped;
+    return false;
+}
+
 /* ------------------------------------------------------------------------ */
 /* IOBlockStorageDevice nub, IOMedia, and the block read path.        */
 
@@ -2419,6 +2571,7 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
     UInt32 generation = fMediaGeneration;
     IOByteCount copied, chunkBytes;
     IOReturn status;
+    bool retried = false;
 
     if (actualBytes != NULL) {
         *actualBytes = 0;
@@ -2487,14 +2640,14 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
         maxBlocks = 0xFFFFULL;
     }
 
-    while (done < byteCount) {
-        UInt32 smid, attempt;
-        UInt64 lba;
-        bool ok = false;
-        IOReturn ioStatus = kIOReturnSuccess;
-        /* A write whose result is unknown must not be replayed blindly.
-         * Reads tolerate the UNIT ATTENTION a SATA link raises after reset. */
-        UInt32 maxAttempts = write ? 1 : 5;
+    while (done < byteCount && fDataBuffer != NULL) {
+        UInt32 batch = 0, i;
+        UInt32 slotBlocks[MPR_IO_SLOTS];
+        UInt64 slotOff[MPR_IO_SLOTS];
+        UInt64 batchBytes = 0;
+        bool failed = false;
+        IOReturn failStatus = kIOReturnSuccess;
+        UInt8 *pool = (UInt8 *)fDataBuffer->getBytesNoCopy();
 
         if (generation != fMediaGeneration || !fMediaPresent ||
                 mediaRemovalPending()) {
@@ -2505,110 +2658,125 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
             break;
         }
         if (fDeviceOffline || fStopping || fReinitInProgress ||
-            fProtocolRecoveryPending) {
+            fProtocolRecoveryPending || pool == NULL) {
             setProperty("MPRBlockRejectReason",
                         fStopping ? "chunk-stopping" :
                         fReinitInProgress ? "chunk-reinit" :
-                        fDeviceOffline ? "chunk-device-offline" : "chunk-protocol-recovery");
+                        fDeviceOffline ? "chunk-device-offline" :
+                        fProtocolRecoveryPending ? "chunk-protocol-recovery" :
+                        "buffers");
             status = kIOReturnNotReady;
             break;
         }
-        remaining = byteCount - done;
-        want = remaining / fBlockSize;
-        if (want > maxBlocks) {
-            want = maxBlocks;
+
+        /* Fill every free window before waiting on the first one, so the
+         * per-command round trip is paid once per batch instead of per chunk.
+         * A write whose result is unknown is never re-posted: the batch only
+         * retries after a UNIT ATTENTION, which cannot lose data. */
+        while (batch < MPR_IO_SLOTS && (done + batchBytes) < byteCount) {
+            UInt64 chunkOff = done + batchBytes;
+            UInt64 lba = block + chunkOff / fBlockSize;
+            UInt64 window = fDataPhys + (UInt64)batch * MPR_DATA_BUF_BYTES;
+            IOReturn posted = kIOReturnSuccess;
+
+            remaining = byteCount - chunkOff;
+            want = remaining / fBlockSize;
+            if (want > maxBlocks) {
+                want = maxBlocks;
+            }
+            chunkBlocks = (UInt32)want;
+            chunkBytes = (IOByteCount)((UInt64)chunkBlocks * fBlockSize);
+
+            if (write) {
+                copied = buffer->readBytes((IOByteCount)chunkOff,
+                                           pool + (UInt64)batch * MPR_DATA_BUF_BYTES,
+                                           chunkBytes);
+                if (copied != chunkBytes) {
+                    setProperty("MPRCommandFailure", "stage-write");
+                    setProperty("MPRCommandDoneBytes", chunkOff, 64);
+                    status = kIOReturnUnderrun;
+                    failed = true;
+                    break;
+                }
+            }
+            if (!scsiPostIo(write, lba, chunkBlocks, fBlockSize, 10 + batch,
+                            fua, window, &posted)) {
+                failed = true;
+                failStatus = posted;
+                break;
+            }
+            slotBlocks[batch] = chunkBlocks;
+            slotOff[batch] = chunkOff;
+            batchBytes += (UInt64)chunkBytes;
+            fIoCount++;
+            batch++;
         }
-        chunkBlocks = (UInt32)want;
-        chunkBytes = (IOByteCount)((UInt64)chunkBlocks * fBlockSize);
-        lba = block + done / fBlockSize;
 
-        /* Rotating SMIDs keep a late reply from an earlier command from
-         * satisfying waitForSmid() for this one. SMIDs 5..9 belong to the
-         * startup probes; 10..25 are the runtime IO window. */
-        smid = 10 + (fNextIoSmid & 15);
-        fNextIoSmid++;
-        fIoCount++;
-
-        /* A write must copy the client's data into the low-4GB staging buffer
-         * before the request frame is posted. scsiReadWrite() no longer
-         * clears the staging buffer on writes. */
-        if (write) {
-            copied = buffer->readBytes((IOByteCount)done, staging, chunkBytes);
-            if (copied != chunkBytes) {
-                setProperty("MPRCommandFailure", "stage-write");
-                setProperty("MPRCommandDoneBytes", done, 64);
-                status = kIOReturnUnderrun;
-                break;
-            }
+        if (batch == 0 && failed) {
+            break;
         }
 
-        for (attempt = 0; attempt < maxAttempts && !ok; attempt++) {
-            if (generation != fMediaGeneration || !fMediaPresent ||
-                mediaRemovalPending()) {
-                ioStatus = kIOReturnNoMedia;
-                break;
-            }
-            if (fDeviceOffline || fStopping || fReinitInProgress ||
-                fProtocolRecoveryPending) {
-                ioStatus = kIOReturnNotReady;
-                break;
-            }
-            ok = scsiReadWrite(write, lba, chunkBlocks, fBlockSize,
-                               smid, false, fua, &ioStatus);
-            if (generation != fMediaGeneration || !fMediaPresent ||
-                mediaRemovalPending()) {
-                ok = false;
-                ioStatus = kIOReturnNoMedia;
-                break;
-            }
-            if (fProtocolRecoveryPending || fDeviceOffline || fStopping) {
-                ok = false;
-                ioStatus = kIOReturnNotReady;
-                break;
-            }
+        /* Harvest in order. A failure still drains the remaining windows so
+         * the firmware never keeps one that this loop is about to refill. */
+        for (i = 0; i < batch; i++) {
+            IOReturn chunkStatus = kIOReturnSuccess;
+            IOByteCount bytes = (IOByteCount)((UInt64)slotBlocks[i] * fBlockSize);
+            bool ok = scsiWaitChunk(10 + i, (UInt32)bytes, &chunkStatus);
+
             if (!ok) {
                 fIoRetryCount++;
-                if (ioStatus == kIOReturnNotReady) {
-                    /* UNIT ATTENTION: clear it with TUR before retrying. */
-                    scsiTur();
-                    IOSleep(50);
-                } else {
-                    IOSleep(10);
+                if (!failed) {
+                    failed = true;
+                    failStatus = chunkStatus;
+                }
+                continue;
+            }
+            if (!write) {
+                copied = buffer->writeBytes((IOByteCount)slotOff[i],
+                                            pool + (UInt64)i * MPR_DATA_BUF_BYTES,
+                                            bytes);
+                if (copied != bytes) {
+                    setProperty("MPRBlockIOFailure", "copy");
+                    setProperty("MPRBlockIOFailureCopied",
+                                (unsigned long long)copied, 64);
+                    status = kIOReturnUnderrun;
+                    failed = true;
+                    break;
                 }
             }
         }
-        if (!ok) {
+
+        if (failed) {
+            /* One UNIT ATTENTION retry per request: the SATA link raises it
+             * after a reset, and it cannot corrupt data. */
+            if (failStatus == kIOReturnNotReady && !retried) {
+                retried = true;
+                scsiTur();
+                IOSleep(50);
+                continue;
+            }
             setProperty("MPRCommandFailure", "scsi-io");
             setProperty("MPRBlockIOFailure", "scsi-io");
-            setProperty("MPRBlockIOFailureLba", lba, 64);
-            setProperty("MPRBlockIOFailureSmid", (unsigned long long)smid, 16);
-            setProperty("MPRBlockIOCount",
-                        (unsigned long long)fIoCount, 32);
+            setProperty("MPRBlockIOFailureLba", block + done / fBlockSize, 64);
+            setProperty("MPRBlockIOFailureSmid",
+                        (unsigned long long)(10 + (batch != 0 ? batch - 1 : 0)), 16);
+            setProperty("MPRBlockIOCount", (unsigned long long)fIoCount, 32);
             setProperty("MPRBlockIORetryCount",
                         (unsigned long long)fIoRetryCount, 32);
             setProperty("MPRBlockIODoneBytes", done, 64);
-            status = ioStatus;
+            status = failStatus;
             break;
         }
-        if (!write) {
-            copied = buffer->writeBytes((IOByteCount)done, staging, chunkBytes);
-            done += (UInt64)copied;
-            if (copied != chunkBytes) {
-                setProperty("MPRBlockIOFailure", "copy");
-                setProperty("MPRBlockIOFailureCopied", (unsigned long long)copied, 64);
-                setProperty("MPRBlockIODoneBytes", done, 64);
-                status = kIOReturnUnderrun;
-                break;
-            }
-        } else {
-            done += (UInt64)chunkBytes;
+
+        if (write) {
             /* A completed write is the only observable evidence that the
              * writable medium was modified; record what and where. */
-            fWriteCount++;
-            fWriteBytes += (UInt64)chunkBytes;
-            fLastWriteLba = lba;
-            fLastWriteSmid = smid;
+            fWriteCount += batch;
+            fWriteBytes += batchBytes;
+            fLastWriteLba = block + done / fBlockSize;
+            fLastWriteSmid = 10 + (batch != 0 ? batch - 1 : 0);
         }
+        done += batchBytes;
     }
 out:
     IOLockUnlock(fIOLock);
@@ -2666,16 +2834,18 @@ MPRController::allocateResidentBuffers(void)
     if (data == NULL) {
         data = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
             kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-            MPR_DATA_BUF_BYTES, MPR_DMA_LOW_MASK);
+            MPR_DATA_POOL_BYTES, MPR_DMA_LOW_MASK);
         allocated = (data != NULL);
     }
     if (data != NULL) {
         physical = data->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
-        if (data->getLength() >= MPR_DATA_BUF_BYTES && physical != 0 &&
-            segLength >= MPR_DATA_BUF_BYTES && physical <= MPR_DMA_LOW_MASK &&
-            MPR_DATA_BUF_BYTES - 1 <= MPR_DMA_LOW_MASK - physical) {
+        if (data->getLength() >= MPR_DATA_POOL_BYTES && physical != 0 &&
+            segLength >= MPR_DATA_POOL_BYTES && physical <= MPR_DMA_LOW_MASK &&
+            MPR_DATA_POOL_BYTES - 1 <= MPR_DMA_LOW_MASK - physical) {
             fDataBuffer = data;
             fDataPhys = physical;
+            /* fDataBytes remains the per-command window size: maxBlocks and the
+             * probe length checks are expressed in it. */
             fDataBytes = MPR_DATA_BUF_BYTES;
             return true;
         }
@@ -3206,7 +3376,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.21");
+    setProperty("MPRBuild", "0.17.22");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
