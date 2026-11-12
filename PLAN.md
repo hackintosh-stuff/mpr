@@ -391,7 +391,23 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
    无限重试，既不收敛也不让旧媒体下线；改为身份变化（连续两轮确认）后进入同一
    受限恢复路径。
 
-### 10.3 仍然不覆盖的范围
+### 10.3 故障注入回归（2026-11-12）
+
+用 `mpr_timeout_test=1` 让一条运行期 SCSI 命令表现成回复丢失，再用
+`mpr_tmf_fail=N` 逐级跳过 TMF，验证热插拔改造没有破坏恢复链：
+
+| 注入 | 实际发生 | 结果 |
+|---|---|---|
+| 仅 timeout | `ABORT_TASK`（TaskType 1），`TerminationCount=1`，`ResponseCode=0` | `MPRRecoveryState=ok`，无 IOC 复位，随后读取正常 |
+| timeout + tmf_fail=1 | 跳过 ABORT，`LUN_RESET`（TaskType 5） | 成功，无复位 |
+| timeout + tmf_fail=2 | 跳过前两级，`TARGET_RESET`（TaskType 3） | 成功，无复位 |
+| timeout + tmf_fail=3 | 三级全跳过，回退 `resetAndReinitialize` | `MPRResetInitiator=io-timeout`，随后 worker 再复位一次，媒体以新 BSD 号重新发布、分区复原、读取正常 |
+
+启动阶段（`fStarting`）发生的超时不走 TMF，而是记 `kMPRProtocolManagementTimeout`
+并交给 worker 的受限复位，这条路径同样以媒体可读结束。因此注入钩子改为仅
+在启动完成后生效，否则会被启动期 I/O 消耗而测不到 TMF 级联（0.17.19）。
+
+### 10.4 仍然不覆盖的范围
 
 单目标、直连 SATA 原型：没有多目标隔离，没有逐目标 TARGET_RESET /
 REMOVE_DEVICE 协议，没有 SAS expander 或 RAID 卷；仍是单一暂存缓冲 + `fIOLock`

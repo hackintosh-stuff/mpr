@@ -125,7 +125,46 @@ The documented failure modes this trail resolved:
   driver never converged and the old medium was never taken offline. It is now
   recognised as an identity change and routed to the same bounded recovery.
 
-## 5. Buffer lifetime
+## 5. Fault injection
+
+Two boot-args exist only to exercise the recovery chain without touching the
+disk. Both are one-shot and inert unless set.
+
+- `mpr_timeout_test=1` fails a single SCSI command (SMID 10–25) as if its reply
+  were lost. It only fires after bring-up: while `fStarting` a timeout
+  escalates straight to the bounded reset by design, so allowing the injection
+  there would consume it without exercising anything. Consumed injection leaves
+  `MPRInjectTimeout=0` and `MPRLastIOFailure=reply-timeout`.
+- `mpr_tmf_fail=N` makes the first N task-management levels look unsuccessful,
+  so recovery really submits the next level: N=1 skips `ABORT_TASK` and sends
+  `LUN_RESET`, N=2 skips both and sends `TARGET_RESET`, N=3 skips all three and
+  falls through to `resetAndReinitialize`. `MPRTmfInjectedFail` records N, and
+  `MPRTmfTaskType` records what was actually sent (1 `ABORT_TASK`, 5
+  `LUN_RESET`, 3 `TARGET_RESET`). It needs `mpr_timeout_test=1` to have
+  something to recover from.
+
+Observed with 0.17.19: N absent → `ABORT_TASK` succeeded with
+`TerminationCount=1`, `MPRRecoveryState=ok`, no IOC reset; N=1 → `LUN_RESET`
+ok, no reset; N=2 → `TARGET_RESET` ok, no reset; N=3 → `MPRResetInitiator`
+`io-timeout`, one further reset from the worker, media republished with its
+partitions and readable. A timeout that lands during bring-up instead records
+`kMPRProtocolManagementTimeout` and lets the worker run its bounded reset; that
+path also ends with the medium readable.
+
+## 6. Choosing an immutability reference
+
+The first 64 MiB of this disk is **live exFAT metadata**, not a stable
+reference: the root directory, allocation bitmap and upcase table sit at
+partition offsets 8–13 MiB, and macOS rewrites parts of that region when it
+mounts or repairs the volume. Per-boot comparisons showed changes confined to
+those clusters plus one data region, while the main and backup boot regions
+stayed byte-identical, `VolumeFlags` stayed `0x0000`, `fsck_exfat -n` reported
+the volume OK, and repeated reads inside one boot were identical. Use a
+data-area range — skip 1024 MiB, 64 MiB — as the immutability anchor; that
+range has been byte-stable across every round, and unmount the volume before
+hashing.
+
+## 7. Buffer lifetime
 
 `fPageBuffer` and `fDataBuffer` are resident for the lifetime of the
 controller object and are never freed by a probe. A probe that allocates a
@@ -135,7 +174,7 @@ alone. Reinitialization replaces a small temporary page only after a successful
 IOC reset. `fResidentBuffersReady` records that the resident pair exists, and
 block I/O refuses to start without it.
 
-## 6. Verification method
+## 8. Verification method
 
 Per cycle: capture identity and driver state, start a `ioreg -c MPRController`
 sampler at 5 Hz, perform the physical action, and afterwards compare

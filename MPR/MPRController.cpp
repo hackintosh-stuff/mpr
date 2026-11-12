@@ -1199,9 +1199,10 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
 
     fTimedOutSmid = 0;
     /* Fault injection: with mpr_timeout_test=1 in boot-args, fail exactly one
-     * runtime SCSI command as if its reply were lost. This exercises the TMF
-     * and recovery path without touching the disk. */
-    if (fInjectTimeout && smid >= 10 && smid <= 25) {
+     * SCSI command as if its reply were lost. It must land after bring-up:
+     * a timeout while fStarting escalates to the bounded reset by design and
+     * would consume the injection without exercising the TMF cascade. */
+    if (fInjectTimeout && !fStarting && smid >= 10 && smid <= 25) {
         fInjectTimeout = false;
         setProperty("MPRInjectTimeout", 0ULL, 8);
         fTimedOutSmid = (UInt16)smid;
@@ -3185,7 +3186,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.18");
+    setProperty("MPRBuild", "0.17.19");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
