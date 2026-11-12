@@ -470,12 +470,13 @@ typedef struct {
     UInt32  EventContext;       /* 0x18 */
 } MPREventNotifyReply;
 
-/* MPI2_EVENT_DATA_SAS_DISCOVERY: 0x0C bytes */
+/* MPI2_EVENT_DATA_SAS_DISCOVERY: 0x08 bytes */
 typedef struct {
-    UInt32  DiscoveryStatus;    /* 0x00 */
-    UInt32  Reserved1;          /* 0x04 */
-    UInt16  ReasonCode;         /* 0x08 */
-    UInt16  PhysicalPort;       /* 0x0A */
+    UInt8   Flags;              /* 0x00 */
+    UInt8   ReasonCode;         /* 0x01 */
+    UInt8   PhysicalPort;       /* 0x02 */
+    UInt8   Reserved1;          /* 0x03 */
+    UInt32  DiscoveryStatus;    /* 0x04 */
 } MPREventDataSasDiscovery;
 
 #pragma pack(pop)
@@ -485,7 +486,7 @@ static_assert(sizeof(MPRPortEnableReply) == 0x14, "PortEnable reply layout");
 static_assert(sizeof(MPREventNotifyRequest) == 0x2C, "EventNotify request layout");
 static_assert(offsetof(MPREventNotifyReply, Event) == 0x14, "event number offset");
 static_assert(offsetof(MPREventNotifyReply, EventContext) == 0x18, "event context offset");
-static_assert(sizeof(MPREventDataSasDiscovery) == 0x0C, "SAS discovery data layout");
+static_assert(sizeof(MPREventDataSasDiscovery) == 0x08, "SAS discovery data layout");
 
 /* ---------------------------------------------------------------------- */
 /* extended config pages (SAS IO Unit).                              */
@@ -511,11 +512,12 @@ static_assert(sizeof(MPREventDataSasDiscovery) == 0x0C, "SAS discovery data layo
 /* MPI2_CONFIG_EXTENDED_PAGE_HEADER: 8 bytes (mpi2_cnfg.h:305-318) */
 typedef struct {
     UInt8   PageVersion;    /* 0x00 */
-    UInt8   PageNumber;     /* 0x01 */
-    UInt8   PageType;       /* 0x02 */
-    UInt8   ExtPageType;    /* 0x03 */
+    UInt8   Reserved1;      /* 0x01 */
+    UInt8   PageNumber;     /* 0x02 */
+    UInt8   PageType;       /* 0x03 */
     UInt16  ExtPageLength;  /* 0x04 */
-    UInt16  Reserved1;      /* 0x06 */
+    UInt8   ExtPageType;    /* 0x06 */
+    UInt8   Reserved2;      /* 0x07 */
 } MPRExtPageHeader;
 
 /* MPI2_SAS_IO_UNIT0_PHY_DATA: 0x14 bytes (mpi2_cnfg.h:2134-2146) */
@@ -534,6 +536,9 @@ typedef struct {
 #pragma pack(pop)
 
 static_assert(sizeof(MPRExtPageHeader) == 0x08, "extended page header layout");
+static_assert(offsetof(MPRExtPageHeader, PageNumber) == 0x02, "extended page number");
+static_assert(offsetof(MPRExtPageHeader, PageType) == 0x03, "extended page type");
+static_assert(offsetof(MPRExtPageHeader, ExtPageType) == 0x06, "extended page subtype");
 static_assert(sizeof(MPRSasIOUnit0PhyData) == 0x14, "SAS IO Unit0 phy data layout");
 
 /* SAS Device PageAddress format (mpi2_cnfg.h:396-401) */
@@ -657,6 +662,9 @@ static_assert(offsetof(MPRScsiIoRequest, Control) == 0x3C, "SCSI IO control offs
 
 /* SAM status codes (mpi2_init.h:415-427) */
 #define MPI2_SCSI_STATUS_GOOD                      0x00
+#define MPI2_IOCSTATUS_SCSI_RECOVERED_ERROR         0x0040
+#define MPI2_IOCSTATUS_SCSI_DATA_OVERRUN            0x0044
+#define MPI2_IOCSTATUS_SCSI_DATA_UNDERRUN           0x0045
 #define MPI2_SCSI_STATUS_CHECK_CONDITION           0x02
 #define MPI2_SCSI_STATUS_BUSY                      0x08
 #define MPI2_SCSI_STATUS_RESERVATION_CONFLICT      0x18
@@ -669,11 +677,13 @@ static_assert(offsetof(MPRScsiIoRequest, Control) == 0x3C, "SCSI IO control offs
 #define MPI2_SCSI_STATE_NO_SCSI_STATUS             0x04
 #define MPI2_SCSI_STATE_TERMINATED                 0x08
 #define MPI2_SCSI_STATE_RESPONSE_INFO_VALID        0x10
+#define MPI2_SCSI_RI_MASK_REASONCODE               0x000000FFU
 
 /* TaskType values (mpi2_init.h:470-480) */
 #define MPI2_SCSITASKMGMT_TASKTYPE_ABORT_TASK      0x01
 #define MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET    0x03
 #define MPI2_SCSITASKMGMT_TASKTYPE_LUN_RESET       0x05
+#define MPI2_SCSITASKMGMT_MSGFLAGS_LINK_RESET       0x00
 
 /* TM ResponseCode values (mpi2_init.h:516-524) */
 #define MPI2_SCSITASKMGMT_RSP_TM_COMPLETE          0x00

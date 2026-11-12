@@ -10,11 +10,14 @@
 #include <IOKit/IOLocks.h>
 #include <kern/thread_call.h>
 #include <libkern/c++/OSMetaClass.h>
+#include "MPRScsi.h"
 
 class IOPCIDevice;
 class MPRBlockDev;
 class IOTimerEventSource;
 struct IOBlockStorageDeviceExtent;
+struct IOStorageCompletion;
+struct MPRAsyncState;
 
 /* One completion slot per SMID. processReplyQueue() fills it under
  * fReplyLock; each waiter consumes only its own slot, so a late reply can no
@@ -23,7 +26,7 @@ struct MPRReplySlot
 {
     volatile UInt32 valid;
     UInt16          smid;
-    UInt8           kind;       /* 1 = address reply, 2 = fast-path success */
+    UInt8           kind;       /* 1 = address, 2 = fast success, 3 = reset abort */
     UInt8           reserved;
     UInt8           reply[64];
 };
@@ -35,11 +38,44 @@ struct MPREventAckEntry
     UInt32 context;
 };
 
+enum MPRCommandState {
+    kMPRCommandFree = 0, kMPRCommandReserved, kMPRCommandPosted,
+    kMPRCommandComplete, kMPRCommandQuarantined, kMPRCommandCancelled
+};
+
+struct MPRCommandOwner {
+    UInt8 state;
+    UInt8 function;
+    UInt16 handle;
+    UInt32 epoch;
+};
+
 class MPRController : public IOService
 {
     OSDeclareDefaultStructors(MPRController)
 
 private:
+    enum { kMPRTargetMalformedReply = 0x100, kMPRTargetRemovalUncertain };
+    /* Bounded asynchronous request scheduler; its resident DMA windows are
+     * separate from the synchronous management/probe staging area. */
+    MPRAsyncState    *fAsync;
+    UInt32           fMaxChainDepth;
+    UInt32           fChainFrameBytes;
+    bool             fPowerQuiesced;
+    bool   initializeAsync(void);
+    void   stopAsync(void);
+    void   releaseAsync(bool dmaStopped);
+    void   destroyAsyncState(void);
+    void   asyncWorker(void);
+    static void asyncCall(thread_call_param_t, thread_call_param_t);
+    void   asyncCompletions(void);
+    static void asyncCompletionCall(thread_call_param_t, thread_call_param_t);
+    IOReturn beginAsyncBarrier(void);
+    void   endAsyncBarrier(void);
+    void   setAsyncAcceptance(bool enabled);
+    bool   quiescePower(void);
+    bool   resumePower(void);
+
     IOPCIDevice      *fPCIDevice;
     IOMemoryMap      *fMMIO;
     volatile UInt32  *fRegs;
@@ -48,6 +84,8 @@ private:
     IOBufferMemoryDescriptor *fQueueBuffer;
     IOBufferMemoryDescriptor *fReplyBuffer;
     IOBufferMemoryDescriptor *fRequestBuffer;
+    IOBufferMemoryDescriptor *fSenseBuffer;
+    UInt64           fSensePhys;
     UInt64           fFreePhys;
     UInt64           fPostPhys;
     UInt64           fReplyPhys;
@@ -80,6 +118,11 @@ private:
     IOSimpleLock              *fPostLock;
     bool                       fManagementBusy[10];
     bool                       fTmfBusy[3];
+    /* A command remains owned after timeout until its original completion
+     * arrives or the IOC has demonstrably stopped DMA. */
+    MPRCommandOwner             fCommandOwners[128];
+    UInt32                     fTransportEpoch;
+    UInt32                     fUnexpectedCompletionCount;
 
     /* firmware event notifications. */
     volatile UInt32            fEventCount;
@@ -136,6 +179,28 @@ private:
      * missing disk, and it must not leave the driver retrying forever. */
     bool                       fSasDeviceMismatch;
     UInt32                     fIdentityLostCount;
+    /* Target identity and advertised capabilities are re-probed after reset.
+     * A handle is only a firmware address, never a persistent disk identity. */
+    UInt32                     fIocCapabilities;
+    UInt32                     fMaxDeviceHandle;
+    UInt32                     fTargetDeviceInfo;
+    UInt16                     fTargetDeviceFlags;
+    UInt64                     fTargetSasAddress;
+    bool                       fHasExpander;
+    UInt32                     fDiscoveredDiskCount;
+    bool                       fNativeFuaSupported;
+    MPRUnmapLimits             fUnmapLimits;
+    bool                       fTargetIdentityValid;
+    char                       fTargetIdentity[520];
+    bool                       fMediaIdentityValid;
+    char                       fMediaIdentity[520];
+    UInt64                     fIdentityCapacity;
+    UInt32                     fIdentityBlockSize;
+    bool                       fRequireSameIdentity;
+    UInt16                     fRemovedTargetHandle;
+    UInt32                     fRemovalGeneration;
+    bool                       fTargetRemovalRequested;
+    bool                       fPhysicalChangePending;
     volatile UInt32            fTopologyGeneration;
     volatile bool              fRemovalPending;
     bool                       fHotplugRetryRequested; /* new add outside IOC recovery */
@@ -241,6 +306,15 @@ private:
                             thread_call_param_t param1);
     bool   waitForSmid(UInt32 timeoutMs, UInt32 smid);
     bool   takeReplySlot(UInt32 smid, UInt8 *reply, UInt32 replyLen, UInt8 *kind);
+    bool   storeCommandReplyLocked(UInt32 smid, UInt8 kind,
+                                   const UInt8 *reply, UInt32 bytes);
+    bool   postOwnedRequestLocked(UInt32 smid, UInt32 flags, UInt32 high);
+    bool   prepareScsiSense(UInt32 smid);
+    UInt64 senseAddress(UInt32 smid) const;
+    bool   commandDmaSafe(UInt32 smid);
+    void   cancelUnpostedCommand(UInt32 smid);
+    bool   drainTaskManagedCommands(UInt16 handle, UInt16 taskMid,
+                                    bool wholeTarget);
     bool   beginManagementRequest(UInt32 smid);
     bool   finishManagementRequest(UInt32 smid, UInt32 timeoutMs,
                                     UInt8 *reply, UInt8 *kind);
@@ -258,10 +332,21 @@ private:
 
     bool   readExtConfigPage(UInt8 extPageType, UInt32 pageAddress,
                              UInt8 *buffer, UInt32 bufferBytes,
-                             UInt32 *actualBytes);
+                             UInt32 *actualBytes, UInt16 *iocStatus = NULL);
     bool   readSasIOUnitPage0(void);
     bool   readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo = NULL);
     bool   discoverTopology(void);
+    bool   readRaidMembership(UInt16 handle, bool *member);
+    bool   probeStableIdentity(void);
+    bool   scsiSataIdentify(UInt8 identify[512]);
+    bool   probeTargetCapabilities(void);
+    bool   retireRemovedTarget(void);
+    bool   checkTargetIdentity(void);
+    bool   isNativeFuaSupported(void) const { return fNativeFuaSupported; }
+    IOReturn synchronizeCacheNow(UInt64 block, UInt64 nblks, bool barrier,
+                                 UInt32 expectedGeneration);
+    IOReturn unmapBlocksNow(const IOBlockStorageDeviceExtent *extents,
+                            UInt32 extentsCount, UInt32 expectedGeneration);
 
     bool   postScsiIo(UInt32 smid);
     bool   scsiTur(void);
@@ -277,7 +362,9 @@ private:
     bool   scsiPostIo(bool write, UInt64 lba, UInt32 blocks, UInt32 blockSize,
                       UInt32 smid, bool fua, UInt64 dataPhys,
                       IOReturn *status);
-    bool   scsiWaitChunk(UInt32 smid, UInt32 dataLen, IOReturn *status);
+    bool   scsiWaitChunk(UInt32 smid, UInt32 dataLen, IOReturn *status,
+                         UInt32 *actualBytes = NULL,
+                         bool *unitAttention = NULL);
     bool   probeBlockRead(void);
 
     bool   allocatePageBuffer(void);
@@ -293,12 +380,22 @@ private:
     void   sendEventAck(UInt16 event, UInt32 context);
     void   postNextEventAckLocked(void);
     void   completeEventAckLocked(const UInt8 *reply, UInt32 replyBytes);
-    IOReturn decodeSense(IOReturn fallback);
+    IOReturn decodeSense(UInt32 smid, UInt32 senseCount, IOReturn fallback,
+                         bool *unitAttention = NULL);
+    bool   validateScsiCompletion(UInt32 smid, UInt8 kind,
+                                  const UInt8 *reply, UInt32 dataLen,
+                                  bool allowShort, IOReturn *status,
+                                  UInt32 *actualBytes = NULL,
+                                  bool *unitAttention = NULL);
     bool   issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen, UInt32 control,
                             const UInt8 *outData, UInt32 dataLen,
-                            UInt32 smid, IOReturn *status);
-    bool   scsiInquiryVpd(UInt8 page, UInt8 *buf, UInt32 len);
-    IOReturn scsiSynchronizeCache(UInt64 lba, UInt32 blocks, UInt32 smid,
+                            UInt32 smid, IOReturn *status,
+                            UInt32 *actualBytes = NULL,
+                            bool allowShort = false,
+                            bool *unitAttention = NULL);
+    bool   scsiInquiryVpd(UInt8 page, UInt8 *buf, UInt32 len,
+                          UInt32 *actualBytes = NULL);
+    IOReturn scsiSynchronizeCache(UInt64 lba, UInt64 blocks, UInt32 smid,
                                   bool barrier);
     IOReturn scsiUnmap(const IOBlockStorageDeviceExtent *extents,
                        UInt32 extentsCount, UInt32 smid);
@@ -312,14 +409,14 @@ public:
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
-    virtual IOReturn powerStateWillChangeTo(IOPMPowerFlags capabilities,
-                                            unsigned long stateNumber,
-                                            IOService *whatDevice) APPLE_KEXT_OVERRIDE;
-    virtual IOReturn powerStateDidChangeTo(IOPMPowerFlags capabilities,
-                                           unsigned long stateNumber,
-                                           IOService *whatDevice) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn setPowerState(unsigned long stateNumber,
+                                   IOService *whatDevice) APPLE_KEXT_OVERRIDE;
+    virtual void systemWillShutdown(IOOptionBits specifier) APPLE_KEXT_OVERRIDE;
 
     /* MPRBlockDev relays every request through these accessors. */
+    IOReturn submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
+                               UInt64 block, UInt64 nblks, bool fua,
+                               const IOStorageCompletion *completion);
     IOReturn readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
                         UInt64 nblks, UInt64 *actualBytes);
     IOReturn transferBlocks(bool write, IOMemoryDescriptor *buffer,

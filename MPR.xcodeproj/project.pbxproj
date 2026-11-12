@@ -8,6 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		A00000000000000000000001 /* MPRController.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000002 /* MPRController.cpp */; };
+		A00000000000000000000014 /* MPRBlockDev.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000015 /* MPRBlockDev.cpp */; };
+		A0000000000000000000001A /* MPRAsync.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001B /* MPRAsync.cpp */; };
+		A0000000000000000000001C /* MPRTarget.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001D /* MPRTarget.cpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -16,6 +19,14 @@
 		A00000000000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A00000000000000000000005 /* MPR.kext */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MPR.kext; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000006 /* MacKernelSDK */ = {isa = PBXFileReference; lastKnownFileType = folder; path = MacKernelSDK; sourceTree = "<group>"; };
+		A00000000000000000000015 /* MPRBlockDev.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MPRBlockDev.cpp; sourceTree = "<group>"; };
+		A00000000000000000000016 /* MPRBlockDev.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MPRBlockDev.h; sourceTree = "<group>"; };
+		A00000000000000000000017 /* MPRCompletion.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MPRCompletion.h; sourceTree = "<group>"; };
+		A00000000000000000000018 /* MPRScsi.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MPRScsi.h; sourceTree = "<group>"; };
+		A00000000000000000000019 /* MPRDmaSgl.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MPRDmaSgl.h; sourceTree = "<group>"; };
+		A0000000000000000000001B /* MPRAsync.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MPRAsync.cpp; sourceTree = "<group>"; };
+		A0000000000000000000001D /* MPRTarget.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MPRTarget.cpp; sourceTree = "<group>"; };
+		A0000000000000000000001E /* mpi2_target.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MPI/mpi2_target.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -43,6 +54,14 @@
 			children = (
 				A00000000000000000000002 /* MPRController.cpp */,
 				A00000000000000000000003 /* MPRController.h */,
+				A00000000000000000000015 /* MPRBlockDev.cpp */,
+				A00000000000000000000016 /* MPRBlockDev.h */,
+				A00000000000000000000017 /* MPRCompletion.h */,
+				A00000000000000000000018 /* MPRScsi.h */,
+				A00000000000000000000019 /* MPRDmaSgl.h */,
+				A0000000000000000000001B /* MPRAsync.cpp */,
+				A0000000000000000000001D /* MPRTarget.cpp */,
+				A0000000000000000000001E /* mpi2_target.h */,
 				A00000000000000000000004 /* Info.plist */,
 			);
 			path = MPR;
@@ -106,6 +125,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				A00000000000000000000001 /* MPRController.cpp in Sources */,
+				A00000000000000000000014 /* MPRBlockDev.cpp in Sources */,
+				A0000000000000000000001A /* MPRAsync.cpp in Sources */,
+				A0000000000000000000001C /* MPRTarget.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -142,11 +164,11 @@
 		A00000000000000000000012 /* Debug (target) */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 0.17.25;
+				CURRENT_PROJECT_VERSION = 0.18.0;
 				INFOPLIST_FILE = "$(SRCROOT)/MPR/Info.plist";
-				MARKETING_VERSION = 0.17.25;
+				MARKETING_VERSION = 0.18.0;
 				MODULE_NAME = com.ling.MPR;
-				MODULE_VERSION = 0.17.25;
+				MODULE_VERSION = 0.18.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.ling.MPR;
 				PRODUCT_NAME = MPR;
 				WRAPPER_EXTENSION = kext;
@@ -156,11 +178,11 @@
 		A00000000000000000000013 /* Release (target) */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 0.17.25;
+				CURRENT_PROJECT_VERSION = 0.18.0;
 				INFOPLIST_FILE = "$(SRCROOT)/MPR/Info.plist";
-				MARKETING_VERSION = 0.17.25;
+				MARKETING_VERSION = 0.18.0;
 				MODULE_NAME = com.ling.MPR;
-				MODULE_VERSION = 0.17.25;
+				MODULE_VERSION = 0.18.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.ling.MPR;
 				PRODUCT_NAME = MPR;
 				WRAPPER_EXTENSION = kext;

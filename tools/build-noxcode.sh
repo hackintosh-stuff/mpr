@@ -24,7 +24,7 @@ ROOT=$(CDPATH= cd -- "$ROOT" && pwd)
 SDK=${MACKERNELSDK:-$ROOT/MacKernelSDK}
 
 NAME=MPR
-VERSION=0.17.25
+VERSION=0.18.0
 BUNDLE_ID=com.ling.MPR
 
 echo "== Environment =="
@@ -60,7 +60,7 @@ extern "C" {
 extern kern_return_t _start(kmod_info_t *, void *);
 extern kern_return_t _stop(kmod_info_t *, void *);
 
-KMOD_EXPLICIT_DECL(com.ling.MPR, "0.17.25", _start, _stop);
+KMOD_EXPLICIT_DECL(com.ling.MPR, "0.18.0", _start, _stop);
 
 __attribute__((visibility("hidden"))) kmod_start_func_t *_realmain = nullptr;
 __attribute__((visibility("hidden"))) kmod_stop_func_t  *_antimain = nullptr;
@@ -76,10 +76,11 @@ CFLAGS="-arch x86_64 -mkernel -fapple-kext -mno-red-zone -nostdinc++ -O0 \
 INCLUDES="-I $SDK/Headers -I $ROOT/MPR"
 
 echo "== Compilation =="
-# shellcheck disable=SC2086
-xcrun clang++ $CFLAGS $INCLUDES -c "$ROOT/MPR/MPRController.cpp" -o "$OBJ/MPRController.o"
-# shellcheck disable=SC2086
-xcrun clang++ $CFLAGS $INCLUDES -c "$ROOT/MPR/MPRBlockDev.cpp" -o "$OBJ/MPRBlockDev.o"
+for source in "$ROOT"/MPR/*.cpp; do
+    object=$(basename "$source" .cpp)
+    # shellcheck disable=SC2086
+    xcrun clang++ $CFLAGS $INCLUDES -c "$source" -o "$OBJ/$object.o"
+done
 # shellcheck disable=SC2086
 xcrun clang++ $CFLAGS $INCLUDES -c "$OBJ/kmod-info.cpp" -o "$OBJ/kmod-info.o"
 

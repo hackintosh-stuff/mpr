@@ -265,11 +265,13 @@ MPRBlockDev::doAsyncReadWrite(IOMemoryDescriptor *buffer,
                               IOStorageAttributes *attributes,
                               IOStorageCompletion *completion)
 {
-    UInt64  actualBytes = 0;
     IOReturn status;
     bool    write, fua;
 
-    if (buffer == NULL || completion == NULL) return kIOReturnBadArgument;
+    if (buffer == NULL || completion == NULL || completion->action == NULL)
+        return kIOReturnBadArgument;
+    if (buffer->getDirection() != kIODirectionIn &&
+        buffer->getDirection() != kIODirectionOut) return kIOReturnBadArgument;
     MPRController *controller = copyController();
     if (controller == NULL) return kIOReturnNoMedia;
 
@@ -279,17 +281,13 @@ MPRBlockDev::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     fua = (attributes != NULL &&
            (attributes->options & kIOStorageOptionForceUnitAccess) != 0);
 
-    /* MPRController::transferBlocks() completes synchronously; the completion
-     * is invoked after the controller lock has been released, so a client that
-     * immediately issues another request cannot deadlock on that lock. */
-    status = controller->transferBlocks(write, buffer, block, nblks,
-                                        fua, &actualBytes);
+    /* Acceptance retains the buffer and copies the completion. Commands from
+     * different requests share the bounded pool; callback runs outside locks
+     * in a separate context, permitting reentrant reads or cache fences. */
+    status = controller->submitAsyncBlocks(write, buffer, block, nblks,
+                                           fua, completion);
     controller->release();
-    if (completion->action != NULL) {
-        completion->action(completion->target, completion->parameter,
-                           status, actualBytes);
-    }
-    return kIOReturnSuccess;
+    return status;
 }
 
 IOReturn

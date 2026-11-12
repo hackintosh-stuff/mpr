@@ -1,81 +1,96 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-12. Driver version: 0.17.18.
+Date: 2026-11-12. Driver version: 0.18.0.
 
-A from-scratch IOKit block-storage driver for the LSI/Broadcom SAS3008
-(`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It drives one directly
-attached SATA disk through the IOC's request/reply queues and publishes it
-through `IOBlockStorageDriver` as a normal whole-disk `IOMedia` with its
-partition scheme.
+MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
+(`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes one independent
+disk through `IOBlockStorageDriver` as a whole-disk `IOMedia`.
 
-Implementation details, IORegistry keys and the hotplug state machine are in
-[DEBUG.md](DEBUG.md). Milestones, scope and the requirement backlog are in
+This source version implements the disk path and controller mechanisms listed
+below. Host-side protocol checks and Darwin-target object compilation have
+passed; it has not been loaded or qualified on the test machine. The available
+acceptance hardware is one backplane and one SATA disk. Source support for discovering
+a disk behind an expander is not evidence of expander hardware qualification.
+
+## Implemented capabilities
+
+- Controller initialization, IOC Facts constrained queues, interrupt-driven
+  replies, bounded polling fallback, event subscription and EVENT_ACK.
+- An asynchronous request queue with four concurrent command windows shared
+  by different requests, separate client completion delivery, and ordered
+  cache/UNMAP fences.
+- Device-visible scatter/gather mappings and bounded MPI 2.5 IEEE chains.
+  Resident staging buffers retain a contiguous fallback when mapping or
+  chain geometry cannot represent a transfer.
+- READ/WRITE(10) and (16), READ CAPACITY(10)/(16), TEST UNIT READY,
+  standard/extended INQUIRY, SYNCHRONIZE CACHE(10)/(16), and FUA with an
+  ordered cache-flush fallback when native FUA is not advertised.
+- UNMAP only after Block Limits and Logical Block Provisioning capabilities
+  are verified. Large requests split to the reported limits without extending
+  a caller's discard range.
+- SAS device-handle enumeration, independent-disk filtering on IR-capable
+  firmware, and stable disk identity with capacity/block-size revalidation.
+- Per-command sense storage and completion ownership checks; bounded TMF
+  escalation and IOC recovery; no automatic replay of an uncertain write.
+- Offline/online media lifecycle, conservative TARGET_RESET/REMOVE_DEVICE,
+  handle-reuse checks, and bounded full-controller recovery.
+- Registered power-state transitions and shutdown quiesce: stop accepting
+  requests, retire accepted work, flush, and stop DMA before power loss;
+  rebuild and revalidate on wake.
+
+Implementation, memory ownership and diagnostic details are in
+[DEBUG.md](DEBUG.md). The FreeBSD comparison and validation boundaries are in
+[PORTING.md](PORTING.md). Project scope and historical test evidence are in
 [PLAN.md](PLAN.md).
 
-## What works
+## Scope
 
-- Controller bring-up: MMIO BAR selection, READY, IOC Facts, IOC Init,
-  manufacturing page 0, MSI/MSI-x interrupt, request/reply frame pools.
-- Discovery: SAS IO Unit Page 0 and SAS Device Page 0, target filtering
-  (end device, SATA/STP/SSP, direct attach), fast-path capability selection.
-- SCSI: TUR, INQUIRY, READ CAPACITY(10)/(16), READ/WRITE(10), SYNCHRONIZE
-  CACHE, UNMAP (probed before use), sense decoding, FUA.
-- Media: one published whole-disk `IOMedia`, partition rescan after a rebuild,
-  `kIOMessageMediaStateHasChanged` offline/online notifications with their
-  actual `IOBlockStorageDriver` return status.
-- Hotplug: physical unplug and replug of the test disk, idle or with block I/O
-  in flight, including replug inside a few seconds and handle reuse by the IOC.
-  The old medium is always taken offline before the new one is published; the
-  disk is rediscovered, re-probed (identity, capacity, TUR, block read) and
-  re-published with its partitions. In-flight I/O fails bounded instead of
-  hanging.
-- Recovery is bounded: at most three diagnostic resets per insertion, then
-  topology polling only. An empty fabric is polled without resetting.
+The published storage path remains single-target and LUN 0. If more than one
+eligible independent target is discovered, publication is refused rather
+than choosing an arbitrary disk.
 
-Verified on the target machine (macOS 26.7.2, Darwin 25.6.0) with the
-240 GB PCCOOLER SSD T20 (`468862128 × 512 B`) on PHY 5, over eleven physical
-unplug/replug cycles: four idle (one held out for a minute), four fast
-(seconds, handle reused), three with 256 MiB reads in flight. Every cycle
-ended with a single active whole-disk `IOMedia`, its partition node, and a
-64 MiB raw read whose SHA-256 matched the pre-cycle baseline; no panic, no
-deadlock, no duplicate active medium, no unbounded reset loop.
+IR RAID volumes, multi-target isolation, multipath, multi-LUN devices,
+SES/SMP management, NVMe/Tri-Mode, firmware flashing and FreeBSD user ioctl
+compatibility are outside this driver configuration. Client buffers are
+copied through bounded resident DMA windows; direct zero-copy client DMA
+and multiple hardware reply queues are not implemented.
 
-## Explicitly not implemented
+These limits are not additional hardware requirements for acceptance. Tests
+for this project use only the existing backplane and SATA disk. Wire-format
+boundaries that the disk cannot exercise, such as LBAs above 2 TiB, are checked
+off-device and are not reported as hardware results.
 
-This is a single-target, directly attached prototype:
+## Build and local checks
 
-- No multi-target isolation, no per-target TARGET_RESET/REMOVE_DEVICE
-  protocol, no SAS expander or RAID volume support.
-- One synchronous staging buffer serialized by `fIOLock`; no asynchronous
-  command pool or chaining, so throughput is bounded by one command at a time.
-- No 24 h soak, no full-disk or concurrent stress, no PM sleep/wake
-  qualification.
+On a host with Python 3 and a C++17 compiler:
 
-Read-only integrity is verified; write paths (WRITE, SYNCHRONIZE CACHE, UNMAP)
-are exercised only in earlier small-scale tests and are not part of the
-hotplug acceptance above.
+```sh
+python3 tools/validate-build-inputs.py
+c++ -std=c++17 -O1 -g -Wall -Wextra -Werror \
+  -fsanitize=address,undefined tools/test_protocol.cpp -o /tmp/mpr-protocol
+/tmp/mpr-protocol
+```
 
-## Build
-
-On macOS with the Command Line Tools only (no Xcode), against MacKernelSDK:
+On macOS with the Command Line Tools and MacKernelSDK:
 
 ```sh
 MACKERNELSDK=/path/to/MacKernelSDK sh tools/build-noxcode.sh
 ```
 
-Output is `build/MPR.kext`, ad-hoc signed. The script also checks
-`_kmod_info`/`_start`/`_stop`, `MH_KEXT_BUNDLE`, that no driver-internal
-symbol is left undefined, `plutil -lint`, and the signature.
+The build produces `build/MPR.kext`, validates the kmod entry points,
+bundle type, driver-internal symbols and plist, then signs it ad hoc. The
+Xcode project and CLI build include all driver translation units.
+A cross-compiled Mach-O object is not a linked, signed or load-tested kext.
 
 ## Install
 
-The kext is installed on the internal SATA disk's ESP only, never in
-`/Library/Extensions` and never on a system volume:
+Install only on the verified internal SATA disk's ESP, under
+`EFI/OC/Kexts/MPR.kext`, with its OpenCore `Kernel > Add` entry.
+Never install this driver in `/Library/Extensions` or on USB install/rescue
+media.
 
-1. `EFI/OC/Kexts/MPR.kext` on the internal disk's EFI partition.
-2. A `Kernel > Add` entry for `com.ling.MPR` in `EFI/OC/config.plist`.
-
-Confirm the disk identity (model, capacity, `Device Location: Internal`)
-before writing, back up `config.plist` next to itself before editing, and check
-the running version after reboot with `kmutil showloaded` and the driver's
-`MPRBuild` property. A file on disk is not evidence that the kernel loaded it.
+Before any write, identify the internal disk and EFI partition by their
+current model, capacity, location and UUID. Back up `config.plist` beside
+itself only if that configuration must change; validate any changed plist.
+After a deliberate deployment and reboot, confirm the loaded version with
+`kmutil showloaded` and `MPRBuild`. This patch does not deploy or reboot.

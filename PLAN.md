@@ -1,11 +1,11 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：草案 v0.9（2026-11-11；源码版本 0.17.13 已部署到 ESP 并重启加载，命名已去除轮次编号；M4 的写后回读、UNMAP、ABORT→LUN→TARGET reset 级联与 resetAndReinitialize 已完成实机注入验证；D8–D11 已实现并做过读/写/UNMAP 回归，D12 已补 PM、watchdog 与热插拔线程；0.17.13 的物理拔插已实测但未通过：旧设备未弹出、未出现新设备，`dd` 读 0 字节且内核报 `device is not ready`，`kIOMessageMediaStateHasChanged` 的 offline/online 生命周期没有生效，热插拔自动重建不能标记完成；按本次要求只记录现状、暂不修复；异步命令池/chain 与 24 h 混合 I/O 未做，reset 后分区方案重扫描已修复，最近部署/加载记录见 §9.1）
+状态：源码 0.18.0（2026-11-12），FreeBSD 对照与本轮实现范围见 [PORTING.md](PORTING.md)。已补异步请求调度、SGL/chain、独立 sense、RW16、VPD/UNMAP、身份/RAID 过滤、移除协议与 PM 生命周期；源码/协议验证不等于实机验收，当前版本尚未部署加载。
 目标硬件：Broadcom Ltd. / Avago Tech (LSI) SAS3008，PCI `0x1000:0x0097`，MPI2.5 / 12 Gb/s SAS3 HBA；已有 1 块获准用于破坏性测试的 SATA SSD，2026-11-11 已接回 SAS3008，Debian 下为 `/dev/sdd`、macOS 下为 `disk5`，均按型号/序列号/容量现场核对（状态见 §9.1），不得沿用历史设备号推断当前身份。
 参考驱动：FreeBSD `mpr`、Linux `mpt3sas`、Apple OSS `IOSCSIParallelFamily`（架构与 ABI 参考）
 目标平台：macOS Tahoe 26.7.2（Build `25G332`，`Darwin 25.6.0`，x86_64，MSI X570 测试机；已由现场 `uname -a` / `sw_vers` 确认），基于 `MacKernelSDK` 的 IOKit kext。BootKC 分析文档标注同为 26.7.2 / 25G332，KC 内部分 kext 构建于 26.7.1 / 25G325 属构建批次差异，不是系统版本冲突；系统升级后需重取 KC。
 
-本文件记录目标设计、实现差距与验收状态，不包含实现代码。§4–§6 的目标约束不代表当前代码已满足；§9 区分源码核查结果与已有实机记录，本次文档修订未重新核查目标机运行状态。参考源码引用以拉取到 `reference/` 的固定 commit 为准；内核侧事实来自 `C:\Users\ling\OneDrive\Documents\Agent\Hackintosh\ida\BootKernelExtensions.kc` 的 IDA 反编译/符号表（见 §4.0）。下文 `xxx.c:NNN` 形式的行号，FreeBSD 侧相对 `reference/freebsd/sys/dev/mpr/`，Linux 侧相对 `reference/linux/drivers/scsi/mpt3sas/`，SDK 侧相对 `MacKernelSDK/`。
+本文件记录目标设计、实现差距与验收状态，不包含实现代码。§4–§6 的目标约束不代表当前代码已满足；§9 保留较早版本的历史核查与实机记录；当前源码行为以 README、DEBUG、PORTING 为准，历史记录不作为 0.18.0 验收结果。参考源码引用以拉取到 `reference/` 的固定 commit 为准；内核侧事实来自 `C:\Users\ling\OneDrive\Documents\Agent\Hackintosh\ida\BootKernelExtensions.kc` 的 IDA 反编译/符号表（见 §4.0）。下文 `xxx.c:NNN` 形式的行号，FreeBSD 侧相对 `reference/freebsd/sys/dev/mpr/`，Linux 侧相对 `reference/linux/drivers/scsi/mpt3sas/`，SDK 侧相对 `MacKernelSDK/`。
 
 ---
 
@@ -301,11 +301,11 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 
 ---
 
-## 9. 当前实现、证据边界与下一步（2026-11-11）
+## 9. 历史实现与实机证据（较早版本，非当前源码状态）
 
 ### 9.1 版本、设备与部署状态
 
-本节是状态唯一入口。2026-11-11 的核实更新了接线、设备身份、只读复测、受控读写压力测试，以及 0.14.0 的部署/加载与写后回读、UNMAP 初步验证（见测试盘行及 §9.2）；ESP UUID、SAS3008 固件与其它状态沿用原有记录，执行前仍须现场确认。
+本节为历史记录；当前源码状态与验证边界以 PORTING.md 为准。2026-11-11 的核实更新了接线、设备身份、只读复测、受控读写压力测试，以及 0.14.0 的部署/加载与写后回读、UNMAP 初步验证（见测试盘行及 §9.2）；ESP UUID、SAS3008 固件与其它状态沿用原有记录，执行前仍须现场确认。
 
 | 对象 | 可确认的状态 | 边界 |
 |---|---|---|

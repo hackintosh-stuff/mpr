@@ -1,227 +1,176 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-12. Driver version: 0.17.18.
+Date: 2026-11-12. Driver version: 0.18.0.
 
-State and capabilities are in [README.md](README.md); scope and backlog are in
-[PLAN.md](PLAN.md). This file records how the driver is built and what its
-documented failure modes were.
+This document describes source behavior and diagnostics. It does not claim
+that the current source has passed runtime acceptance. See [PORTING.md](PORTING.md)
+for the comparison and validation boundary.
 
-## 1. Concurrency model
+## 1. Concurrency and ordering
 
-- One `fIOLock` serializes block I/O, topology reads and reinitialization.
-  A request queued before a medium change re-checks `fMediaGeneration` after it
-  acquires the lock; a chunk loop in progress re-checks the removal latch
-  before every chunk. Neither can submit across a medium replacement.
-- `fReplyLock` (an `IOSimpleLock`) protects the reply slots and the topology
-  and fault trail. Nothing that allocates — in particular no
-  `setProperty()` — runs under it; those members are published from the
-  watchdog instead.
-- Management requests own one SMID each (2 events, 3 PORT_ENABLE, 4 config,
-  6 TUR, 26–28 task management, 29 SYNCHRONIZE CACHE, 30 UNMAP, 31 event ACK).
-  Runtime I/O uses SMIDs 10–25. A reply is delivered to its own SMID slot, not
-  to a global "last reply".
-- A waiting management request keeps consuming the reply queue while it waits
-  (`finishManagementRequest` drains every 20 ms), because the reply it needs
-  may land behind other completions.
+`MPRBlockDev::doAsyncReadWrite` copies the completion and retains the descriptor
+through `submitAsyncBlocks`. A successful return means the bounded queue has
+accepted responsibility for exactly one completion. A rejected request gets
+an error return and no callback.
 
-## 2. Hotplug state machine
+The scheduler has 32 request records and four 64 KiB command windows. It
+rotates among requests, can issue several chunks of one request when others
+are absent, and harvests every posted window even if a sibling fails.
+Queue exhaustion is reported as `kIOReturnNoResources`; it is not silently
+accepted or allowed to grow without a bound.
 
-`fWatchdogTimer` runs once a second on the workloop. It publishes protocol
-and topology diagnostics, decrements the cooldown, and enters
-`fHotplugCall` when a topology event or a retry token is pending. The worker
-(`hotplugThread`) runs on its own thread call with `fIOLock` held for the
-duration, and releases it around any call that can re-enter the storage stack
-(`takeMediaOffline`, `notifyMediaState`, `registerService`).
+The I/O worker and client-completion worker are distinct, serialized
+`thread_call` objects at kernel priority. Completion delivery holds neither
+the scheduler lock nor `fIOLock`. A completion may issue a synchronous flush
+without preventing the I/O worker from retiring the preceding requests.
 
-Decisions, in order:
+A synchronous cache operation or UNMAP installs a sequence fence. Earlier
+accepted requests finish before the operation; newer requests remain queued.
+The media generation is captured before waiting and checked under the
+transport lock, so a request for a departed disk cannot act on its replacement.
 
-1. `fStopping` or `fStarting` — exit.
-2. Removal event, `fDeviceOffline`, protocol fault pending, or an unfinished
-   offline notification — take the medium offline. `MPRMediaOfflineCause`
-   records which of those four fired.
-3. Read SAS IO Unit Page 0 and SAS Device Page 0.
-   - Handle present and unchanged, medium published, not offline — online, no
-     work.
-   - Handle present but different, or medium not published — offline, then
-     reinitialize.
-   - No handle and no negotiated link on any phy — absence: poll, never reset.
-   - No handle but a phy carries a link, or the device page denies the current
-     handle (`fSasDeviceMismatch`, confirmed on two consecutive polls) — the
-     IOC has not rediscovered this insertion: run the bounded reset below.
-4. Bounded reinitialization: at most three diagnostic resets per insertion,
-   after that only polling. A target that was absent in the previous snapshot
-   gets a fresh budget.
-5. After a successful reset, re-run discovery, identity, capacity, TUR and a
-   block read, then publish (or re-notify) the medium while the lock is
-   released.
+Lock roles:
 
-A removal is latched (`fRemovalPending`) on `TARGET_NOT_RESPONDING` and on any
-`PHY_CHANGED` for the phy that carries the attached handle, even if a fast
-replug reuses the same handle, so the old medium is always taken down first. A
-phy change means the link was renegotiated, which only happens after it
-dropped; requiring the reported rate to be low was wrong, because a replug
-shorter than one poll interval can produce a phy change with a healthy rate and
-no removal event at all — measured on this adapter, and the reason a two-second
-replug used to keep the old medium alive. The latch is not the only signal
-either: a replug can also surface as a device page identity mismatch, and that
-path takes the medium offline before recovery as well.
+| Lock | Protected state |
+|---|---|
+| Scheduler IOLock | Request acceptance, sequence/fence state, completion records |
+| `fIOLock` | Hardware batches, management staging, discovery, recovery and PM |
+| `fReplyLock` | Command ownership, reply slots, event queue and topology latches |
+| `fPostLock` | The two halves of an MMIO request descriptor |
 
-## 3. IORegistry diagnostics
+The permitted inner lock order is reply then post. No wait or allocation
+occurs under either simple lock. No client notification is issued while
+holding the transport lock.
 
-Published by the controller: `MPRBuild`, `MPRIntState`, `MPREventState`,
-`MPRHotplugState`, `MPRHotplugAttempts`, `MPRHotplugResetResult`,
-`MPRHotplugHandle`, `MPRHotplugBlockDev`, `MPRReinitState`, `MPRResetCount`,
-`MPRResetInitiator`, `MPRMediaPresent`, `MPRMediaReady`,
-`MPRResidentBuffersReady`, `MPRMediaGeneration`, `MPRMediaBlocks`,
-`MPRMediaBlockSize`, `MPRDeviceOffline`, `MPRMediaOfflineStatus`,
-`MPRMediaOnlineStatus`, `MPRMediaOfflineCause`, `MPRTopologyGeneration`,
-`MPRTopologyState`, `MPRLinkUpPhys`, `MPRIdentityLostCount`,
-`MPREventAckQueued`/`InFlight`/`Completed`/`Failed`/`Overflow`,
-`MPRProtocolRecoveryPending`, `MPRProtocolFaultCode`, `MPRProtocolFaultSmid`,
-`MPRStickyFaultCode`/`Smid`/`Count`, `MPRBadReplySite`/`Value`/`Smid`/`Count`/
-`Function`/`MsgLen`/`Word`, `MPRLastTopoHandle`/`Reason`/`Rate`,
-`MPRTopoRemovalHits`, `MPRPhyNDevHandle`, `MPRPhyNLinkRate`, and the block
-I/O counters `MPRBlockIOCount`, `MPRBlockIODoneBytes`, `MPRBlockIOFailure`,
-`MPRBlockIOFailureLba`/`Smid`, `MPRBlockIORetryCount`, `MPRBlockRejectReason`.
+## 2. DMA, SGL and ownership
 
-Write accounting: `MPRWriteCount`, `MPRWriteBytes`, `MPRLastWriteLba`,
-`MPRLastWriteSmid`. These count completed 64 KiB staging chunks, so a write is
-visible only after its data reached the device. They record writes from any
-source, which is the point: while the medium is published writable, macOS
-mounts the volume and writes to it, and those writes must be attributable.
-A bounded verification on unallocated disk space (see section 9) showed the
-counters matching the issued traffic exactly — 34 writes / 2,098,176 bytes for
-the test operations plus 128 writes / 8,388,608 bytes for the final window
-restore — with `MPRLastWriteLba` equal to the start LBA of the last chunk.
+Each asynchronous window has its own resident data buffer, `IODMACommand`
+mapping and bounded chain storage. The mapper belongs to the PCI provider
+when available. Data addresses are restricted to 63 bits. The SGL encoder
+checks the complete address range, total length, request-frame geometry,
+chain depth and storage capacity before writing a list.
 
-Property values are diagnostics, never acceptance criteria: a state string of
-`online` is compatible with a medium the storage stack has already dropped, and
-a medium that is present but not readable is not "recovered". Acceptance is a
-raw read that returns the expected byte count with the expected content.
+IEEE request ChainOffset and NextChainOffset are in 16-byte elements.
+Only the final data element has END_OF_LIST. A chain's length describes the
+actual target elements, including its next chain element when present.
 
-Sampling note: a full `ioreg -l -w0` costs about 2.5 s on the target machine,
-which is far too coarse for a fast unplug. `ioreg -c MPRController -r -l -w0`
-costs ~0.03 s and is the right query for a hotplug trace.
+The implementation caps chains at four frames per window and caps each
+frame at 1024 bytes while honoring lower IOC limits. An unrepresentable
+mapping uses the established contiguous resident staging window. This is
+scatter/gather support with copies, not direct DMA into a client's buffer.
 
-## 4. Fault trails and what they identified
+SMIDs have explicit free, reserved, posted, completed, quarantined and
+cancelled ownership states. A completion must match the outstanding function
+and, for SCSI/TMF, the device handle. It must not overwrite an unconsumed
+completion. Software generations are not treated as tags present in hardware
+replies: a timed-out SMID remains unavailable until a reply or a proved DMA
+stop ends its ownership.
 
-Faults are recorded with a code and the SMID that caused them
-(`kMPRProtocolAckOverflow` 1, `AckReply` 2, `ManagementTimeout` 3,
-`EventLength` 4, `ManagementBusy` 5, `ManagementReply` 6, `AckTimeout` 7,
-`InterruptUnavailable` 8). Because a reinitialization clears the live fault
-state, `MPRStickyFault*` keeps the last fault across the reset, and
-`MPRBadReplySite` names the validation that rejected a completion
-(1 reply descriptor flags, 2 SCSI reply frame, 3 PORT_ENABLE frame,
-4 EVENT_NOTIFICATION frame, 5 config page frame).
+Sense storage is separate from configuration pages and independent per SMID.
+Both fixed and descriptor sense are bounded by the actual SenseCount.
+Block I/O requires an exact transfer count and valid SCSI completion state;
+only commands such as INQUIRY explicitly accept a shorter legal payload.
 
-The documented failure modes this trail resolved:
+Management, high-priority TMF and EVENT_ACK resources are reserved separately.
+Queue depths are constrained by IOC Facts, and TMFs obey the reported
+high-priority credit. A reset synthesizes cancelled completions for affected
+runtime commands instead of making each waiter time out again.
 
-- **PORT_ENABLE wait too short.** The firmware answers PORT_ENABLE about
-  7.6 s (`MPRLongReplyWaitMs=7594`, `Smid=3`) after a diagnostic reset on this
-  adapter, and the reference implementation allows 300 s for the same command.
-  A 2 s budget failed every rebuild even though the transport was healthy. The
-  wait is now 30 s and keeps draining the reply queue while it waits.
-- **SCSI reply length compared against the wrong size.** `MPRScsiIoReply` is
-  0x34 bytes because of the MPI 2.5 EEDP tail, but this firmware answers with
-  the classic 0x30-byte SCSI IO reply. `MsgLength * 4 < sizeof(...)` therefore
-  rejected every *error* reply (48 < 52) and raised a protocol fault, which
-  tore the medium down and reset the IOC. `MPRBadReplySite=2`,
-  `MsgLen=12`, `Function=0` is that signature. The check now covers only the
-  0x20-byte prefix the driver actually reads
-  (`MPR_SCSIIO_REPLY_MIN_BYTES`). A SCSI error reply is an I/O error, not a
-  transport failure.
-- **No rediscovery trigger.** After a replug the IOC can leave a phy with a
-  negotiated link and no attached target, and it emits no further topology
-  event. Treating that snapshot as "disk absent" polled forever. It now takes
-  the bounded reset path, which is the only rediscovery this prototype owns.
-- **Device page denial spun forever.** A fast replug can leave SAS Device
-  Page 0 answering with a different handle or a non-zero access status. That
-  was counted as a topology read failure and retried indefinitely, so the
-  driver never converged and the old medium was never taken offline. It is now
-  recognised as an identity change and routed to the same bounded recovery.
+If hardware cannot be proven quiescent, DMA-visible resident resources remain
+retained. Client buffers are never the target of that DMA, so failed client
+requests can still complete. Such a state requires controlled recovery and is
+not a reason to reuse the quarantined window.
 
-## 5. Fault injection
+## 3. Disk discovery and identity
 
-Two boot-args exist only to exercise the recovery chain without touching the
-disk. Both are one-shot and inert unless set.
+Discovery combines SAS IO Unit Page 0 with SAS Device Page 0 GET_NEXT_HANDLE.
+The latter reaches a terminal disk behind an expander backplane. It does not
+create a multi-target storage stack. Multiple eligible disks are refused.
 
-- `mpr_timeout_test=1` fails a single SCSI command (SMID 10–25) as if its reply
-  were lost. It only fires after bring-up: while `fStarting` a timeout
-  escalates straight to the bounded reset by design, so allowing the injection
-  there would consume it without exercising anything. Consumed injection leaves
-  `MPRInjectTimeout=0` and `MPRLastIOFailure=reply-timeout`.
-- `mpr_tmf_fail=N` makes the first N task-management levels look unsuccessful,
-  so recovery really submits the next level: N=1 skips `ABORT_TASK` and sends
-  `LUN_RESET`, N=2 skips both and sends `TARGET_RESET`, N=3 skips all three and
-  falls through to `resetAndReinitialize`. `MPRTmfInjectedFail` records N, and
-  `MPRTmfTaskType` records what was actually sent (1 `ABORT_TASK`, 5
-  `LUN_RESET`, 3 `TARGET_RESET`). It needs `mpr_timeout_test=1` to have
-  something to recover from.
+On IR-capable firmware, RAID Configuration Page 0 is enumerated to exclude
+volumes, member disks, hot spares and expansion members. Configuration
+transport failures or malformed pages fail closed. IR change events retire
+the old eligibility decision.
 
-Observed with 0.17.19: N absent → `ABORT_TASK` succeeded with
-`TerminationCount=1`, `MPRRecoveryState=ok`, no IOC reset; N=1 → `LUN_RESET`
-ok, no reset; N=2 → `TARGET_RESET` ok, no reset; N=3 → `MPRResetInitiator`
-`io-timeout`, one further reset from the worker, media republished with its
-partitions and readable. A timeout that lands during bring-up instead records
-`kMPRProtocolManagementTimeout` and lets the worker run its bounded reset; that
-path also ends with the medium readable.
+SATA identity prefers ATA IDENTIFY model and serial; VPD 0x83/0x80 are
+fallbacks. SAS address and DevHandle are topology properties, not persistent
+identity. Recovery rechecks the stable identity, block count and block size.
+A physical insertion publishes a new media generation after retiring the
+previous medium; a transport recovery cannot silently bind old I/O to a
+different disk.
 
-## 6. Choosing an immutability reference
+## 4. Hotplug and recovery
 
-The first 64 MiB of this disk is **live exFAT metadata**, not a stable
-reference: the root directory, allocation bitmap and upcase table sit at
-partition offsets 8–13 MiB, and macOS rewrites parts of that region when it
-mounts or repairs the volume. Per-boot comparisons showed changes confined to
-those clusters plus one data region, while the main and backup boot regions
-stayed byte-identical, `VolumeFlags` stayed `0x0000`, `fsck_exfat -n` reported
-the volume OK, and repeated reads inside one boot were identical. Use a
-data-area range — skip 1024 MiB, 64 MiB — as the immutability anchor; that
-range has been byte-stable across every round, and unmount the volume before
-hashing.
+The watchdog monitors IOC state, event acknowledgement and topology work.
+A worker retires the old IOMedia through its actual storage client, then
+discovers, probes and publishes the new medium with no transport lock held
+around reentrant notifications.
 
-## 7. Buffer lifetime
+A real TARGET_NOT_RESPONDING event can initiate
+TARGET_RESET -> command drain -> SAS IO Unit Control REMOVE_DEVICE.
+The event handle and generation are preserved. A live/reused handle, a new
+add event or renewed PHY activity cancels the old removal decision.
+Uncertain state falls back to bounded controller recovery.
 
-`fPageBuffer` and `fDataBuffer` are resident for the lifetime of the
-controller object and are never freed by a probe. A probe that allocates a
-temporary page only releases it when no protocol recovery is pending; a frame
-the firmware may still own is never recycled on the strength of a timeout
-alone. Reinitialization replaces a small temporary page only after a successful
-IOC reset. `fResidentBuffersReady` records that the resident pair exists, and
-block I/O refuses to start without it.
+A usable independent target is probed directly before attempting an IOC
+reset. Full resets remain capped at three per insertion. An empty fabric,
+including an expander with no eligible terminal disk, is polled without
+an endless reset loop.
 
-## 8. Verification method
+Timeout recovery attempts ABORT TASK, LUN RESET and TARGET RESET subject to
+available TMF credit and terminated-command evidence, then a bounded IOC
+reset. Writes with uncertain completion are not replayed. The legacy
+synchronous path may retry a zero-transfer UNIT ATTENTION read once.
 
-Per cycle: capture identity and driver state, start a `ioreg -c MPRController`
-sampler at 5 Hz, perform the physical action, and afterwards compare
-`MPRMediaGeneration`, `MPRMediaOfflineStatus`, `MPRMediaOnlineStatus`,
-`MPRResetCount`, handle and topology generation. Then confirm exactly one
-active whole-disk `IOMedia` with its partition child, and read 64 MiB from the
-raw device under an external 60 s deadline, recording exit status, stderr,
-byte count and SHA-256, plus a fixed-offset 64 MiB reference range that must
-hash identically before and after the cycle. In-flight cycles run continuous
-256 MiB reads so the unplug lands inside one of them; that read must terminate
-with an error rather than a timeout hang.
+## 5. Cache, FUA and UNMAP
 
-Write verification uses a region with no filesystem of its own — partition 1,
-the Microsoft Reserved area — so no file data is at risk, and it runs as
-save → write → readback → restore → readback: the restored bytes must hash
-identically to the saved copy, and the region's fingerprint must match before
-and after. Sizes 512 B, 4 KiB, 64 KiB, 1 MiB, 4 MiB and 8 MiB all round-trip
-byte-exactly; a write at the capacity boundary is rejected with `EIO` and the
-region is unchanged. Open the raw node once with `O_RDWR | O_EXCL` for the
-whole test: a mounted volume makes every later write-open fail with `EBUSY`,
-which is the operating system protecting a filesystem it believes it owns.
+READ/WRITE selects 10- or 16-byte CDBs from the entire requested range.
+SYNCHRONIZE CACHE uses the corresponding width; a range larger than the
+16-byte block-count field is satisfied by a stronger whole-medium flush.
+FUA uses the native capability when known, otherwise an ordered flush after
+the request's successful writes.
 
-Offsets in `dd` are in `bs` units, so `bs=1m seek=34` is byte 34 MiB, not LBA
-34. Use `oflag=seek_bytes`/`iflag=skip_bytes`, or byte offsets through
-`pread`/`pwrite`, whenever the target is an LBA.
+UNMAP requires B0 Block Limits and B2 Logical Block Provisioning/LBPU.
+Every input extent is validated before the first discard. The generated
+batches obey the maximum block count, descriptor count and per-descriptor
+32-bit block field. Optimal granularity and alignment are recorded as hints;
+the driver never rounds outward into data the caller did not discard.
+A failure disables UNMAP while leaving ordinary I/O subject to the normal
+device/recovery state. Read-zero behavior is claimed only when advertised.
 
-Unplug during a write uses a continuous 2 MiB pwrite loop against the same
-scratch range, logging every attempt's elapsed time and result. The write that
-meets the removal must fail with an error — measured at 3.9 s for a ten-second
-unplug and 2.0 s for a two-second one, both far inside the 60 s deadline — and
-every later attempt through the stale handle must fail in about 0.1 ms, which
-is what shows nothing was replayed onto the new medium. With the phy-change
-removal rule in place the two-second case also retires the old medium
-(`MPRMediaOfflineCause=removal-event`, generation 1→2→3, one reset) and comes
-back with its partition, read verified.
+## 6. Power and shutdown
+
+`setPowerState` is the registered PM entry point. The normal operating vote
+is On. Sleep closes asynchronous acceptance, fences accepted I/O, flushes
+the disk when usable, disables reply delivery, resets/quiesces the IOC and
+disables PCI bus mastering. Ownership is reset only after DMA stop is proved.
+
+Wake restores PCI access, rebuilds queues/events/topology, revalidates the
+disk, then reopens acceptance. A failed wake retires media and requests
+bounded recovery. `systemWillShutdown` follows the same quiesce path.
+Sleep/wake and shutdown behavior in this version remains unqualified on
+hardware; source hooks and compilation are not runtime evidence.
+
+Stop waits for the I/O and completion workers outside the transport lock,
+then tears down DMA. Scheduler/transport locks remain alive until final
+service release so callers retained before stop can unwind safely.
+
+## 7. Diagnostics
+
+| Area | Useful IORegistry properties |
+|---|---|
+| Build and media | `MPRBuild`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady` |
+| Async and DMA | `MPRAsyncRequestLimit`, `MPRAsyncCommandLimit`, `MPRAsyncPeakRequests`, `MPRMappedCommands`, `MPRChainedCommands`, `MPRBounceCommands` |
+| Identity/filter | `MPRStableIdentityValid`, `MPRStableIdentity`, `MPRIdentityState`, `MPRRaidFilterState`, `MPRStandaloneTargetCount` |
+| Capabilities | `MPRNativeFuaSupported`, `MPRFuaPolicy`, `MPRUnmapEnabled`, `MPRUnmapMaxLbaCount`, `MPRUnmapMaxDescriptors`, `MPRUnmapReadsZero` |
+| Recovery | `MPRHotplugState`, `MPRTargetRemovalState`, `MPRResetCount`, `MPRReinitState`, `MPRRecoveryState`, `MPRDeviceOffline` |
+| Protocol | `MPRProtocolRecoveryPending`, `MPRProtocolFaultCode`, `MPRStickyFaultCount`, `MPRBadReplySite`, `MPREventAckQueued`, `MPREventAckFailed` |
+| Power | `MPRPowerState`, `MPRPowerFlushStatus`, `MPRStopDMAState`, `MPRWatchdogIOCState` |
+| Writes | `MPRWriteCount`, `MPRWriteBytes`, `MPRLastWriteLba`, `MPRLastWriteSmid` |
+
+A property saying "online" is not data-integrity evidence. Always pair it with
+the active IOMedia count, actual byte count and readback content.
+
+Existing opt-in boot arguments `mpr_timeout_test`, `mpr_tmf_fail` and
+`mpr_timeout_every` exercise recovery. They are not enabled by this patch.
+Serial kernel logging remains off by default under the workspace rules.
