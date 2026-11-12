@@ -51,9 +51,13 @@ MPRBlockDev::refreshIdentity(void)
 {
     IOLockLock(fControllerLock);
     if (fController != NULL) {
-        strlcpy(fVendor, fController->getVendorString(), sizeof(fVendor));
-        strlcpy(fProduct, fController->getProductString(), sizeof(fProduct));
-        strlcpy(fRevision, fController->getRevisionString(), sizeof(fRevision));
+        /* Each nub reports its own target's INQUIRY identity. */
+        strlcpy(fVendor, fController->getVendorStringForHandle(fDevHandle),
+                sizeof(fVendor));
+        strlcpy(fProduct, fController->getProductStringForHandle(fDevHandle),
+                sizeof(fProduct));
+        strlcpy(fRevision, fController->getRevisionStringForHandle(fDevHandle),
+                sizeof(fRevision));
     }
     IOLockUnlock(fControllerLock);
 }
@@ -317,7 +321,7 @@ MPRBlockDev::doSynchronizeCache(void)
     if (fReadOnly) return kIOReturnSuccess; /* nothing was written: no command */
     MPRController *controller = copyController();
     if (controller == NULL) return kIOReturnNoMedia;
-    IOReturn status = controller->synchronizeCache(0, 0, false);
+    IOReturn status = controller->synchronizeCache(0, 0, false, fDevHandle);
     controller->release();
     return status;
 }
@@ -331,7 +335,7 @@ MPRBlockDev::doSynchronize(UInt64 block, UInt64 nblks,
 
     MPRController *controller = copyController();
     if (controller == NULL) return kIOReturnNoMedia;
-    IOReturn status = controller->synchronizeCache(block, nblks, barrier);
+    IOReturn status = controller->synchronizeCache(block, nblks, barrier, fDevHandle);
     controller->release();
     return status;
 }
@@ -343,7 +347,7 @@ MPRBlockDev::doUnmap(IOBlockStorageDeviceExtent *extents,
     if (fReadOnly) return kIOReturnNotWritable;
     MPRController *controller = copyController();
     if (controller == NULL) return kIOReturnNoMedia;
-    IOReturn status = controller->unmapBlocks(extents, extentsCount);
+    IOReturn status = controller->unmapBlocks(extents, extentsCount, fDevHandle);
     controller->release();
     return status;
 }

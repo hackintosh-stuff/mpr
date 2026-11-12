@@ -21,7 +21,7 @@ struct MPRAsyncRequest {
     IOMemoryDescriptor *buffer;
     IOStorageCompletion completion;
     UInt64 sequence, turn, block, blocks, total, issued, completed;
-    UInt32 generation, inFlight, blockSize;
+    UInt32 generation, targetGeneration, inFlight, blockSize;
     UInt16 devHandle;
     IOReturn status;
     bool occupied, initialized, prepared, finished, write, fua;
@@ -227,6 +227,10 @@ MPRController::submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
     job->block = block;
     job->blocks = nblks;
     job->generation = generation;
+    /* The target's own generation is what rejects a request queued for a disk
+     * that has since been removed or replaced behind the same handle. */
+    MPRTargetSlot *slot = findTarget(devHandle);
+    job->targetGeneration = slot != NULL ? slot->generation : 0;
     job->write = write;
     job->fua = fua;
     job->devHandle = devHandle;
@@ -295,24 +299,29 @@ MPRController::endAsyncBarrier(void)
 }
 
 IOReturn
-MPRController::synchronizeCache(UInt64 block, UInt64 nblks, bool barrier)
+MPRController::synchronizeCache(UInt64 block, UInt64 nblks, bool barrier,
+                                UInt16 handle)
 {
-    const UInt32 generation = fMediaGeneration;
+    /* The fence orders this client's earlier writes; the generation proves the
+     * command still names the medium those writes were accepted for. */
+    MPRTargetSlot *slot = findTarget(handle);
+    const UInt32 generation = slot != NULL ? slot->generation : 0;
     IOReturn result = beginAsyncBarrier();
     if (result != kIOReturnSuccess) return result;
-    result = synchronizeCacheNow(block, nblks, barrier, generation);
+    result = synchronizeCacheNow(block, nblks, barrier, generation, handle);
     endAsyncBarrier();
     return result;
 }
 
 IOReturn
 MPRController::unmapBlocks(const IOBlockStorageDeviceExtent *extents,
-                           UInt32 extentsCount)
+                           UInt32 extentsCount, UInt16 handle)
 {
-    const UInt32 generation = fMediaGeneration;
+    MPRTargetSlot *slot = findTarget(handle);
+    const UInt32 generation = slot != NULL ? slot->generation : 0;
     IOReturn result = beginAsyncBarrier();
     if (result != kIOReturnSuccess) return result;
-    result = unmapBlocksNow(extents, extentsCount, generation);
+    result = unmapBlocksNow(extents, extentsCount, generation, handle);
     endAsyncBarrier();
     return result;
 }
@@ -353,10 +362,13 @@ MPRController::asyncWorker(void)
             MPRTargetSlot *slot = findTarget(job->devHandle);
             const UInt32 blockSize = slot != NULL ? slot->blockSize : 0;
             const UInt64 capacityBlocks = slot != NULL ? slot->capacityBlocks : 0;
-            if (fStopping || fSuspended || fDeviceOffline || fReinitInProgress ||
-                fProtocolRecoveryPending || !fMediaPresent || slot == NULL ||
-                !slot->present || job->generation != fMediaGeneration ||
-                mediaRemovalPending()) {
+            /* Admission is per target: one target that is being probed, is
+             * offline or has been replaced must not fail the others. */
+            if (fStopping || fSuspended || fDeviceOffline || fProtocolRecoveryPending ||
+                slot == NULL || !slot->present || !slot->probeValid ||
+                slot->offlinePending ||
+                job->targetGeneration != slot->generation ||
+                job->generation != fMediaGeneration || mediaRemovalPending()) {
                 job->status = kIOReturnNoMedia;
                 continue;
             }
@@ -416,7 +428,7 @@ MPRController::asyncWorker(void)
             UInt8 cdb[16];
             UInt32 cdbLength = mprBuildReadWriteCdb(cdb, job->write,
                 job->block + window.offset / blockSize, blocks,
-                job->fua && isNativeFuaSupported());
+                job->fua && slot->nativeFua);
             if (!cdbLength) {
                 cancelUnpostedCommand(smid);
                 job->status = kIOReturnBadArgument;
@@ -498,8 +510,11 @@ MPRController::asyncWorker(void)
             IOReturn result = kIOReturnIOError;
             bool complete = scsiWaitChunk(kMPRRuntimeSmid + index,
                                           window.bytes, &result);
+            MPRTargetSlot *jobSlot = findTarget(job->devHandle);
             if (complete && (job->generation != fMediaGeneration ||
-                !fMediaPresent || mediaRemovalPending())) {
+                jobSlot == NULL || !jobSlot->present || jobSlot->offlinePending ||
+                job->targetGeneration != jobSlot->generation ||
+                mediaRemovalPending())) {
                 complete = false;
                 result = kIOReturnNoMedia;
             }
@@ -523,8 +538,10 @@ MPRController::asyncWorker(void)
                     }
                 }
             }
-            if (!complete && job->status == kIOReturnSuccess)
+            if (!complete && job->status == kIOReturnSuccess) {
                 job->status = result == kIOReturnSuccess ? kIOReturnIOError : result;
+                if (jobSlot != NULL) jobSlot->failureCount++;
+            }
             if (complete && window.offset == job->completed)
                 job->completed += window.bytes;
             if (complete && job->write) {
@@ -533,6 +550,8 @@ MPRController::asyncWorker(void)
                 fLastWriteLba = job->block + window.offset /
                     (job->blockSize != 0 ? job->blockSize : fBlockSize);
                 fLastWriteSmid = kMPRRuntimeSmid + index;
+                /* Write accounting stays attributable to one target. */
+                if (jobSlot != NULL) jobSlot->writeCount++;
             }
             --job->inFlight;
             window.posted = false;
@@ -552,13 +571,22 @@ MPRController::asyncWorker(void)
             }
             if (job.status != kIOReturnSuccess ||
                 (job.initialized && job.issued == job.total)) {
-                /* FUA fallback is ordered under the transport lock; never
-                 * flush a replacement medium on behalf of this request. */
+                /* FUA fallback is ordered under the transport lock and names
+                 * this request's target; never flush a replacement medium or
+                 * another disk on behalf of this request. */
                 if (job.status == kIOReturnSuccess && job.write && job.fua &&
-                    job.total && !isNativeFuaSupported()) {
-                    job.status = job.generation == fMediaGeneration &&
-                                 fMediaPresent && !mediaRemovalPending() ?
-                        scsiSynchronizeCache(0, 0, 29, true) : kIOReturnNoMedia;
+                    job.total) {
+                    MPRTargetSlot *flushSlot = findTarget(job.devHandle);
+                    if (flushSlot != NULL && !flushSlot->nativeFua &&
+                        job.generation == fMediaGeneration &&
+                        job.targetGeneration == flushSlot->generation &&
+                        flushSlot->present && flushSlot->probeValid &&
+                        !flushSlot->offlinePending && !mediaRemovalPending() &&
+                        selectTarget(flushSlot->handle)) {
+                        job.status = scsiSynchronizeCache(0, 0, 29, true);
+                    } else {
+                        job.status = kIOReturnNoMedia;
+                    }
                 }
                 IOLockLock(state->lock);
                 job.finished = true;

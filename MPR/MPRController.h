@@ -50,10 +50,11 @@ struct MPRCommandOwner {
     UInt32 epoch;
 };
 
-/* Per-device state for multi-target isolation. During the staged rollout the
- * controller still publishes one nub, but every eligible target is recorded
- * here with its own identity, geometry and access policy. A newly discovered
- * disk is read-only unless an explicit write rule matches it. */
+/* Per-target state for multi-target isolation. A DevHandle is a firmware
+ * address, not a disk: it can name a different device after a replug, so each
+ * slot also carries the SAS address, stable identity and medium generation it
+ * was probed for. A newly discovered disk is read-only unless an explicit
+ * write rule matches it. */
 enum { kMPRMaxTargets = 8, kMPRMaxWriteRules = 4 };
 struct MPRTargetSlot
 {
@@ -62,7 +63,7 @@ struct MPRTargetSlot
     UInt16 flags;
     UInt64 sasAddress;
     bool   fastPath;
-    bool   present;
+    bool   present;         /* listed by the current topology snapshot */
     bool   readOnly;
     UInt64 capacityBlocks;
     UInt32 blockSize;
@@ -71,7 +72,25 @@ struct MPRTargetSlot
     char   model[64];
     char   serial[32];
     MPRBlockDev *nub;
+    /* Bumped whenever the medium behind this slot changes, so I/O and
+     * synchronous commands accepted for the old device cannot act on the new
+     * one. */
     UInt32 generation;
+    bool   probeValid;      /* geometry and identity probed for this device */
+    char   vendor[16];
+    char   product[20];
+    char   revision[8];
+    bool   online;          /* storage client was told the medium is online */
+    bool   offlinePending;
+    bool   onlinePending;
+    bool   removalRequested;
+    UInt32 scanToken;       /* last topology scan that listed this handle */
+    UInt32 probeFailures;   /* bounded read-only probe retries for this device */
+    UInt32 failureCount;
+    UInt32 writeCount;
+    bool   unmapEnabled;
+    bool   nativeFua;
+    MPRUnmapLimits unmapLimits;
 };
 
 class MPRController : public IOService
@@ -216,18 +235,14 @@ private:
     MPRUnmapLimits             fUnmapLimits;
     bool                       fTargetIdentityValid;
     char                       fTargetIdentity[520];
-    bool                       fMediaIdentityValid;
-    char                       fMediaIdentity[520];
-    UInt64                     fIdentityCapacity;
-    UInt32                     fIdentityBlockSize;
-    bool                       fRequireSameIdentity;
-    UInt16                     fRemovedTargetHandle;
-    UInt32                     fRemovalGeneration;
-    bool                       fTargetRemovalRequested;
     bool                       fPhysicalChangePending;
     volatile UInt32            fTopologyGeneration;
     volatile bool              fRemovalPending;
     bool                       fHotplugRetryRequested; /* new add outside IOC recovery */
+    /* A TARGET_NOT_RESPONDING event names a handle. It is latched here under
+     * fReplyLock and promoted into the target table by the hotplug worker,
+     * which is the only context allowed to change that table. */
+    volatile UInt16            fPendingRemovalHandle;
 
     /* Bulk data buffer for block transfers. It stays resident
      * for the lifetime of the nub instead of being freed after one probe. */
@@ -237,7 +252,6 @@ private:
 
     /* media identity, nub, and serialization of the shared SCSI IO
      * path (one outstanding SMID, one reply slot, one staging buffer). */
-    MPRBlockDev               *fBlockDev;
     IOLock                    *fIOLock;
     UInt64                     fCapacityBlocks;
     UInt32                     fBlockSize;
@@ -295,6 +309,7 @@ private:
      * read-only unless an explicit MPRWritableDevices rule matches it. */
     MPRTargetSlot              fTargets[kMPRMaxTargets];
     UInt32                     fTargetCount;
+    UInt32                     fScanSerial;
     char                       fWriteRuleModel[kMPRMaxWriteRules][64];
     char                       fWriteRuleSerial[kMPRMaxWriteRules][32];
     UInt32                     fWriteRuleCount;
@@ -335,8 +350,6 @@ private:
     void   watchdogTimeout(IOTimerEventSource *sender);
     void   hotplugThread(void);
     bool   mediaRemovalPending(void);
-    void   invalidateMedia(void); /* caller holds fIOLock */
-    bool   takeMediaOffline(void); /* drops fIOLock for notification */
     static void hotplugCall(thread_call_param_t param0,
                             thread_call_param_t param1);
     bool   waitForSmid(UInt32 timeoutMs, UInt32 smid);
@@ -375,13 +388,13 @@ private:
     bool   probeStableIdentity(void);
     bool   scsiSataIdentify(UInt8 identify[512]);
     bool   probeTargetCapabilities(void);
-    bool   retireRemovedTarget(void);
     bool   checkTargetIdentity(void);
     bool   isNativeFuaSupported(void) const { return fNativeFuaSupported; }
     IOReturn synchronizeCacheNow(UInt64 block, UInt64 nblks, bool barrier,
-                                 UInt32 expectedGeneration);
+                                 UInt32 expectedGeneration, UInt16 handle);
     IOReturn unmapBlocksNow(const IOBlockStorageDeviceExtent *extents,
-                            UInt32 extentsCount, UInt32 expectedGeneration);
+                            UInt32 extentsCount, UInt32 expectedGeneration,
+                            UInt16 handle);
 
     bool   postScsiIo(UInt32 smid);
     bool   scsiTur(void);
@@ -405,9 +418,20 @@ private:
     bool   allocatePageBuffer(void);
     bool   allocateResidentBuffers(void);
     bool   prepareTargetMedia(void);
-    bool   publishBlockDevice(void);
-    bool   publishTargets(void);
+    bool   ensureTargetsPublished(void);
     bool   publishTarget(MPRTargetSlot *slot);
+    bool   probeTarget(MPRTargetSlot *slot);
+    bool   selectTarget(UInt16 handle);
+    MPRTargetSlot *allocTargetSlot(void);
+    void   requestTargetRemoval(MPRTargetSlot *slot);
+    void   invalidateTarget(MPRTargetSlot *slot);
+    void   invalidateTargets(void);
+    bool   retireTarget(MPRTargetSlot *slot);
+    bool   removeTargetDevice(UInt16 handle);
+    bool   targetDevicePresent(UInt16 handle, bool *present, UInt64 *sasAddress);
+    UInt32 liveTargetCount(void);
+    void   publishTargetProperties(void);
+    void   publishTargetCounters(void);
 
     /* command submission, auto sense, task management and recovery. */
     void   postDefaultRequest(UInt32 smid);
@@ -436,7 +460,8 @@ private:
                                   bool barrier);
     IOReturn scsiUnmap(const IOBlockStorageDeviceExtent *extents,
                        UInt32 extentsCount, UInt32 smid);
-    bool   sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid);
+    bool   sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid,
+                        UInt16 handle, UInt16 *iocStatus = NULL);
     bool   recoverTimedOutCommand(UInt32 smid);
     bool   resetAndReinitialize(void);
 
@@ -464,9 +489,11 @@ public:
         MPRTargetSlot *slot = findTarget(handle);
         return slot != NULL ? slot->capacityBlocks : 0;
     }
+    /* A published target is one whose current device was probed and whose
+     * medium has not been retired; a bare topology entry is not media. */
     bool isMediaPresentForHandle(UInt16 handle) {
         MPRTargetSlot *slot = findTarget(handle);
-        return slot != NULL && slot->present;
+        return slot != NULL && slot->present && slot->probeValid;
     }
 
     /* MPRBlockDev relays every request through these accessors. Each request
@@ -480,9 +507,10 @@ public:
     IOReturn transferBlocks(bool write, IOMemoryDescriptor *buffer,
                             UInt64 block, UInt64 nblks, bool fua,
                             UInt64 *actualBytes);
-    IOReturn synchronizeCache(UInt64 block, UInt64 nblks, bool barrier);
+    IOReturn synchronizeCache(UInt64 block, UInt64 nblks, bool barrier,
+                              UInt16 handle);
     IOReturn unmapBlocks(const IOBlockStorageDeviceExtent *extents,
-                         UInt32 extentsCount);
+                         UInt32 extentsCount, UInt16 handle);
     UInt64   getCapacityBlocks(void) const { return fCapacityBlocks; }
     bool     isDeviceOffline(void) const { return fDeviceOffline; }
     bool     isMediaPresent(void) const { return fMediaPresent; }
@@ -490,6 +518,20 @@ public:
     char    *getVendorString(void) { return fVendor; }
     char    *getProductString(void) { return fProduct; }
     char    *getRevisionString(void) { return fRevision; }
+    /* Identity strings are per target: every published disk has its own
+     * INQUIRY response, not the response of whichever target was probed last. */
+    char    *getVendorStringForHandle(UInt16 handle) {
+        MPRTargetSlot *slot = findTarget(handle);
+        return slot != NULL ? slot->vendor : fVendor;
+    }
+    char    *getProductStringForHandle(UInt16 handle) {
+        MPRTargetSlot *slot = findTarget(handle);
+        return slot != NULL ? slot->product : fProduct;
+    }
+    char    *getRevisionStringForHandle(UInt16 handle) {
+        MPRTargetSlot *slot = findTarget(handle);
+        return slot != NULL ? slot->revision : fRevision;
+    }
 };
 
 #endif /* MPRController_h */

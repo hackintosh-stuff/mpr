@@ -1,10 +1,11 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.19.0.
+Date: 2026-11-13. Driver version: 0.20.0.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
-(`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes one independent
-disk through `IOBlockStorageDriver` as a whole-disk `IOMedia`.
+(`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes every eligible
+independent disk through `IOBlockStorageDriver` as its own whole-disk
+`IOMedia`.
 
 ## Status
 
@@ -13,7 +14,7 @@ Built, linked, signed ad hoc and loaded from the internal ESP on the test machin
 `MPRBuild`.
 
 The driver is qualified in two configurations: the test SATA disk attached
-directly to the SAS3008, and the same disk as the only terminal disk behind an
+directly to the SAS3008, and the same disk as the terminal disk behind an
 Adaptec AEC-82885T expander and one backplane. Both publish one whole-disk
 `IOMedia` and pass bounded read, write, flush and UNMAP with byte-exact
 readback, including concurrent reads. Direct attach additionally passed unplug
@@ -21,18 +22,22 @@ and replug, including unplug with I/O in flight; reply-timeout injection through
 ABORT_TASK, LUN RESET, TARGET RESET and controller reset; sleep/wake; and
 shutdown.
 
-Multi-target discovery records every eligible device in a bounded target table
-and publishes one nub per target, each with its own geometry, identity and
-completion ownership; block I/O is routed by DevHandle. Access is fail-closed:
-a nub is read-only unless an explicit `MPRWritableDevices` rule in the kext
-personality matches the disk's model and serial, so a disk from an unknown
-array cannot receive a write. Per-target TARGET_RESET/REMOVE_DEVICE and
-hotplug/power management isolation are still being added.
+With two targets on the expander (the SATA test disk and a 6 TB SAS disk that
+belongs to a ZFS array) the driver publishes one nub per target with its own
+geometry, INQUIRY identity and completion ownership, and routes every command by
+DevHandle. Access is fail-closed: a target is read-only unless an explicit
+`MPRWritableDevices` rule matches its ATA model and serial, and an SSP device is
+always read-only, so the array member cannot receive a write. On the running
+system the array member's read-only media was reported as such, raw reads at LBA
+0 and at 5.6 TB matched across passes and across a reboot, and every completed
+write was attributed to the writable target while the array member's write count
+stayed zero.
 
-Not covered: per-target removal and recovery, SAS/SSP write paths, multipath, multiple LUNs,
-enclosure services, physical unplug/replug and power management behind the
-expander, long duration or concurrent stress, and throughput tuning.
-Wire-format and large-LBA cases are checked on the host, not on this hardware.
+Not covered: per-target removal, hotplug and sleep/wake have not been repeated
+on hardware with the second target attached; SAS/SSP write paths, multipath,
+multiple LUNs, enclosure services, long duration or concurrent stress, and
+throughput tuning are out of scope. Wire-format and large-LBA cases are checked
+on the host, not on this hardware.
 
 ## Capabilities
 
@@ -49,12 +54,14 @@ Wire-format and large-LBA cases are checked on the host, not on this hardware.
   the reported limits without extending the caller's discard range.
 - SAS device-handle enumeration, independent-disk filtering on IR-capable
   firmware, and stable identity with capacity and block-size revalidation.
-- Per-command sense and completion ownership; bounded TMF escalation and
-  controller recovery; no replay of a write with uncertain completion.
-- Media offline/online lifecycle, guarded TARGET_RESET / REMOVE_DEVICE, and
-  bounded full-controller recovery.
-- Registered power states: quiesce, flush and DMA stop for sleep and shutdown;
-  rebuild and revalidate on wake.
+- Per-command sense and completion ownership; TMF escalation and IOC recovery
+  that name the failed command's own handle; no replay of a write with uncertain
+  completion.
+- Per-target media offline/online lifecycle, guarded TARGET_RESET / drain /
+  REMOVE_DEVICE with handle-reuse checks, and bounded full-controller recovery
+  as the fallback when a removal or probe cannot be proved.
+- Registered power states: per-target flush, then DMA stop for sleep and
+  shutdown; rebuild and per-target revalidation on wake.
 
 Implementation, memory ownership, locking and diagnostic details are in
 [DEBUG.md](DEBUG.md). Scope, reference baseline, milestone status and remaining
@@ -62,15 +69,17 @@ work are in [PLAN.md](PLAN.md).
 
 ## Scope
 
-The storage path is single-target and LUN 0. If more than one eligible
-independent target is discovered, publication is refused rather than choosing an
-arbitrary disk.
+Each published target is a LUN-0 whole disk with its own medium. Discovery,
+probing, removal and recovery are per target: a handle names one firmware
+address, and the driver keeps the SAS address, stable identity and medium
+generation that address was probed for, so a reused handle is never treated as
+the same disk.
 
-IR RAID volumes, multi-target isolation, multipath, multi-LUN devices, SES/SMP
-management, NVMe/Tri-Mode, firmware flashing and FreeBSD user ioctl
-compatibility are outside this driver. Client buffers are copied through
-bounded resident DMA windows; direct zero-copy client DMA and multiple hardware
-reply queues are not implemented.
+IR RAID volumes, multipath, multi-LUN devices, SES/SMP management,
+NVMe/Tri-Mode, firmware flashing and FreeBSD user ioctl compatibility are
+outside this driver. Client buffers are copied through bounded resident DMA
+windows; direct zero-copy client DMA and multiple hardware reply queues are not
+implemented.
 
 These limits are not additional hardware requirements.
 

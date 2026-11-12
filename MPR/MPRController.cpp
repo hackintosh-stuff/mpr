@@ -420,8 +420,7 @@ MPRController::resetProtocolState(void)
     fEventAckBusy = false;
     fProtocolRecoveryPending = false;
     fProtocolFaultCode = fProtocolFaultSmid = 0;
-    fTargetRemovalRequested = false;
-    fRemovedTargetHandle = 0;
+    fPendingRemovalHandle = 0;
     IOSimpleLockUnlock(fReplyLock);
 }
 
@@ -525,13 +524,13 @@ MPRController::recordTopologyEventLocked(const UInt8 *data, UInt32 bytes)
             fPhysicalChangePending = true;
         }
         if (affected && reason == MPI2_EVENT_SAS_TOPO_RC_TARG_NOT_RESPONDING) {
-            fRemovedTargetHandle = handle;
-            fRemovalGeneration = fTopologyGeneration + 1;
-            fTargetRemovalRequested = true;
-        } else if (handle == fRemovedTargetHandle &&
+            /* Latch the handle only. The target table is owned by the hotplug
+             * worker under fIOLock; this runs with fReplyLock held. */
+            fPendingRemovalHandle = handle;
+        } else if (handle == fPendingRemovalHandle &&
                    (reason == MPI2_EVENT_SAS_TOPO_RC_TARG_ADDED ||
                     (reason == MPI2_EVENT_SAS_TOPO_RC_PHY_CHANGED && rate >= 8))) {
-            fTargetRemovalRequested = false;
+            fPendingRemovalHandle = 0;
         }
         if (reason == MPI2_EVENT_SAS_TOPO_RC_TARG_ADDED &&
             !fReinitInProgress && !fStarting) {
@@ -1386,7 +1385,7 @@ MPRController::processReplyQueue(void)
                         /* Membership can change without a physical hotplug.
                          * Freeze publication until the complete config is read. */
                         if (fMediaPresent) fRemovalPending = true;
-                        fTargetRemovalRequested = false;
+                        fPendingRemovalHandle = 0;
                         fTopologyGeneration++;
                         fTopologyChanged = true;
                         fHotplugPending = true;
@@ -1756,7 +1755,11 @@ MPRController::postScsiIo(UInt32 smid)
     const UInt8 *frame = base + (UInt64)smid * fRequestFrameSize;
     UInt16 handle = (UInt16)((UInt16)frame[0] | ((UInt16)frame[1] << 8));
     if (handle == 0) handle = (UInt16)fAttachedDevHandle;
-    UInt32 flags = fFastPathEnabled
+    /* Fast-path capability is the target's, not the controller's: a descriptor
+     * type chosen from another target would be rejected or misrouted. */
+    MPRTargetSlot *slot = findTarget(handle);
+    bool fastPath = slot != NULL ? slot->fastPath : fFastPathEnabled;
+    UInt32 flags = fastPath
                        ? MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO
                        : MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO;
     IOSimpleLockLock(fReplyLock);
@@ -2688,180 +2691,6 @@ MPRController::allocateResidentBuffers(void)
 /* Target protocol implementation is in MPRTarget.cpp. */
 
 bool
-MPRController::publishBlockDevice(void)
-{
-    /* No DMA preparation or transport operation belongs here: matching can
-     * re-enter block IO immediately. The caller publishes outside fIOLock. */
-    MPRBlockDev *nub;
-    if (fBlockDev != NULL) return true;
-    if (!fMediaPresent || fDeviceOffline || fAttachedDevHandle == 0 ||
-        fCapacityBlocks == 0 || fBlockSize == 0 || fIOLock == NULL ||
-        fPageBuffer == NULL || fDataBuffer == NULL ||
-        fPagePhys == 0 || fDataPhys == 0 || fDataBytes == 0) {
-        setProperty("MPRBlockDeviceState", "skipped-not-ready");
-        return false;
-    }
-
-    nub = new MPRBlockDev;
-    if (nub == NULL) {
-        setProperty("MPRBlockDeviceState", "failed-nub-alloc");
-        return false;
-    }
-    if (!nub->init(NULL)) {
-        nub->release();
-        setProperty("MPRBlockDeviceState", "failed-nub-init");
-        return false;
-    }
-    nub->setController(this, (UInt16)fAttachedDevHandle, fTargetReadOnly);
-    if (!nub->attach(this)) {
-        nub->release();
-        setProperty("MPRBlockDeviceState", "failed-nub-attach");
-        return false;
-    }
-    if (!nub->start(this)) {
-        nub->detach(this);
-        nub->release();
-        setProperty("MPRBlockDeviceState", "failed-nub-start");
-        return false;
-    }
-
-    fBlockDev = nub;
-    nub->registerService();
-    setProperty("MPRBlockDeviceState", "ok");
-    setProperty("MPRMediaBlocks", fCapacityBlocks, 64);
-    setProperty("MPRMediaBlockSize", (unsigned long long)fBlockSize, 32);
-    IOLog("MPR nub registered, blocks=%llu blockSize=%u\n",
-          (unsigned long long)fCapacityBlocks, (unsigned int)fBlockSize);
-    return true;
-}
-
-bool
-MPRController::publishTarget(MPRTargetSlot *slot)
-{
-    if (slot == NULL || slot->handle == 0 || slot->nub != NULL ||
-        slot->blockSize == 0 || slot->capacityBlocks == 0 ||
-        fIOLock == NULL || fPageBuffer == NULL || fDataBuffer == NULL ||
-        fPagePhys == 0 || fDataPhys == 0 || fDataBytes == 0) return false;
-    MPRBlockDev *nub = new MPRBlockDev;
-    if (nub == NULL) return false;
-    if (!nub->init(NULL)) {
-        nub->release();
-        return false;
-    }
-    nub->setController(this, slot->handle, slot->readOnly);
-    if (!nub->attach(this)) {
-        nub->release();
-        return false;
-    }
-    if (!nub->start(this)) {
-        nub->detach(this);
-        nub->release();
-        return false;
-    }
-    slot->nub = nub;
-    if (fBlockDev == NULL) fBlockDev = nub; /* legacy single-nub paths */
-    nub->registerService();
-    UInt32 index = (UInt32)(slot - fTargets);
-    char name[40];
-    snprintf(name, sizeof(name), "MPRTarget%uReadOnly", index);
-    setProperty(name, slot->readOnly);
-    snprintf(name, sizeof(name), "MPRTarget%uBlocks", index);
-    setProperty(name, (unsigned long long)slot->capacityBlocks, 64);
-    snprintf(name, sizeof(name), "MPRTarget%uBlockSize", index);
-    setProperty(name, (unsigned long long)slot->blockSize, 32);
-    snprintf(name, sizeof(name), "MPRTarget%uIdentity", index);
-    setProperty(name, slot->identityValid ? slot->identity : "unknown");
-    return true;
-}
-
-bool
-MPRController::publishTargets(void)
-{
-    UInt32 published = 0;
-    UInt16 defaultHandle = 0;
-    for (UInt32 i = 0; i < fTargetCount && i < kMPRMaxTargets; i++) {
-        MPRTargetSlot *slot = &fTargets[i];
-        if (slot->handle == 0) continue;
-        /* The existing probe chain is read-only (TUR, INQUIRY, VPD, READ
-         * CAPACITY, MODE SENSE, READ). Its controller-level state is serialised
-         * by fIOLock and copied into the slot before the next target. */
-        fAttachedDevHandle = slot->handle;
-        fRequireSameIdentity = false;
-        fTargetIdentityValid = false;
-        fCapacityBlocks = 0;
-        fBlockSize = 0;
-        /* Identity strings are probed per target: SSP devices have no ATA
-         * IDENTIFY, so leaving the previous SATA serial in place would make
-         * the write rule match the wrong disk. */
-        fTargetModel[0] = 0;
-        fTargetSerial[0] = 0;
-        /* The topology enumeration already captured this target's device
-         * page fields. Reuse them instead of re-reading config pages while
-         * the start path still owns the shared management SMID. */
-        fTargetDeviceInfo = slot->deviceInfo;
-        fTargetDeviceFlags = slot->flags;
-        fTargetSasAddress = slot->sasAddress;
-        fFastPathEnabled = slot->fastPath;
-        const char *stage = NULL;
-        if (!probeScsiIdentity()) stage = "scsi-identity";
-        else if (!probeCapacity()) stage = "capacity";
-        else if (!probeBlockRead()) stage = "block-read";
-        else if (!prepareTargetMedia()) stage = "media";
-        if (stage != NULL) {
-            char name[48];
-            snprintf(name, sizeof(name), "MPRTarget%uProbe", i);
-            setProperty(name, "failed");
-            snprintf(name, sizeof(name), "MPRTarget%uProbeStage", i);
-            setProperty(name, stage);
-            continue;
-        }
-        slot->capacityBlocks = fCapacityBlocks;
-        slot->blockSize = fBlockSize;
-        slot->identityValid = fTargetIdentityValid;
-        strlcpy(slot->identity, fTargetIdentity, sizeof(slot->identity));
-        strlcpy(slot->model, fTargetModel, sizeof(slot->model));
-        strlcpy(slot->serial, fTargetSerial, sizeof(slot->serial));
-        /* Only a SATA/STP disk with an explicit identity rule may be writable.
-         * SSP targets such as the ZFS array member are always read-only, even
-         * if a rule would otherwise match a stale identity. */
-        bool sataTarget =
-            (slot->deviceInfo & MPI2_SAS_DEVICE_INFO_SATA_DEVICE) != 0;
-        slot->readOnly = !sataTarget ||
-                         !isWritableIdentity(slot->model, slot->serial);
-        slot->generation = ++fMediaGeneration;
-        slot->present = true;
-        if (!publishTarget(slot)) {
-            slot->present = false;
-            continue;
-        }
-        published++;
-        if (!slot->readOnly && defaultHandle == 0) defaultHandle = slot->handle;
-    }
-    if (defaultHandle == 0) {
-        for (UInt32 i = 0; i < fTargetCount && i < kMPRMaxTargets; i++)
-            if (fTargets[i].nub != NULL) { defaultHandle = fTargets[i].handle; break; }
-    }
-    /* Synchronous cache/UNMAP helpers still use the controller default; point
-     * it at a writable target when one exists, otherwise the first target. */
-    fAttachedDevHandle = defaultHandle;
-    fMediaPresent = published != 0;
-    setProperty("MPRMediaPresent", fMediaPresent);
-    setProperty("MPRPublishedTargetCount", published, 32);
-    if (published != 0) {
-        for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
-            MPRTargetSlot *first = &fTargets[i];
-            if (first->nub == NULL) continue;
-            setProperty("MPRMediaBlocks", first->capacityBlocks, 64);
-            setProperty("MPRMediaBlockSize", (unsigned long long)first->blockSize, 32);
-            fCapacityBlocks = first->capacityBlocks;
-            fBlockSize = first->blockSize;
-            break;
-        }
-    }
-    return published != 0;
-}
-
-bool
 MPRController::probeCapacity(void)
 {
     bool ownPage = (fPageBuffer == NULL);
@@ -3082,13 +2911,9 @@ MPRController::init(OSDictionary *properties)
     fDiscoveredDiskCount = 0;
     fNativeFuaSupported = false;
     fUnmapLimits = MPRUnmapLimits{};
-    fTargetIdentityValid = fMediaIdentityValid = fRequireSameIdentity = false;
-    fTargetIdentity[0] = fMediaIdentity[0] = '\0';
-    fIdentityCapacity = 0;
-    fIdentityBlockSize = 0;
-    fRemovedTargetHandle = 0;
-    fRemovalGeneration = 0;
-    fTargetRemovalRequested = false;
+    fTargetIdentityValid = false;
+    fTargetIdentity[0] = '\0';
+    fPendingRemovalHandle = 0;
     fPhysicalChangePending = false;
     return super::init(properties);
 }
@@ -3157,7 +2982,6 @@ MPRController::start(IOService *provider)
     fLastReplySmid = 0xFFFF;
     fLastReplyKind = 0;
     fScsiSuccess = 0;
-    fBlockDev = NULL;
     fIOLock = IOLockAlloc();
     fReplyLock = IOSimpleLockAlloc();
     fPostLock = IOSimpleLockAlloc();
@@ -3187,6 +3011,10 @@ MPRController::start(IOService *provider)
     fTopologyGeneration = 0;
     fRemovalPending = false;
     fHotplugRetryRequested = false;
+    fPendingRemovalHandle = 0;
+    fScanSerial = 0;
+    fTargetCount = 0;
+    memset(fTargets, 0, sizeof(fTargets));
     memset(fReplySlots, 0, sizeof(fReplySlots));
     fCapacityBlocks = 0;
     fBlockSize = 0;
@@ -3272,7 +3100,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.19.0");
+    setProperty("MPRBuild", "0.20.0");
     setProperty("MPRFeatures",
                 "async-pool,ieee-sgl-chain,read-write16,cache16,unmap-limits,"
                 "stable-identity,raid-filter,auto-sense,tmf,remove-device,pm-quiesce");
@@ -3338,7 +3166,9 @@ MPRController::start(IOService *provider)
          * success are mandatory before publishing a media object. */
         loadWritePolicy();
         if (eventsReady && discoverTopology() && fTargetCount != 0) {
-            if (!publishTargets()) fMediaPresent = false;
+            /* Publish every eligible target; a target that cannot be probed
+             * stays unpublished and is retried by the hotplug worker. */
+            ensureTargetsPublished();
         }
     } else {
         setProperty("MPRConfigPageState", "skipped-earlier-stage-failed");
@@ -3375,7 +3205,8 @@ MPRController::start(IOService *provider)
 void
 MPRController::stop(IOService *provider)
 {
-    MPRBlockDev *nub;
+    MPRBlockDev *nubs[kMPRMaxTargets + 1];
+    UInt32 nubCount = 0;
     bool dmaStopped = false;
 
     fStopping = true;
@@ -3401,17 +3232,22 @@ MPRController::stop(IOService *provider)
     fMediaPresent = false;
     fDeviceOffline = true;
     fMediaGeneration++;
-    nub = fBlockDev;
-    fBlockDev = NULL;
-    if (nub != NULL) {
-        nub->setController(NULL);
-    }
+    /* Unbind every published target from the transport here, then hand the
+     * nubs back to IOKit outside the lock: client termination can
+     * synchronously re-enter the device. */
     for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
-        if (fTargets[i].nub != NULL) {
-            fTargets[i].nub->setController(NULL);
-            fTargets[i].nub = NULL;
+        MPRTargetSlot *slot = &fTargets[i];
+        if (slot->nub != NULL) {
+            slot->nub->setController(NULL);
+            if (nubCount < kMPRMaxTargets) nubs[nubCount++] = slot->nub;
+            slot->nub = NULL;
         }
-        fTargets[i].present = false;
+        slot->present = false;
+        slot->probeValid = false;
+        slot->online = false;
+        slot->offlinePending = false;
+        slot->onlinePending = false;
+        slot->handle = 0;
     }
 
     /* No command submitter remains. Stop the reply consumer and the IOC
@@ -3465,9 +3301,9 @@ MPRController::stop(IOService *provider)
     /* Client termination can synchronously re-enter the device. The offline
      * gate is already closed and no controller lock is held here. IOKit
      * owns the eventual detach; do not detach a still-terminating child. */
-    if (nub != NULL) {
-        nub->terminate();
-        nub->release();
+    for (UInt32 i = 0; i < nubCount; i++) {
+        nubs[i]->terminate();
+        nubs[i]->release();
     }
     if (fWorkLoop != NULL) {
         fWorkLoop->release();
@@ -3489,10 +3325,30 @@ MPRController::quiescePower(void)
     IOReturn fence = beginAsyncBarrier();
     if (fence != kIOReturnSuccess) return false;
     IOLockLock(fIOLock);
+    /* Flush every target that this driver can write to. Each flush names its
+     * own handle: a flush must leave one disk's cache ordered with that disk,
+     * never with whichever target was published last. */
     IOReturn flush = kIOReturnSuccess;
-    if (fMediaPresent && !fDeviceOffline && !fProtocolRecoveryPending &&
-        !mediaRemovalPending()) flush = scsiSynchronizeCache(0, 0, 29, true);
+    UInt32 flushed = 0;
+    if (!fDeviceOffline && !fProtocolRecoveryPending && !mediaRemovalPending()) {
+        for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+            MPRTargetSlot *slot = &fTargets[i];
+            if (slot->handle == 0 || !slot->present || !slot->probeValid ||
+                slot->readOnly || slot->offlinePending) continue;
+            if (!selectTarget(slot->handle)) continue;
+            IOReturn one = scsiSynchronizeCache(0, 0, 29, true);
+            char name[48];
+            snprintf(name, sizeof(name), "MPRTarget%uFlushStatus", (unsigned)i);
+            setProperty(name, (unsigned long long)(UInt32)one, 32);
+            if (one != kIOReturnSuccess) {
+                flush = one;
+                break;
+            }
+            flushed++;
+        }
+    }
     setProperty("MPRPowerFlushStatus", (unsigned long long)(UInt32)flush, 32);
+    setProperty("MPRPowerFlushCount", (unsigned long long)flushed, 32);
     fSuspended = true;
     teardownInterrupts();
     bool stopped = fRegs != NULL && diagReset();
@@ -3515,37 +3371,29 @@ MPRController::resumePower(void)
 {
     if (!fSuspended) return true;
     IOLockLock(fIOLock);
-    const bool published = fMediaPresent;
-    const UInt64 oldCapacity = fIdentityCapacity;
-    const UInt32 oldBlockSize = fIdentityBlockSize;
-    char oldIdentity[sizeof(fMediaIdentity)];
-    strlcpy(oldIdentity, fMediaIdentity, sizeof(oldIdentity));
     bool ready = !fStopping && fPowerQuiesced && fPCIDevice != NULL &&
         fPCIDevice->setMemoryEnable(true) && fPCIDevice->setBusMasterEnable(true);
     if (ready) ready = resetAndReinitialize();
-    IOSimpleLockLock(fReplyLock);
-    bool replacement = fRemovalPending || fPhysicalChangePending;
-    IOSimpleLockUnlock(fReplyLock);
-    /* A disk inserted while asleep must take OFFLINE -> ONLINE, even if
-     * reset discovery itself succeeded. Never attach it to the old medium. */
-    if (ready && (!published || replacement || !fMediaIdentityValid ||
-        strcmp(oldIdentity, fMediaIdentity) != 0 ||
-        oldCapacity != fIdentityCapacity || oldBlockSize != fIdentityBlockSize))
-        ready = false;
+    if (ready) ready = ensureTargetsPublished();
+    /* Every medium that was published before sleep takes OFFLINE -> ONLINE
+     * around this rebuild, whatever its identity: a disk inserted while asleep
+     * must not be attached to the old medium. */
+    for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+        MPRTargetSlot *slot = &fTargets[i];
+        if (slot->nub == NULL) continue;
+        if (slot->present && slot->probeValid) slot->onlinePending = true;
+        else slot->offlinePending = true;
+    }
     fSuspended = false;
     fPowerQuiesced = false;
-    if (!ready) {
-        invalidateMedia();
-        IOSimpleLockLock(fReplyLock);
-        fHotplugPending = true;
-        IOSimpleLockUnlock(fReplyLock);
-    }
+    IOSimpleLockLock(fReplyLock);
+    fHotplugPending = true;
+    IOSimpleLockUnlock(fReplyLock);
     setProperty("MPRPowerState", ready ? "on" : "wake-recovery-pending");
     IOLockUnlock(fIOLock);
     setAsyncAcceptance(true);
     return ready;
 }
-
 IOReturn
 MPRController::setPowerState(unsigned long stateNumber, IOService *whatDevice)
 {
@@ -3940,9 +3788,16 @@ MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
 /* Target protocol implementation is in MPRTarget.cpp. */
 
 bool
-MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
+MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid,
+                            UInt16 handle, UInt16 *iocStatus)
 {
-    if (fRequestBuffer == NULL || fAttachedDevHandle == 0 ||
+    /* A task-management request names its target explicitly: resetting or
+     * aborting through the controller's default handle would hit a different,
+     * healthy disk. `iocStatus` stays 0xFFFF unless a well-formed reply
+     * arrived, which lets a caller distinguish "the firmware answered with an
+     * error" from "no completion was ever seen". */
+    if (iocStatus != NULL) *iocStatus = 0xFFFF;
+    if (fRequestBuffer == NULL || handle == 0 ||
         smid < MPR_SM_TMF_BASE || smid >= MPR_SM_TMF_BASE + 3 ||
         smid >= fRequestCount || fReplyLock == NULL || fProtocolRecoveryPending)
         return false;
@@ -3968,7 +3823,6 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
     UInt8 *frame = base + (UInt64)smid * fRequestFrameSize;
     memset(frame, 0, fRequestFrameSize);
     MPRScsiTaskMgmtRequest *request = (MPRScsiTaskMgmtRequest *)frame;
-    const UInt16 handle = (UInt16)fAttachedDevHandle;
     request->DevHandle = handle;
     request->Function = MPI2_FUNCTION_SCSI_TASK_MGMT;
     request->TaskType = taskType;
@@ -3998,14 +3852,16 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
         recordProtocolFault(kMPRProtocolUnexpectedCompletion, smid);
         return false;
     }
-    bool ok = (reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS &&
+    const UInt16 status = reply->IOCStatus & MPI2_IOCSTATUS_MASK;
+    if (iocStatus != NULL) *iocStatus = status;
+    bool ok = status == MPI2_IOCSTATUS_SUCCESS &&
         (reply->ResponseCode == MPI2_SCSITASKMGMT_RSP_TM_COMPLETE ||
          reply->ResponseCode == MPI2_SCSITASKMGMT_RSP_TM_SUCCEEDED);
     setProperty("MPRTmfResponseCode", (unsigned long long)reply->ResponseCode, 8);
-    setProperty("MPRTmfIOCStatus",
-                (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
+    setProperty("MPRTmfIOCStatus", (unsigned long long)status, 16);
     setProperty("MPRTmfTerminationCount", (unsigned long long)reply->TerminationCount, 32);
     setProperty("MPRTmfTaskType", (unsigned long long)taskType, 8);
+    setProperty("MPRTmfHandle", (unsigned long long)handle, 16);
     setProperty("MPRTmfState", ok ? "ok" : "failed");
     return ok;
 }
@@ -4045,13 +3901,28 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
         MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET
     };
     UInt32 i, injectFail;
-    const UInt16 handle = (UInt16)fAttachedDevHandle;
     bool recovered = false;
     bool controllerReset = false;
 
     if (smid == 0) {
         return false;
     }
+    /* The failed command belongs to exactly one target. Read its handle from
+     * the command owner before the SMID is frozen, so every escalation level
+     * names that target instead of the controller's current default. */
+    UInt16 handle = 0;
+    IOSimpleLockLock(fReplyLock);
+    if (smid < 128 &&
+        fCommandOwners[smid].function == MPI2_FUNCTION_SCSI_IO_REQUEST)
+        handle = fCommandOwners[smid].handle;
+    IOSimpleLockUnlock(fReplyLock);
+    if (handle == 0) handle = (UInt16)fAttachedDevHandle;
+    MPRTargetSlot *slot = findTarget(handle);
+    if (slot != NULL) {
+        slot->failureCount++;
+        publishTargetProperties();
+    }
+
     /* Freeze the SMID until the firmware confirms the task is gone; it must
      * not write a late reply into a reused request frame (risk R6). */
     fFrozenSmid = (UInt16)smid;
@@ -4071,7 +3942,10 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
             IOSleep(50);
             continue;
         }
-        if (sendTaskMgmt(levels[i], (UInt16)smid, MPR_SM_TMF_BASE + i) &&
+        /* A reply that carries an error still proves the firmware accepted the
+         * request; the drain is what proves the command is gone. Without a
+         * reply, the next escalation level is tried. */
+        if (sendTaskMgmt(levels[i], (UInt16)smid, MPR_SM_TMF_BASE + i, handle) &&
             drainTaskManagedCommands(handle, (UInt16)smid, i != 0)) {
             recovered = true;
         } else {
@@ -4088,10 +3962,10 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
     removed = fRemovalPending;
     IOSimpleLockUnlock(fReplyLock);
     if (controllerReset || removed || !recovered) {
-        /* Do not resume an old IO across a global reset or a physical
-         * removal. The unlocked worker performs OFFLINE -> ONLINE before
-         * clients issue new requests against the new media generation. */
-        invalidateMedia();
+        /* An IOC reset unbinds every medium and a removal invalidates one; the
+         * unlocked worker performs OFFLINE -> ONLINE per target before clients
+         * issue new requests against the new media generation. */
+        invalidateTargets();
         IOSimpleLockLock(fReplyLock);
         fHotplugPending = true;
         IOSimpleLockUnlock(fReplyLock);
@@ -4145,6 +4019,7 @@ MPRController::watchdogTimeout(IOTimerEventSource *sender)
     setProperty("MPRWatchdogState", fProtocolRecoveryPending ? "protocol-recovery" :
                 fTopologyChanged ? "topology-change" :
                 !fMediaPresent ? "offline" : "ok");
+    publishTargetCounters();
     if (schedule) thread_call_enter(fHotplugCall);
     if (sender != NULL) sender->setTimeoutMS(1000);
 }
@@ -4167,55 +4042,20 @@ MPRController::mediaRemovalPending(void)
 }
 
 void
-MPRController::invalidateMedia(void)
-{
-    /* Caller holds fIOLock. Transport failure and publication state are
-     * separate: setting DeviceOffline must never suppress a later OFFLINE. */
-    if (fMediaPresent) {
-        fMediaPresent = false;
-        fMediaGeneration++;
-        fMediaOfflinePending = (fBlockDev != NULL);
-    }
-    fMediaOnlinePending = false;
-    fDeviceOffline = true;
-    setProperty("MPRDeviceOffline", true);
-    setProperty("MPRMediaPresent", false);
-    setProperty("MPRMediaReady", false);
-}
-
-bool
-MPRController::takeMediaOffline(void)
-{
-    /* Caller holds fIOLock; return with it held. Storage notifications can
-     * re-enter the transport, so never send them while holding this lock. */
-    invalidateMedia();
-    if (!fMediaOfflinePending || fBlockDev == NULL) return true;
-    MPRBlockDev *nub = fBlockDev;
-    nub->retain();
-    IOLockUnlock(fIOLock);
-    IOReturn status = nub->notifyMediaState(kIOMediaStateOffline);
-    nub->release();
-    IOLockLock(fIOLock);
-    setProperty("MPRMediaOfflineStatus", (unsigned long long)(UInt32)status, 32);
-    /* Before matching there is no old IOBlockStorageDriver/IOMedia to retire.
-     * Its eventual initial probe will observe fMediaPresent == false. */
-    if (status == kIOReturnSuccess || status == kIOReturnNotAttached) {
-        fMediaOfflinePending = false;
-        return true;
-    }
-    return false;
-}
-
-void
 MPRController::hotplugThread(void)
 {
-    UInt32 generation = 0, oldHandle = 0;
-    bool removal = false, retry = false, resetOk = false;
-    bool retryRequested = false;
-    bool directProbe = false;
-    bool physicalChange = false;
+    struct MPRNotifyAction {
+        UInt32 index;
+        MPRBlockDev *nub;
+        bool online;
+        IOReturn status;
+    };
+    MPRNotifyAction actions[2 * kMPRMaxTargets];
+    UInt32 generation = 0, actionCount = 0, live = 0;
+    bool retry = false, resetNeeded = false, probeFailed = false;
+    bool retryRequested = false, physicalChange = false;
+    UInt16 pendingRemoval = 0;
     const char *state = "stopped";
-    IOReturn notification = kIOReturnSuccess;
 
     if (fIOLock == NULL) return;
     IOLockLock(fIOLock);
@@ -4231,208 +4071,195 @@ MPRController::hotplugThread(void)
         IOSimpleLockUnlock(fReplyLock);
         goto done;
     }
-    removal = fRemovalPending;
     fRemovalPending = false;
     retryRequested = fHotplugRetryRequested;
     fHotplugRetryRequested = false;
     physicalChange = fPhysicalChangePending;
     fPhysicalChangePending = false;
+    pendingRemoval = fPendingRemovalHandle;
+    fPendingRemovalHandle = 0;
     IOSimpleLockUnlock(fReplyLock);
 
-    /* Per-target removal and recovery are not wired yet. With several
-     * published targets the single-target rebuild below would tear down every
-     * medium and republish one arbitrary disk, so keep the steady state. */
-    if (fTargetCount > 1 && !removal && !retryRequested &&
-        !fDeviceOffline && !fProtocolRecoveryPending && !fMediaOfflinePending) {
-        state = "multi-target-steady";
-        goto done;
-    }
-
-    oldHandle = fAttachedDevHandle;
-    if (physicalChange || retryRequested) fRequireSameIdentity = false;
-    else if (fMediaPresent) fRequireSameIdentity = fMediaIdentityValid;
-    if (removal || retryRequested) fHotplugAttempts = 0;
-    if (removal || fDeviceOffline || fProtocolRecoveryPending ||
-        fMediaOfflinePending) {
-        /* Which of the four independent reasons tore the medium down. */
-        setProperty("MPRMediaOfflineCause",
-                    removal ? "removal-event" :
-                    fMediaOfflinePending ? "offline-not-completed" :
-                    fProtocolRecoveryPending ? "protocol-recovery" :
-                    "device-offline");
-        if (!takeMediaOffline()) {
-            state = "offline-notification-failed";
-            retry = true;
-            goto done;
-        }
-    }
-    if (fStopping) goto done;
-
-    if (removal && !fProtocolRecoveryPending && !retireRemovedTarget()) {
-        /* Any uncertain old ownership or reused handle goes through the
-         * existing bounded IOC recovery, never an unconditional remove. */
-        recordProtocolFault(kMPRTargetRemovalUncertain, oldHandle);
-    }
-
-    if (!fProtocolRecoveryPending) {
-        if (!allocatePageBuffer() || !readSasIOUnitPage0()) {
-            state = "topology-read-failed";
-            retry = true;
-            goto done;
-        }
-        if (fAttachedDevHandle == 0 && (fLinkUpPhys == 0 || fHasExpander)) {
-            /* A successful empty snapshot with no negotiated link anywhere is
-             * absence; a failed read above is not. Poll it without resetting. */
-            retry = true;
-            state = takeMediaOffline() ? "removed" : "offline-notification-failed";
-            fCapacityBlocks = 0;
-            fBlockSize = 0;
-            fUnmapEnabled = false;
-            if (fDiscoveredDiskCount == 0) fRequireSameIdentity = false;
-            fHotplugAttempts = 0;
-            goto done;
-        }
-        if (fAttachedDevHandle == 0) {
-            /* A phy negotiates a link but the IOC attaches no target, or the
-             * handle it listed no longer names that target. Both need the
-             * bounded diagnostic reset below; a single mismatch sample is
-             * given one poll to settle first. */
-            if (fSasDeviceMismatch && fIdentityLostCount < 2) {
-                state = "target-identity-pending";
-                retry = true;
-                goto done;
-            }
-            state = fSasDeviceMismatch ? "target-identity-lost" :
-                                        "link-without-target";
-        } else if (fMediaPresent && !removal && oldHandle == fAttachedDevHandle &&
-                   !fDeviceOffline) {
-            if (!fMediaOnlinePending) {
-                state = "online";
-                goto done;
-            }
-            goto notifyOnline;
-        } else if (oldHandle == 0) {
-            /* A target that was absent before this snapshot is a new
-             * insertion: it gets a full recovery budget. */
-            fHotplugAttempts = 0;
-        }
-        if (!takeMediaOffline()) {
-            state = "offline-notification-failed";
-            retry = true;
-            goto done;
-        }
-        if (fAttachedDevHandle != 0 && fHotplugAttempts < 3) {
-            bool dmaSafe = true;
-            for (UInt32 smid = 10; smid <= 30; smid++) {
-                if (smid >= 26 && smid <= 28) continue;
-                if (!commandDmaSafe(smid)) { dmaSafe = false; break; }
-            }
-            /* A terminal device discovered after removal needs a fresh probe,
-             * not an unconditional reset of the controller and its fabric. */
-            if (dmaSafe) {
-                fReinitInProgress = true;
-                resetOk = probeScsiIdentity() && probeCapacity() && prepareTargetMedia();
-                fReinitInProgress = false;
-            } else {
-                recordProtocolFault(kMPRTargetRemovalUncertain, oldHandle);
-            }
-            if (resetOk && !fProtocolRecoveryPending && !fStopping) {
-                directProbe = true;
-                setProperty("MPRHotplugResetResult", "not-needed");
-                goto targetReady;
-            }
-        }
-    }
-
-    /* Single-target prototype: a diagnostic reset is the bounded fallback
-     * for reappearing targets. Do not reset endlessly while a disk is gone
-     * or while firmware repeatedly reports its own discovery events. */
-    if (fHotplugAttempts >= 3) {
-        state = "recovery-exhausted";
-        /* Keep the snapshot polled. A target that finally appears clears the
-         * budget above; an empty fabric is never reset again. */
+    /* 1. One topology snapshot, merged into the persistent target table.
+     * A handle that is still listed keeps its nub and medium; a vanished one
+     * is marked for the guarded removal sequence. */
+    if (!allocatePageBuffer() || !readSasIOUnitPage0()) {
+        state = "topology-read-failed";
         retry = true;
         goto done;
     }
-    fHotplugAttempts++;
-    setProperty("MPRResetInitiator", "hotplug");
-    resetOk = resetAndReinitialize();
-    setProperty("MPRHotplugResetResult", resetOk ? "ok" : "failed");
-    if (!resetOk) {
-        invalidateMedia();
-        if (fAttachedDevHandle == 0 && !fProtocolRecoveryPending) {
-            state = "removed";
-            fHotplugAttempts = 0;
-            retry = true;
-        } else {
-            state = "recovery-failed";
-            retry = fHotplugAttempts < 3;
-        }
-        goto done;
+    /* A physical change (or a new insertion outside an IOC reset) restores the
+     * probe and reset budgets, so a disk plugged back in is tried again. */
+    if (physicalChange || retryRequested) {
+        for (UInt32 i = 0; i < kMPRMaxTargets; i++) fTargets[i].probeFailures = 0;
+        fHotplugAttempts = 0;
     }
-targetReady:
-    /* A new physical removal observed during reset must be processed before
-     * any ONLINE notification. Do not erase it with a final pending=false. */
-    IOSimpleLockLock(fReplyLock);
-    removal = fRemovalPending;
-    if (directProbe && generation != fTopologyGeneration) {
-        removal = true;
+    /* A TARGET_NOT_RESPONDING event can name a handle that GET_NEXT_HANDLE
+     * still lists. Promote that latch into the table after the scan, which is
+     * the only context allowed to change it. */
+    if (pendingRemoval != 0) {
+        MPRTargetSlot *slot = findTarget(pendingRemoval);
+        if (slot != NULL) requestTargetRemoval(slot);
     }
-    IOSimpleLockUnlock(fReplyLock);
-    if (removal || fProtocolRecoveryPending || fStopping) {
-        invalidateMedia();
-        state = "topology-changed-during-recovery";
-        retry = !fStopping;
-        goto done;
-    }
-    fDeviceOffline = false;
-    fMediaPresent = true;
-    fMediaGeneration++;
-    fMediaOnlinePending = true;
 
-notifyOnline:
-    {
-        UInt32 publication = fMediaGeneration;
-        MPRBlockDev *nub = fBlockDev;
-        if (nub != NULL) nub->retain();
+    /* 2. Retire what the fabric dropped: TARGET_RESET, drain of the aborted
+     * commands, then REMOVE_DEVICE, each naming this slot's handle. A target
+     * whose removal cannot be proved goes through the bounded IOC reset. */
+    for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+        MPRTargetSlot *slot = &fTargets[i];
+        if (!slot->removalRequested) continue;
+        if (!retireTarget(slot)) {
+            recordProtocolFault(kMPRTargetRemovalUncertain, slot->handle);
+            resetNeeded = true;
+            break;
+        }
+    }
+
+    /* 3. Probe and publish every present target that is not ready. Probing is
+     * read-only and bounded per target: a disk that fails three times is left
+     * offline until it is physically reinserted, instead of holding fIOLock
+     * against the healthy targets on every scan. */
+    if (!resetNeeded && !fProtocolRecoveryPending) {
+        for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+            MPRTargetSlot *slot = &fTargets[i];
+            if (slot->handle == 0 || !slot->present) continue;
+            if (!slot->probeValid) {
+                if (slot->probeFailures >= 3) continue;
+                if (!probeTarget(slot)) {
+                    slot->probeFailures++;
+                    slot->failureCount++;
+                    /* One failed probe is retried in place; repeated failure
+                     * is what justifies an IOC reset. */
+                    if (slot->probeFailures >= 2) probeFailed = true;
+                    else retry = true;
+                    continue;
+                }
+                slot->probeFailures = 0;
+            }
+            if (!publishTarget(slot)) {
+                slot->failureCount++;
+                probeFailed = true;
+            }
+        }
+    }
+
+    /* 4. Deliver media-state changes per target. Notifications can re-enter the
+     * transport, so they run with no lock held; OFFLINE precedes ONLINE for the
+     * same nub. */
+    for (UInt32 pass = 0; pass < 2; pass++) {
+        actionCount = 0;
+        for (UInt32 i = 0; i < kMPRMaxTargets && actionCount < 2 * kMPRMaxTargets; i++) {
+            MPRTargetSlot *slot = &fTargets[i];
+            if (slot->nub == NULL) continue;
+            bool wanted;
+            if (pass == 0) {
+                wanted = slot->offlinePending;
+            } else {
+                wanted = slot->onlinePending && !slot->offlinePending &&
+                         slot->probeValid && slot->present;
+            }
+            if (!wanted) continue;
+            slot->nub->retain();
+            actions[actionCount].index = i;
+            actions[actionCount].nub = slot->nub;
+            actions[actionCount].online = pass != 0;
+            actions[actionCount].status = kIOReturnSuccess;
+            actionCount++;
+        }
+        if (actionCount == 0) continue;
         IOLockUnlock(fIOLock);
-        if (nub != NULL) {
-            notification = nub->notifyMediaState(kIOMediaStateOnline);
-            nub->release();
-        } else {
-            notification = publishBlockDevice() ? kIOReturnSuccess : kIOReturnNoMemory;
+        for (UInt32 a = 0; a < actionCount; a++) {
+            actions[a].status = actions[a].nub->notifyMediaState(
+                actions[a].online ? kIOMediaStateOnline : kIOMediaStateOffline);
         }
         IOLockLock(fIOLock);
-        setProperty("MPRMediaOnlineStatus",
-                    (unsigned long long)(UInt32)notification, 32);
-        if (fStopping || publication != fMediaGeneration || fDeviceOffline ||
-            fProtocolRecoveryPending || mediaRemovalPending()) {
-            state = "publication-interrupted";
-            retry = !fStopping;
+        for (UInt32 a = 0; a < actionCount; a++) {
+            actions[a].nub->release();
+            MPRTargetSlot *slot = &fTargets[actions[a].index];
+            if (slot->nub != actions[a].nub) continue;
+            char name[48];
+            snprintf(name, sizeof(name), "MPRTarget%uMediaStatus",
+                     (unsigned)actions[a].index);
+            setProperty(name, (unsigned long long)(UInt32)actions[a].status, 32);
+            if (!actions[a].online) {
+                /* The storage layer has no client before matching; that is not
+                 * a failed offline transition. */
+                if (actions[a].status == kIOReturnSuccess ||
+                    actions[a].status == kIOReturnNotAttached) {
+                    slot->offlinePending = false;
+                } else {
+                    retry = true;
+                }
+            } else if (actions[a].status == kIOReturnSuccess) {
+                slot->onlinePending = false;
+                slot->online = true;
+            } else if (actions[a].status == kIOReturnNotAttached) {
+                /* Matching may still be in progress for a fresh nub. */
+                retry = true;
+            } else {
+                slot->online = false;
+                retry = true;
+            }
+        }
+        if (fStopping) { retry = false; state = "stopped"; goto done; }
+    }
+
+    /* 5. Bounded fallback. Only a removal or probe that could not be completed
+     * escalates to an IOC reset, and the reset budget is per insertion. */
+    if (resetNeeded || probeFailed) {
+        if (fProtocolRecoveryPending) {
+            state = "protocol-recovery";
+            retry = true;
             goto done;
         }
-        if (notification == kIOReturnNotAttached) {
-            state = "awaiting-storage-driver";
-            retry = true;
-        } else if (notification != kIOReturnSuccess) {
-            invalidateMedia();
-            state = "online-notification-failed";
-            retry = true;
-        } else {
-            fMediaOnlinePending = false;
-            fHotplugAttempts = 0;
-            state = "online";
+        if (fHotplugAttempts < 3) {
+            fHotplugAttempts++;
+            setProperty("MPRResetInitiator",
+                        resetNeeded ? "target-removal" : "target-probe");
+            bool ok = resetAndReinitialize();
+            setProperty("MPRHotplugResetResult", ok ? "ok" : "failed");
+            if (!ok) {
+                invalidateTargets();
+                state = "recovery-failed";
+                retry = fHotplugAttempts < 3;
+            } else {
+                /* The next pass re-scans and re-probes every target. */
+                state = "targets-revalidating";
+                retry = true;
+            }
+            goto done;
         }
+        state = "recovery-exhausted";
+        retry = true;
+        goto done;
+    }
+
+    live = liveTargetCount();
+    fMediaPresent = live != 0;
+    fDeviceOffline = false;
+    {
+        /* A present target that still has no medium is reported as such: the
+         * controller is usable, that target is not. */
+        UInt32 unpublished = 0;
+        for (UInt32 i = 0; i < kMPRMaxTargets; i++)
+            if (fTargets[i].handle != 0 && fTargets[i].present &&
+                fTargets[i].nub == NULL) unpublished++;
+        state = live == 0 ? "absent" : unpublished != 0 ? "online-partial" : "online";
     }
 
 done:
+    /* Publication state is derived from the table, so it stays truthful even
+     * when this pass ended on an error path. */
+    live = liveTargetCount();
+    fMediaPresent = live != 0;
     setProperty("MPRHotplugState", state);
     setProperty("MPRMediaPresent", fMediaPresent);
     setProperty("MPRDeviceOffline", fDeviceOffline);
     setProperty("MPRMediaGeneration", (unsigned long long)fMediaGeneration, 32);
     setProperty("MPRHotplugAttempts", (unsigned long long)fHotplugAttempts, 32);
     setProperty("MPRHotplugHandle", (unsigned long long)fAttachedDevHandle, 16);
-    setProperty("MPRHotplugBlockDev", fBlockDev != NULL);
+    setProperty("MPRHotplugBlockDev", live != 0);
+    publishTargetProperties();
     IOSimpleLockLock(fReplyLock);
     if (generation == fTopologyGeneration && !fHotplugPending && !retry) {
         fTopologyChanged = false;
@@ -4449,15 +4276,12 @@ done:
 bool
 MPRController::resetAndReinitialize(void)
 {
-    /* Called with fIOLock held. Only restore transport and target readiness;
-     * storage notifications and registration belong to the unlocked worker. */
+    /* Called with fIOLock held. Restore transport and re-enumerate the fabric;
+     * probing and publication stay with the unlocked worker, which reports
+     * media state per target and must never do so under this lock. */
     bool ok = false;
     const char *state = "failed";
     if (fReinitInProgress || fStopping) return false;
-    IOSimpleLockLock(fReplyLock);
-    if (fMediaPresent) fRequireSameIdentity = fMediaIdentityValid;
-    if (fPhysicalChangePending || fHotplugRetryRequested) fRequireSameIdentity = false;
-    IOSimpleLockUnlock(fReplyLock);
     fReinitInProgress = true;
     fDeviceOffline = true;
     fUnmapEnabled = false;
@@ -4472,6 +4296,9 @@ MPRController::resetAndReinitialize(void)
         goto finished;
     }
     resetProtocolState();
+    /* An IOC reset unbinds every medium: handles, geometry and identity have
+     * to be re-established per target before any of them accepts I/O again. */
+    invalidateTargets();
     /* A timed-out startup manufacturing probe used a smaller temporary
      * page. It is safe to replace only after this successful IOC reset. */
     if (fPageBuffer != NULL && fPageBuffer->getLength() < MPR_PAGE_BUF_BYTES) {
@@ -4498,22 +4325,19 @@ MPRController::resetAndReinitialize(void)
     if (!initializeController() || !initializeQueues()) goto finished;
     if (!allocatePageBuffer() || !sendEventNotification() || !sendPortEnable())
         goto finished;
+    /* Discovery can lag the reset reply: poll a bounded number of times and
+     * let the worker publish whatever the successful snapshot contains. */
     for (UInt32 retry = 0; retry < 5 && !fStopping; retry++) {
         IOSleep(200);
         if (!readSasIOUnitPage0()) {
             if (fProtocolRecoveryPending) goto finished;
             continue;
         }
-        if (fAttachedDevHandle != 0) break;
+        ok = !fProtocolRecoveryPending && !fStopping;
+        break;
     }
-    if (fAttachedDevHandle == 0) {
-        state = "no-media";
-        goto finished;
-    }
-    if (!probeScsiIdentity() || !probeCapacity() || !prepareTargetMedia())
-        goto finished;
-    ok = !fProtocolRecoveryPending && !fStopping;
-    state = ok ? "ok" : "failed";
+    if (ok) state = fTargetCount != 0 ? "ok" : "no-targets";
+    else state = "enumeration-failed";
 
 finished:
     fReinitInProgress = false;
@@ -4525,7 +4349,3 @@ finished:
                 fDataBuffer != NULL && fDataPhys != 0 && fDataBytes != 0);
     return ok;
 }
-
-/* Target protocol implementation is in MPRTarget.cpp. */
-
-/* Target protocol implementation is in MPRTarget.cpp. */

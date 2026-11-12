@@ -1,13 +1,13 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：源码 0.18.1（2026-11-13）。已在内部 SATA 盘的 ESP 部署并经 OpenCore 注入加载，单盘读写、热插拔、超时/TMF/复位恢复与睡眠/唤醒均已实机验证。当前源码行为与诊断见 [DEBUG.md](DEBUG.md)，对外能力与验证边界见 [README.md](README.md)。
+状态：源码 0.20.0（2026-11-13）。已在内部 SATA 盘的 ESP 部署并经 OpenCore 注入加载，单盘读写、热插拔、超时/TMF/复位恢复与睡眠/唤醒均已实机验证；多目标场景下两块盘各自发布、按 DevHandle 路由、写入策略隔离已实机验证。当前源码行为与诊断见 [DEBUG.md](DEBUG.md)，对外能力与验证边界见 [README.md](README.md)。
 
 ## 1. 目标与范围
 
 ### 1.1 目标硬件与平台
 
 - HBA：Broadcom/Avago SAS3008，PCI `0x1000:0x0097`，MPI 2.5，12 Gb/s SAS3；固件 `09.00.00.00`，`IOCCapabilities` 含 `INTEGRATED_RAID`。
-- 测试盘：PCCOOLER SSD T200 240 GB（468,862,128 × 512 B），exFAT 卷 `testdisk`；扩容器验证用 Adaptec AEC-82885T 加单背板，链路上只有一块终端 SATA 盘。
+- 测试盘：PCCOOLER SSD T200 240 GB（468,862,128 × 512 B），exFAT 卷 `testdisk`；扩容器验证用 Adaptec AEC-82885T 加单背板。多目标验证时同一背板上另有 TOSHIBA MG04SCA60EE 6 TB（11,721,045,168 × 512 B，SSP，属于 ZFS 阵列 `main_data`），只读、不写。
 - 平台：macOS Tahoe 26.7.2（`25G332`、`Darwin 25.6.0`），x86_64，MSI X570 测试机；IOKit kext，基于 MacKernelSDK 构建。
 - 硬件事实：BAR0 是 I/O，MMIO 在 BAR1/BAR2（配置偏移 `0x14`）；地址随启动重新分配，不硬编码。
 
@@ -16,7 +16,7 @@
 ### 1.2 范围
 
 1. 自研 `IOService`（provider = `IOPCIDevice`）实现 HBA：PCI 使能、BAR 映射、IOC 复位与初始化、队列、中断、事件订阅与 ACK。
-2. 把一块独立 STP/SATA 盘经系统 `IOBlockStorageDriver` 发布为原生整盘 `IOMedia`，并维护设备身份与媒体生命周期。
+2. 把每个合格独立盘（STP/SATA 或 SSP）经系统 `IOBlockStorageDriver` 发布为原生整盘 `IOMedia`，并维护每个目标的身份、几何与媒体生命周期；写入权限按目标、按显式规则授予以外一律只读。
 3. 块 I/O：READ/WRITE(10)/(16)、SYNCHRONIZE CACHE、FUA、auto sense、超时与 TMF 恢复、热插拔；UNMAP 仅在探测到支持且通过限制校验后启用。
 4. 电源与停机：睡眠/唤醒、`systemWillShutdown` 的静默路径。
 5. 诊断：IORegistry 属性与可选故障注入 boot-args。
@@ -24,7 +24,7 @@
 ### 1.3 不做
 
 - IR/RAID 逻辑卷及其成员管理、SES 机箱管理、SMP passthrough、固件升级、启动盘引导。
-- 多目标/多 LUN/多路径、SAS/SSP 盘的实机验收。
+- 多 LUN、多路径、SAS/SSP 盘的写路径。
 - NVMe/PCIe/Tri-Mode、SAS2（`mps`/`0x0072`）、GEN35/SEA 分支。
 - Apple Silicon、dext/DriverKit、多队列与性能调优、FreeBSD user ioctl 兼容层。
 - 继承 `IOSCSIParallelInterfaceController`（§3 路线 B），仅保留为后续评估。
@@ -78,12 +78,12 @@ mpr/
 | SGL/chain 与常驻暂存回退 | 已验证 | 客户端数据经常驻窗口拷贝，无零拷贝直映 |
 | 块 I/O 与缓存命令 | 已验证 | READ/WRITE(10)/(16)、RC10/16、TUR、INQUIRY、SYNC(10)/(16)、FUA 回退 |
 | UNMAP | 已验证 | 探测 B0/B2 后启用，按上报限制拆分，不外扩调用者范围 |
-| 发现与身份 | 已验证 | 单盘；多于一个合格独立目标时拒绝发布，不任选 |
+| 发现与身份 | 已验证（双目标） | 每个合格目标进入目标表并独立 probe/nub；handle 只作固件地址，复用按 SAS 地址与稳定身份判定 |
 | IR 成员过滤 | 已实现，未在阵列上验证 | 拒绝卷、成员盘、热备与扩容成员；当前固件虽带 IR 能力但无卷样本 |
-| 移除与恢复 | 部分验证 | TMF 级联（ABORT/LUN/TARGET RESET）与有界 IOC 复位经注入验证；TARGET_RESET → REMOVE_DEVICE 路径未在实机触发；写不重放 |
-| 热插拔与媒体生命周期 | 已验证（直连） | 含在途 I/O 拔盘与秒级插回；expander 下未复测 |
-| 睡眠/唤醒、停机静默 | 已验证（直连） | 唤醒后自动重建媒体；expander 下未复测 |
-| 多目标、多 LUN、多路径、SES/SMP、NVMe/Tri-Mode | 未实现 | 见 §1.3 |
+| 移除与恢复 | 部分验证 | TMF 级联与有界 IOC 复位在单目标下经注入验证；逐目标路由（handle 取自失败 SMID）与逐目标 TARGET_RESET → REMOVE_DEVICE 已实现，尚未在实机触发；写不重放 |
+| 热插拔与媒体生命周期 | 已验证（直连） | 含在途 I/O 拔盘与秒级插回；按目标增删/离线已实现，expander 下双目标未复测 |
+| 睡眠/唤醒、停机静默 | 已验证（直连） | 唤醒后逐目标重建媒体；双目标下未复测 |
+| 多 LUN、多路径、SES/SMP、NVMe/Tri-Mode | 未实现 | 见 §1.3 |
 
 ## 5. 里程碑状态
 
@@ -94,14 +94,14 @@ mpr/
 | M2 中断、回复与事件 | 中断回复、回复帧回收、按命令分派、EventMasks/ACK、PortEnable | 完成（回复帧回收随长时间运行覆盖，未单独统计绕环次数） |
 | M3 单盘只读 | 独立盘识别、身份与容量、只读 nub、大范围顺序读一致性 | 完成 |
 | M4 读写与恢复 | WRITE、缓存同步/FUA、UNMAP、sense、超时/TMF/复位 | 完成；注入长跑只完成多轮短程 |
-| M5 拓扑、热插拔与 PM | nub 增删、handle 复用隔离、安全 stop、睡眠/唤醒 | 完成（直连） |
+| M5 拓扑、热插拔与 PM | nub 增删、handle 复用隔离、安全 stop、睡眠/唤醒 | 完成（直连）；多目标下逐目标实现已上线，双目标实机复测待做 |
 | M6 诊断工具（可选） | 独立 `IOUserClient`/工具、统计导出 | 未实施；现用 IORegistry 属性与 boot-args |
 | M7 后续 | IR 卷、SES、多队列、启动盘、签名发布；路线 B / dext 评估 | 不在当前范围 |
 
 ## 6. 尚未完成
 
-- 逐目标 TARGET_RESET/REMOVE_DEVICE 协议与 hotplug/PM 隔离：目标表、多目标枚举、每目标独立 nub 与 IOMedia、按 DevHandle 路由 I/O、完成所有权与 fail-closed 只读策略已实现；移除、恢复、热插拔与电源管理仍走控制器级单目标路径，需按目标隔离。
-- expander 拓扑下的物理拔插、在途 I/O 拔盘与睡眠/唤醒复测。
+- 双目标移除/热插拔/PM 实机复测：逐目标 TARGET_RESET/REMOVE_DEVICE、handle 复用与离线/上线通知已实现，但尚未在背板上两块盘同时在线时物理拔插或睡眠/唤醒。
+- expander 拓扑下的物理拔插、在途 I/O 拔盘与睡眠/唤醒复测（单目标）。
 - 故障注入长跑未跑满：需夹具在媒体重建后按新 BSD 号重开设备，并把预期内复位与短时错误纳入判据。
 - 性能未调优：仍为常驻窗口拷贝、4 个命令窗口、单一回复消费者。
 - 换盘到不同容量设备、跨 macOS 版本回归、正式签名与发布流程。
@@ -111,7 +111,7 @@ mpr/
 
 - 主机侧：`tools/test_protocol.cpp` 用独立基准字节与独立 chain 解码器验证协议层（136,593 条断言、2,000 个确定性 SGL 用例，含故意拒绝用例），启用 ASan/UBSan；`tools/validate-build-inputs.py` 校验 LF 行尾、bundle 与运行版本一致、所有编译单元均纳入 Xcode 工程。
 - 构建/加载：`tools/build-noxcode.sh` 产出 `MPR.kext`，校验 kmod 入口、bundle 类型、驱动内部符号与 plist 后 ad hoc 签名；注入内部 ESP 后以 `kmutil showloaded` 与 `MPRBuild` 三处一致确认。交叉编译的 Mach-O 目标不等于链接、签名、可加载。
-- 实机：单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。
+- 实机：单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。双目标时另验证两盘 LBA0 与高 LBA 读一致性、可写盘写后回读、以及 `MPRTargetNWriteCount` 只落在可写目标。
 - 长跑：以命令数预算代替墙钟时间，关注按操作次数累积的驱动问题（回复帧、SMID、事件 ACK、属性字典、恢复循环退化），不是介质耐久性。串行命令原型曾以约 345 万条命令、90 分钟通过（p99 无漂移、`MPRResetCount` 不增长、属性数量稳定、参考区哈希不变）；当前异步调度版本尚未重跑。
 - 破坏性写仅限现场重新核对身份的测试盘，写窗口事后逐字节还原；`IORegistry` 的"在线"属性不能替代字节数与回读内容。
 
@@ -120,9 +120,9 @@ mpr/
 | # | 风险 | 缓解 |
 |---|---|---|
 | R1 | 系统升级后 vtable/符号/加载行为漂移 | 升级前重取 KC 并重跑离线核查，再做加载与只读回归；不外推旧结论 |
-| R2 | 单目标假设：多目标、多 LUN、多路径未实现 | 多于一个合格目标时拒绝发布；不承诺未验证拓扑 |
+| R2 | 多目标仅验证到"各自发布 + 只读隔离 + 读一致性"，移除/热插拔/PM 未在双目标下复测 | 逐目标路径已实现并记录未验证项；不以单目标结果推断多目标移除行为 |
 | R3 | 固件带 IR 能力，过滤规则覆盖有限 | 无法确认独立盘身份时不发布；不把单盘结果推广到全部 IR 配置 |
-| R4 | expander 覆盖仅一块终端盘 | 明确记录未复测项，不外推为通用支持 |
+| R4 | expander 覆盖为同一背板上的两块终端盘（一块 SATA、一块 SSP），拔插与 PM 未复测 | 明确记录未复测项，不外推为通用支持 |
 | R5 | 性能原型的窗口拷贝与单一回复消费者 | 先保证正确性；调优时再评估直映与多队列 |
 | R6 | 路线 B 的 SPI KPI 已废弃 | 维持路线 A；改走 B 前单独完成构建与加载验证 |
 | R7 | ESP 有文件但实际未加载或仍运行旧版 | ESP-only 部署；重启后独立核对运行版本；config 变更前备份并校验 |
