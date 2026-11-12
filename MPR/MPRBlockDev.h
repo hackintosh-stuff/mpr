@@ -2,6 +2,7 @@
 #define MPRBlockDev_h
 
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <IOKit/IOLocks.h>
 
 class MPRController;
 
@@ -15,16 +16,22 @@ class MPRBlockDev : public IOBlockStorageDevice
 
 private:
     MPRController *fController;
+    IOLock        *fControllerLock;
+    char           fVendor[16];
+    char           fProduct[20];
+    char           fRevision[8];
+    MPRController *copyController(void);
+    void refreshIdentity(void);
     bool           fLastMediaPresent;
-    bool           fForceMediaStateChange;
 
 public:
     virtual bool init(OSDictionary *properties) APPLE_KEXT_OVERRIDE;
+    virtual void free(void) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 
     void setController(MPRController *controller);
-    void notifyMediaState(UInt32 state);
+    IOReturn notifyMediaState(UInt32 state);
 
     virtual IOReturn doEjectMedia(void) APPLE_KEXT_OVERRIDE;
     virtual IOReturn doFormatMedia(UInt64 byteCapacity) APPLE_KEXT_OVERRIDE;

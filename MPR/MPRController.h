@@ -28,6 +28,13 @@ struct MPRReplySlot
     UInt8           reply[64];
 };
 
+enum { kMPREventAckQueueDepth = 64 };
+struct MPREventAckEntry
+{
+    UInt16 event;
+    UInt32 context;
+};
+
 class MPRController : public IOService
 {
     OSDeclareDefaultStructors(MPRController)
@@ -69,6 +76,10 @@ private:
     UInt8                      fLastReply[64];
     MPRReplySlot               fReplySlots[128];
     IOSimpleLock              *fReplyLock;
+    /* Lock order is reply -> post. Never wait or take reply under post. */
+    IOSimpleLock              *fPostLock;
+    bool                       fManagementBusy[10];
+    bool                       fTmfBusy[3];
 
     /* firmware event notifications. */
     volatile UInt32            fEventCount;
@@ -78,6 +89,50 @@ private:
     UInt32                     fLastEventContext;
     UInt32                     fEventSeen[4];
     UInt8                      fLastEventData[64];
+    MPREventAckEntry            fEventAckQueue[kMPREventAckQueueDepth];
+    UInt32                     fEventAckHead;
+    UInt32                     fEventAckQueued;
+    bool                       fEventAckBusy;
+    UInt32                     fEventAckAge;
+    UInt32                     fEventAckCompleted;
+    UInt32                     fEventAckFailed;
+    UInt32                     fEventAckOverflow;
+    volatile bool              fProtocolRecoveryPending;
+    UInt32                     fProtocolFaultCode;
+    UInt32                     fProtocolFaultSmid;
+    /* Survive resetProtocolState(): the fault that forced the current
+     * recovery is cleared from the live state, but the diagnosis must not be. */
+    UInt32                     fStickyFaultCode;
+    UInt32                     fStickyFaultSmid;
+    UInt32                     fStickyFaultCount;
+    /* Last decoded topology entry, published from the watchdog so no
+     * allocation happens under fReplyLock. */
+    UInt32                     fLastTopoHandle;
+    UInt32                     fLastTopoReason;
+    UInt32                     fLastTopoRate;
+    UInt32                     fTopoRemovalHits;
+    /* Which validation rejected a completion. Site: 1 reply-descriptor
+     * flags, 2 SCSI reply frame, 3 PORT_ENABLE frame, 4 EVENT_NOTIFICATION
+     * frame, 5 config page frame. Allocation-free, published by the watchdog. */
+    UInt32                     fBadReplySite;
+    UInt32                     fBadReplyValue;
+    UInt32                     fBadReplySmid;
+    UInt32                     fBadReplyCount;
+    UInt32                     fBadReplyFunction;
+    UInt32                     fBadReplyMsgLen;
+    UInt32                     fBadReplyWord;
+    /* Phy count with a negotiated link in the last SAS IO Unit Page0 read.
+     * A link without an attached target means the IOC has not rediscovered,
+     * which is a different state from an empty fabric. */
+    UInt32                     fLinkUpPhys;
+    /* SAS Device Page0 denied the attached handle (different handle, or a
+     * non-zero access status). That is a target that needs rediscovery, not a
+     * missing disk, and it must not leave the driver retrying forever. */
+    bool                       fSasDeviceMismatch;
+    UInt32                     fIdentityLostCount;
+    volatile UInt32            fTopologyGeneration;
+    volatile bool              fRemovalPending;
+    bool                       fHotplugRetryRequested; /* new add outside IOC recovery */
 
     /* Bulk data buffer for block transfers. It stays resident
      * for the lifetime of the nub instead of being freed after one probe. */
@@ -101,6 +156,12 @@ private:
     bool                       fUnmapEnabled;
     bool                       fReinitInProgress;
     bool                       fDeviceOffline;   /* recovery failed: reject new IO */
+    bool                       fMediaPresent;    /* storage-layer publication state */
+    volatile UInt32            fMediaGeneration; /* reject IO queued for an old medium */
+    bool                       fStarting;
+    bool                       fMediaOfflinePending;
+    bool                       fMediaOnlinePending;
+    UInt32                     fHotplugAttempts;
     bool                       fStopping;
     bool                       fInjectTimeout;   /* mpr_timeout_test boot-arg */
     UInt32                     fInjectTmfFail;   /* mpr_tmf_fail boot-arg */
@@ -110,8 +171,8 @@ private:
     IOTimerEventSource        *fWatchdogTimer;
     thread_call_t              fHotplugCall;
     volatile bool              fHotplugPending;
+    bool                       fHotplugRunning;
     volatile UInt32            fHotplugCooldown;
-    bool                       fHotplugRebuild;  /* reset came from a cable swap */
     UInt32                     fHighPriorityCredit;
     volatile UInt32            fEventReplyCount;
     volatile UInt32            fEventAckCount;
@@ -160,15 +221,25 @@ private:
     static void interruptAction(OSObject *owner, IOInterruptEventSource *sender,
                                 int index);
     void   processReplyQueue(void);
-    void   rescanPartitions(void);
-    bool   wholeMediaHasPartitions(void);
     void   watchdogTimeout(IOTimerEventSource *sender);
     void   hotplugThread(void);
+    bool   mediaRemovalPending(void);
+    void   invalidateMedia(void); /* caller holds fIOLock */
+    bool   takeMediaOffline(void); /* drops fIOLock for notification */
     static void hotplugCall(thread_call_param_t param0,
                             thread_call_param_t param1);
-    bool   waitForReply(UInt32 timeoutMs);
     bool   waitForSmid(UInt32 timeoutMs, UInt32 smid);
     bool   takeReplySlot(UInt32 smid, UInt8 *reply, UInt32 replyLen, UInt8 *kind);
+    bool   beginManagementRequest(UInt32 smid);
+    bool   finishManagementRequest(UInt32 smid, UInt32 timeoutMs,
+                                    UInt8 *reply, UInt8 *kind);
+    void   recordProtocolFaultLocked(UInt32 code, UInt32 smid);
+    void   recordProtocolFault(UInt32 code, UInt32 smid);
+    void   noteBadReply(UInt32 site, UInt32 value, UInt32 smid,
+                        const UInt8 *frame, UInt32 bytes);
+    void   resetProtocolState(void);
+    void   serviceProtocolState(void);
+    void   recordTopologyEventLocked(const UInt8 *data, UInt32 bytes);
 
     bool   sendEventNotification(void);
     bool   sendPortEnable(void);
@@ -181,7 +252,7 @@ private:
     bool   readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo = NULL);
     bool   discoverTopology(void);
 
-    void   postScsiIo(UInt32 smid);
+    bool   postScsiIo(UInt32 smid);
     bool   scsiTur(void);
     bool   scsiInquiry(void);
     bool   probeScsiIdentity(void);
@@ -194,14 +265,19 @@ private:
                          bool fua, IOReturn *status = NULL);
     bool   probeBlockRead(void);
 
+    bool   allocatePageBuffer(void);
     bool   allocateResidentBuffers(void);
+    bool   prepareTargetMedia(void);
     bool   publishBlockDevice(void);
 
     /* command submission, auto sense, task management and recovery. */
     void   postDefaultRequest(UInt32 smid);
     void   postHighPriorityRequest(UInt32 smid);
+    void   postRequestDescriptor(UInt32 low, UInt32 high);
     void   releaseReplyFrame(UInt32 baddr);
     void   sendEventAck(UInt16 event, UInt32 context);
+    void   postNextEventAckLocked(void);
+    void   completeEventAckLocked(const UInt8 *reply, UInt32 replyBytes);
     IOReturn decodeSense(IOReturn fallback);
     bool   issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen, UInt32 control,
                             const UInt8 *outData, UInt32 dataLen,
@@ -216,6 +292,8 @@ private:
     bool   resetAndReinitialize(void);
 
 public:
+    virtual bool init(OSDictionary *properties = NULL) APPLE_KEXT_OVERRIDE;
+    virtual void free(void) APPLE_KEXT_OVERRIDE;
     virtual IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
@@ -237,6 +315,7 @@ public:
                          UInt32 extentsCount);
     UInt64   getCapacityBlocks(void) const { return fCapacityBlocks; }
     bool     isDeviceOffline(void) const { return fDeviceOffline; }
+    bool     isMediaPresent(void) const { return fMediaPresent; }
     UInt32   getBlockSize(void) const { return fBlockSize; }
     char    *getVendorString(void) { return fVendor; }
     char    *getProductString(void) { return fProduct; }

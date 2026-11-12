@@ -46,6 +46,13 @@ OSDefineMetaClassAndStructors(MPRController, IOService)
 /* A reply wait uses the interrupt first, then falls back to one poll pass. */
 #define MPR_REPLY_TIMEOUT_MS 2000
 
+/* PORT_ENABLE restarts firmware discovery and is answered only once that
+ * discovery finishes, so it scales with the topology behind the HBA instead
+ * of with a register handshake. mpt3sas allows 300 s for the same command
+ * after a host reset; the 2 s management budget is only valid for config
+ * pages and IOC Init. */
+#define MPR_PORT_ENABLE_TIMEOUT_MS 30000
+
 /* topology config page staging buffer (SAS IO Unit Page0 with 8+ phys). */
 #define MPR_PAGE_BUF_BYTES      512
 
@@ -54,6 +61,15 @@ OSDefineMetaClassAndStructors(MPRController, IOService)
 
 /* bulk transfer staging buffer. */
 #define MPR_DATA_BUF_BYTES      65536
+#define MPR_SM_EVENT_ACK        31
+
+enum {
+    kMPRProtocolAckOverflow = 1, kMPRProtocolAckReply,
+    kMPRProtocolManagementTimeout, kMPRProtocolEventLength,
+    kMPRProtocolManagementBusy, kMPRProtocolManagementReply,
+    kMPRProtocolAckTimeout,
+    kMPRProtocolInterruptUnavailable
+};
 
 struct MPRRegisterInfo
 {
@@ -96,6 +112,232 @@ void
 MPRController::writeReg(UInt32 offset, UInt32 value)
 {
     fRegs[offset / sizeof(UInt32)] = value;
+}
+
+void
+MPRController::postRequestDescriptor(UInt32 low, UInt32 high)
+{
+    if (fPostLock == NULL || fRegs == NULL) {
+        return;
+    }
+    /* Reply processing can submit an ACK while a normal command submits.
+     * Keep the two MMIO halves indivisible. Lock order: reply -> post only. */
+    IOSimpleLockLock(fPostLock);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, low);
+    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, high);
+    IOSimpleLockUnlock(fPostLock);
+}
+
+void
+MPRController::recordProtocolFaultLocked(UInt32 code, UInt32 smid)
+{
+    if (!fProtocolRecoveryPending) {
+        fProtocolFaultCode = code;
+        fProtocolFaultSmid = smid;
+        fTopologyGeneration++;
+    }
+    /* Diagnostic trail: the first fault of a recovery round, kept across the
+     * resetProtocolState() that the following reinit performs. */
+    fStickyFaultCode = code;
+    fStickyFaultSmid = smid;
+    fStickyFaultCount++;
+    fProtocolRecoveryPending = true;
+    fHotplugPending = true;
+}
+
+void
+MPRController::recordProtocolFault(UInt32 code, UInt32 smid)
+{
+    if (fReplyLock == NULL) {
+        return;
+    }
+    IOSimpleLockLock(fReplyLock);
+    recordProtocolFaultLocked(code, smid);
+    IOSimpleLockUnlock(fReplyLock);
+}
+
+void
+MPRController::noteBadReply(UInt32 site, UInt32 value, UInt32 smid,
+                            const UInt8 *frame, UInt32 bytes)
+{
+    /* Allocation-free: several callers hold fReplyLock. */
+    fBadReplySite = site;
+    fBadReplyValue = value;
+    fBadReplySmid = smid;
+    fBadReplyCount++;
+    fBadReplyFunction = (frame != NULL && bytes > 3) ? frame[3] : 0xFF;
+    fBadReplyMsgLen = (frame != NULL && bytes > 2) ? frame[2] : 0xFF;
+    fBadReplyWord = 0;
+    if (frame != NULL && bytes >= 4) {
+        memcpy(&fBadReplyWord, frame, sizeof(UInt32));
+    }
+}
+
+bool
+MPRController::beginManagementRequest(UInt32 smid)
+{
+    bool ready = false;
+
+    if (smid == 0 || smid >= 10 || fReplyLock == NULL ||
+        fRequestBuffer == NULL || fStopping) {
+        return false;
+    }
+    IOSimpleLockLock(fReplyLock);
+    if (!fProtocolRecoveryPending) {
+        if (fManagementBusy[smid]) {
+            recordProtocolFaultLocked(kMPRProtocolManagementBusy, smid);
+        } else {
+            fManagementBusy[smid] = true;
+            fReplySlots[smid].valid = 0;
+            ready = true;
+        }
+    }
+    IOSimpleLockUnlock(fReplyLock);
+    return ready;
+}
+
+bool
+MPRController::finishManagementRequest(UInt32 smid, UInt32 timeoutMs,
+                                        UInt8 *reply, UInt8 *kind)
+{
+    if (!waitForSmid(timeoutMs, smid) ||
+        !takeReplySlot(smid, reply, 64, kind)) {
+        /* The IOC may still own this frame AND the shared DMA buffer.
+         * Keep the busy bit until a diagnostic reset has stopped old DMA. */
+        recordProtocolFault(kMPRProtocolManagementTimeout, smid);
+        return false;
+    }
+    IOSimpleLockLock(fReplyLock);
+    fManagementBusy[smid] = false;
+    bool healthy = !fProtocolRecoveryPending;
+    IOSimpleLockUnlock(fReplyLock);
+    return healthy;
+}
+
+void
+MPRController::resetProtocolState(void)
+{
+    /* Caller has stopped the old IOC's DMA and disabled reply processing.
+     * Never use this to reclaim a timed-out frame while the IOC is live. */
+    if (fReplyLock == NULL) {
+        return;
+    }
+    IOSimpleLockLock(fReplyLock);
+    memset(fManagementBusy, 0, sizeof(fManagementBusy));
+    memset(fTmfBusy, 0, sizeof(fTmfBusy));
+    memset(fReplySlots, 0, sizeof(fReplySlots));
+    fEventAckHead = fEventAckQueued = fEventAckAge = 0;
+    fEventAckBusy = false;
+    fProtocolRecoveryPending = false;
+    fProtocolFaultCode = fProtocolFaultSmid = 0;
+    IOSimpleLockUnlock(fReplyLock);
+}
+
+void
+MPRController::serviceProtocolState(void)
+{
+    UInt32 queued, completed, failed, overflow, fault, smid, generation;
+    bool busy, recovery;
+
+    if (fReplyLock == NULL) {
+        return;
+    }
+    IOSimpleLockLock(fReplyLock);
+    if (!fReinitInProgress && !fStopping && fEventAckBusy &&
+        !fProtocolRecoveryPending && ++fEventAckAge >= 5) {
+        fEventAckFailed++;
+        recordProtocolFaultLocked(kMPRProtocolAckTimeout, MPR_SM_EVENT_ACK);
+    }
+    queued = fEventAckQueued;
+    completed = fEventAckCompleted;
+    failed = fEventAckFailed;
+    overflow = fEventAckOverflow;
+    busy = fEventAckBusy;
+    recovery = fProtocolRecoveryPending;
+    fault = fProtocolFaultCode;
+    smid = fProtocolFaultSmid;
+    generation = fTopologyGeneration;
+    IOSimpleLockUnlock(fReplyLock);
+    setProperty("MPREventAckQueued", (unsigned long long)queued, 32);
+    setProperty("MPREventAckInFlight", busy);
+    setProperty("MPREventAckCompleted", (unsigned long long)completed, 32);
+    setProperty("MPREventAckFailed", (unsigned long long)failed, 32);
+    setProperty("MPREventAckOverflow", (unsigned long long)overflow, 32);
+    setProperty("MPRProtocolRecoveryPending", recovery);
+    setProperty("MPRProtocolFaultCode", (unsigned long long)fault, 32);
+    setProperty("MPRProtocolFaultSmid", (unsigned long long)smid, 16);
+    setProperty("MPRTopologyGeneration", (unsigned long long)generation, 32);
+    /* The members below are written under the reply lock, so they are
+     * published here instead of allocating inside that lock. */
+    setProperty("MPRStickyFaultCode", (unsigned long long)fStickyFaultCode, 32);
+    setProperty("MPRStickyFaultSmid", (unsigned long long)fStickyFaultSmid, 16);
+    setProperty("MPRStickyFaultCount", (unsigned long long)fStickyFaultCount, 32);
+    setProperty("MPRLastTopoHandle", (unsigned long long)fLastTopoHandle, 16);
+    setProperty("MPRLastTopoReason", (unsigned long long)fLastTopoReason, 8);
+    setProperty("MPRLastTopoRate", (unsigned long long)fLastTopoRate, 8);
+    setProperty("MPRTopoRemovalHits", (unsigned long long)fTopoRemovalHits, 32);
+    setProperty("MPRBadReplySite", (unsigned long long)fBadReplySite, 32);
+    setProperty("MPRBadReplyValue", (unsigned long long)fBadReplyValue, 32);
+    setProperty("MPRBadReplySmid", (unsigned long long)fBadReplySmid, 16);
+    setProperty("MPRBadReplyCount", (unsigned long long)fBadReplyCount, 32);
+    setProperty("MPRBadReplyFunction", (unsigned long long)fBadReplyFunction, 8);
+    setProperty("MPRBadReplyMsgLen", (unsigned long long)fBadReplyMsgLen, 8);
+    setProperty("MPRBadReplyWord", (unsigned long long)fBadReplyWord, 32);
+}
+
+void
+MPRController::recordTopologyEventLocked(const UInt8 *data, UInt32 bytes)
+{
+    /* Payload is borrowed from the reply frame and parsed before recycling.
+     * The diagnostics-only fLastEventData is too short for eight PHYs. */
+    if (bytes < 12 || data[8] > (bytes - 12) / 4) {
+        recordProtocolFaultLocked(kMPRProtocolEventLength, 0);
+        return;
+    }
+    bool changed = false;
+    for (UInt32 i = 0; i < data[8]; i++) {
+        const UInt8 *phy = data + 12 + i * 4;
+        UInt16 handle = (UInt16)((UInt16)phy[0] | ((UInt16)phy[1] << 8));
+        UInt8 reason = phy[3] & MPI2_EVENT_SAS_TOPO_RC_MASK;
+        UInt8 rate = phy[2] >> 4;
+        if (handle == 0 ||
+            ((phy[3] & MPI2_EVENT_SAS_TOPO_PHYSTATUS_VACANT) != 0 &&
+             reason != MPI2_EVENT_SAS_TOPO_RC_TARG_NOT_RESPONDING)) {
+            continue;
+        }
+        bool affected = (handle == fAttachedDevHandle && fAttachedDevHandle != 0);
+        bool removed = reason == MPI2_EVENT_SAS_TOPO_RC_TARG_NOT_RESPONDING ||
+                       (reason == MPI2_EVENT_SAS_TOPO_RC_PHY_CHANGED && rate < 8);
+        /* Diagnostics: the last reason that carried a target handle decides
+         * which transition the driver reacts to. Plain members only; the
+         * watchdog publishes them outside this lock. */
+        fLastTopoHandle = handle;
+        fLastTopoReason = reason;
+        fLastTopoRate = rate;
+        if (affected && removed) {
+            /* Preserve removal even if a fast replug reuses the same handle. */
+            fTopoRemovalHits++;
+            fRemovalPending = true;
+        }
+        if (reason == MPI2_EVENT_SAS_TOPO_RC_TARG_ADDED &&
+            !fReinitInProgress && !fStarting) {
+            /* A new insertion may retry an exhausted recovery budget;
+             * discovery generated by our own IOC reset must not do so. */
+            fHotplugRetryRequested = true;
+        }
+        if (reason == MPI2_EVENT_SAS_TOPO_RC_TARG_ADDED ||
+            reason == MPI2_EVENT_SAS_TOPO_RC_TARG_NOT_RESPONDING ||
+            reason == MPI2_EVENT_SAS_TOPO_RC_PHY_CHANGED ||
+            reason == MPI2_EVENT_SAS_TOPO_RC_DELAY_NOT_RESPONDING) {
+            changed = true;
+        }
+    }
+    if (changed) {
+        fTopologyGeneration++;
+        fTopologyChanged = true;
+        /* Cooldown delays work; it must never discard a physical event. */
+        fHotplugPending = true;
+    }
 }
 
 IOService *
@@ -741,7 +983,9 @@ MPRController::setupInterrupts(void)
 {
     int type = -1;
 
-    fWorkLoop = IOWorkLoop::workLoop();
+    if (fWorkLoop == NULL) {
+        fWorkLoop = IOWorkLoop::workLoop();
+    }
     if (fWorkLoop == NULL) {
         setProperty("MPRIntState", "no-workloop");
         return false;
@@ -781,10 +1025,7 @@ MPRController::teardownInterrupts(void)
         fInterrupt->release();
         fInterrupt = NULL;
     }
-    if (fWorkLoop != NULL) {
-        fWorkLoop->release();
-        fWorkLoop = NULL;
-    }
+    /* The watchdog shares this workloop. Keep it alive across IOC resets. */
 }
 
 bool
@@ -821,133 +1062,134 @@ MPRController::interruptAction(OSObject *owner, IOInterruptEventSource *sender,
 void
 MPRController::processReplyQueue(void)
 {
-    UInt8 *queue, *post, *replyBase;
-    UInt32 i, baddr, replyBytes;
-    UInt64 entry, clear;
-    UInt8  flags;
+    if (fQueueBuffer == NULL || fReplyBuffer == NULL || fReplyLock == NULL) {
+        return;
+    }
+    UInt8 *queue = (UInt8 *)fQueueBuffer->getBytesNoCopy();
+    UInt8 *replyBase = (UInt8 *)fReplyBuffer->getBytesNoCopy();
+    if (queue == NULL || replyBase == NULL || fReplyFrameSize == 0) {
+        return;
+    }
+    UInt8 *post = queue + fFqDepth * 4;
+    UInt32 replyBytes = fReplyFrameSize * fFqDepth;
 
-    if (fQueueBuffer == NULL || fReplyBuffer == NULL) {
-        return;
-    }
-    queue = (UInt8 *)fQueueBuffer->getBytesNoCopy();
-    replyBase = (UInt8 *)fReplyBuffer->getBytesNoCopy();
-    if (queue == NULL || replyBase == NULL) {
-        return;
-    }
-    post = queue + fFqDepth * 4;
-    replyBytes = fReplyFrameSize * fFqDepth;
-
-    /* Only one consumer may walk the reply queue. The interrupt action and a
-     * waiter's fallback poll both call this method; the spin lock makes the
-     * post-index update and the per-SMID publication atomic. */
-    if (fReplyLock == NULL) {
-        return;
-    }
+    /* One consumer owns descriptor retirement, reply slots, and event ACKs. */
     IOSimpleLockLock(fReplyLock);
-
-    for (i = 0; i < fPqDepth; i++) {
+    for (UInt32 i = 0; i < fPqDepth; i++) {
+        UInt64 entry;
         memcpy(&entry, post + fReplyPostIndex * 8, sizeof(entry));
-        flags = (UInt8)(entry & MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK);
+        UInt8 flags = (UInt8)(entry & MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK);
         if (flags == MPI2_RPY_DESCRIPT_FLAGS_UNUSED ||
             ((entry >> 32) & 0xFFFFFFFFULL) == 0xFFFFFFFFULL) {
             break;
         }
-        baddr = (UInt32)(entry >> 32);
-        clear = 0xFFFFFFFFFFFFFFFFULL;
+        UInt16 smid = (UInt16)((entry >> 16) & 0xFFFF);
+        UInt32 baddr = (UInt32)(entry >> 32);
+        UInt64 clear = 0xFFFFFFFFFFFFFFFFULL;
         memcpy(post + fReplyPostIndex * 8, &clear, sizeof(clear));
         fReplyPostIndex = (fReplyPostIndex + 1) % fPqDepth;
         if (flags == MPI2_RPY_DESCRIPT_FLAGS_ADDRESS_REPLY &&
             baddr >= (UInt32)fReplyPhys &&
-            baddr < (UInt32)fReplyPhys + replyBytes) {
-            UInt8 *replyFrame = replyBase + (baddr - (UInt32)fReplyPhys);
-
-            if (replyFrame[3] == MPI2_FUNCTION_EVENT_NOTIFICATION) {
-                MPREventNotifyReply *event = (MPREventNotifyReply *)replyFrame;
-
-                /* Asynchronous firmware event (also carries the reply to the
-                 * mask-setting request itself). */
-                memcpy(fLastEventData, replyFrame, sizeof(fLastEventData));
-                fLastEvent = event->Event;
-                fLastEventDataLength = event->EventDataLength;
-                fLastEventAckRequired = event->AckRequired;
-                fLastEventContext = event->EventContext;
-                if (fLastEvent < 128) {
-                    fEventSeen[fLastEvent / 32] |= (1U << (fLastEvent % 32));
-                }
-                fEventCount++;
-                fEventReplyCount++;
-                if (fLastEvent == MPI2_EVENT_SAS_DEVICE_STATUS_CHANGE ||
-                    fLastEvent == MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST) {
-                    /* Do not call setProperty() while fReplyLock is held;
-                     * the watchdog schedules a thread that compares the
-                     * discovered DevHandle before rebuilding anything. */
-                    fTopologyChanged = true;
-                    if (fHotplugCooldown == 0) {
-                        fHotplugPending = true;
+            baddr - (UInt32)fReplyPhys < replyBytes &&
+            ((baddr - (UInt32)fReplyPhys) % fReplyFrameSize) == 0) {
+            UInt8 *reply = replyBase + (baddr - (UInt32)fReplyPhys);
+            UInt32 bytes = (UInt32)reply[2] * 4;
+            if (bytes < 4 || bytes > fReplyFrameSize) {
+                recordProtocolFaultLocked(kMPRProtocolManagementReply, smid);
+            } else if (smid == MPR_SM_EVENT_ACK) {
+                /* ACK completion never satisfies a config/SCSI waiter. */
+                completeEventAckLocked(reply, bytes);
+            } else if (reply[3] == MPI2_FUNCTION_EVENT_NOTIFICATION) {
+                if (bytes < sizeof(MPREventNotifyReply)) {
+                    recordProtocolFaultLocked(kMPRProtocolEventLength, smid);
+                } else {
+                    const MPREventNotifyReply *event =
+                        (const MPREventNotifyReply *)reply;
+                    UInt32 eventBytes = (UInt32)event->EventDataLength * 4;
+                    memset(fLastEventData, 0, sizeof(fLastEventData));
+                    memcpy(fLastEventData, reply,
+                           bytes < sizeof(fLastEventData) ? bytes : sizeof(fLastEventData));
+                    fLastEvent = event->Event;
+                    fLastEventDataLength = event->EventDataLength;
+                    fLastEventAckRequired = event->AckRequired;
+                    fLastEventContext = event->EventContext;
+                    if (event->Event < 128) {
+                        fEventSeen[event->Event / 32] |= 1U << (event->Event % 32);
+                    }
+                    fEventCount++;
+                    fEventReplyCount++;
+                    if (smid == 2 && fManagementBusy[2]) {
+                        /* Only the subscription's own SMID completes it. */
+                        MPRReplySlot *slot = &fReplySlots[2];
+                        memset(slot->reply, 0, sizeof(slot->reply));
+                        memcpy(slot->reply, reply,
+                               bytes < sizeof(slot->reply) ? bytes : sizeof(slot->reply));
+                        slot->smid = 2;
+                        slot->kind = 1;
+                        slot->valid = 1;
+                    }
+                    if (eventBytes > bytes - sizeof(MPREventNotifyReply)) {
+                        recordProtocolFaultLocked(kMPRProtocolEventLength, smid);
+                    } else if (event->Event == MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST &&
+                               (event->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS) {
+                        recordTopologyEventLocked(reply + sizeof(MPREventNotifyReply),
+                                                  eventBytes);
+                    }
+                    /* DEVICE_STATUS_CHANGE also reports internal reset/TMF
+                     * completion and SMART. It is not a device add/remove. */
+                    if (event->AckRequired == MPI2_EVENT_NOTIFICATION_ACK_REQUIRED) {
+                        sendEventAck(event->Event, event->EventContext);
                     }
                 }
-                if (fLastEventAckRequired == MPI2_EVENT_NOTIFICATION_ACK_REQUIRED) {
-                    sendEventAck(fLastEvent, fLastEventContext);
-                }
             } else {
-                UInt16 rsmid = (UInt16)((entry >> 16) & 0xFFFF);
-
-                if (rsmid < 128) {
-                    MPRReplySlot *slot = &fReplySlots[rsmid];
-
-                    memcpy(slot->reply, replyFrame, sizeof(slot->reply));
-                    slot->smid = rsmid;
+                if (smid < 128) {
+                    MPRReplySlot *slot = &fReplySlots[smid];
+                    memset(slot->reply, 0, sizeof(slot->reply));
+                    memcpy(slot->reply, reply,
+                           bytes < sizeof(slot->reply) ? bytes : sizeof(slot->reply));
+                    slot->smid = smid;
                     slot->kind = 1;
                     slot->valid = 1;
                 }
-                memcpy(fLastReply, replyFrame, sizeof(fLastReply));
-                fLastReplySmid = rsmid;
+                memset(fLastReply, 0, sizeof(fLastReply));
+                memcpy(fLastReply, reply,
+                       bytes < sizeof(fLastReply) ? bytes : sizeof(fLastReply));
+                fLastReplySmid = smid;
                 fLastReplyKind = 1;
                 fReplyCount++;
             }
-            /* D1: each AddressReply consumes exactly one reply frame; return
-             * it to the free queue (mpr_free_reply, mprvar.h:559-565). */
             releaseReplyFrame(baddr);
         } else if (flags == MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS ||
                    flags == MPI25_RPY_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO_SUCCESS) {
-            /* A successful SCSI IO carries no reply frame; only the SMID. */
-            UInt16 rsmid = (UInt16)((entry >> 16) & 0xFFFF);
-
-            if (rsmid < 128) {
-                MPRReplySlot *slot = &fReplySlots[rsmid];
-
-                slot->smid = rsmid;
-                slot->kind = 2;
-                memset(slot->reply, 0, sizeof(slot->reply));
-                slot->valid = 1;
+            if (smid == MPR_SM_EVENT_ACK) {
+                recordProtocolFaultLocked(kMPRProtocolAckReply, smid);
+                fEventAckFailed++;
+            } else {
+                if (smid < 128) {
+                    MPRReplySlot *slot = &fReplySlots[smid];
+                    memset(slot->reply, 0, sizeof(slot->reply));
+                    slot->smid = smid;
+                    slot->kind = 2;
+                    slot->valid = 1;
+                }
+                fLastReplySmid = smid;
+                fLastReplyKind = 2;
+                memset(fLastReply, 0, sizeof(fLastReply));
+                fScsiSuccess++;
+                fReplyCount++;
             }
-            fLastReplySmid = rsmid;
-            fLastReplyKind = 2;
-            memset(fLastReply, 0, sizeof(fLastReply));
-            fScsiSuccess++;
-            fReplyCount++;
+        } else {
+            noteBadReply(1, (UInt32)flags, smid, NULL, 0);
+            recordProtocolFaultLocked(kMPRProtocolManagementReply, smid);
         }
     }
-    IOSimpleLockUnlock(fReplyLock);
+    /* Publish the index while still owning it; another consumer must not
+     * publish an older index after we have advanced the ring again. */
     writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, fReplyPostIndex);
+    IOSimpleLockUnlock(fReplyLock);
 }
 
-bool
-MPRController::waitForReply(UInt32 timeoutMs)
-{
-    UInt32 i;
 
-    for (i = 0; i < timeoutMs; i++) {
-        if (fReplyCount > 0) {
-            fReplyViaIrq++;
-            return true;
-        }
-        IOSleep(1);
-    }
-    /* Fallback when the interrupt source could not be installed. */
-    processReplyQueue();
-    return fReplyCount > 0;
-}
 
 bool
 MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
@@ -980,7 +1222,17 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
         ready = (fReplySlots[smid].valid != 0);
         IOSimpleLockUnlock(fReplyLock);
         if (ready) {
+            if (i >= 1000) {
+                setProperty("MPRLongReplyWaitMs", (unsigned long long)i, 32);
+                setProperty("MPRLongReplyWaitSmid", (unsigned long long)smid, 16);
+            }
             return true;
+        }
+        /* A long wait (PORT_ENABLE) must not stop the consumer: replies that
+         * land in the queue while this thread sleeps still have to reach
+         * their slots, and queued event ACKs have to be posted. */
+        if ((i % 20) == 19) {
+            processReplyQueue();
         }
         IOSleep(1);
     }
@@ -1038,10 +1290,14 @@ MPRController::sendEventNotification(void)
 {
     UInt8 *frame;
     MPREventNotifyRequest *request;
-    UInt32 value32, before, i;
+    UInt8 replyBuf[64], replyKind = 0;
 
+    if (fRequestBuffer == NULL || !beginManagementRequest(2)) {
+        return false;
+    }
     frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
     if (frame == NULL) {
+        recordProtocolFault(kMPRProtocolManagementReply, 2);
         return false;
     }
     frame += 2 * fRequestFrameSize;     /* SMID 2 */
@@ -1070,67 +1326,57 @@ MPRController::sendEventNotification(void)
                  request->EventMasks[2] == 0xFFFFFFFFU &&
                  request->EventMasks[3] == 0xFFFFFFFFU) ? "ok" : "mismatch");
 
-    /* The subscription reply is itself an EVENT_NOTIFICATION reply; wait for
-     * it and check IOCStatus instead of assuming the write succeeded. */
-    before = fEventReplyCount;
-    fReplyCount = 0;
-    fLastReplyKind = 0;
-    fLastReplySmid = 0xFFFF;
-    value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (2U << 16);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
-    for (i = 0; i < MPR_REPLY_TIMEOUT_MS && fEventReplyCount == before; i++) {
-        IOSleep(1);
-    }
-    if (fEventReplyCount == before) {
+    postDefaultRequest(2);
+    if (!finishManagementRequest(2, MPR_REPLY_TIMEOUT_MS, replyBuf, &replyKind)) {
         setProperty("MPREventNotifyState", "no-subscription-reply");
         return false;
     }
-    {
-        MPREventNotifyReply *reply = (MPREventNotifyReply *)fLastEventData;
-
-        setProperty("MPREventNotifyIOCStatus",
-                    (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
-        setProperty("MPREventNotifyState",
-                    ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) ==
-                     MPI2_IOCSTATUS_SUCCESS) ? "ok" : "failed-status");
+    MPREventNotifyReply *reply = (MPREventNotifyReply *)replyBuf;
+    if (replyKind != 1 || reply->Function != MPI2_FUNCTION_EVENT_NOTIFICATION ||
+        reply->MsgLength * 4U < sizeof(MPREventNotifyReply)) {
+        noteBadReply(4, (UInt32)replyKind, 2, replyBuf, sizeof(replyBuf));
+        recordProtocolFault(kMPRProtocolManagementReply, 2);
+        setProperty("MPREventNotifyState", "unexpected-subscription-reply");
+        return false;
     }
-    return true;
+    UInt16 status = reply->IOCStatus & MPI2_IOCSTATUS_MASK;
+    setProperty("MPREventNotifyIOCStatus", (unsigned long long)status, 16);
+    setProperty("MPREventNotifyState", status == MPI2_IOCSTATUS_SUCCESS ? "ok" : "failed-status");
+    return status == MPI2_IOCSTATUS_SUCCESS;
 }
 
 bool
 MPRController::sendPortEnable(void)
 {
-    UInt8 *frame;
-    MPRPortEnableRequest *request;
-    UInt32 value32;
-
-    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
-    if (frame == NULL) {
+    if (fRequestBuffer == NULL || !beginManagementRequest(3)) {
         return false;
     }
-    frame += 3 * fRequestFrameSize;     /* SMID 3 */
+    UInt8 *frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        recordProtocolFault(kMPRProtocolManagementReply, 3);
+        return false;
+    }
+    frame += 3 * fRequestFrameSize;
     memset(frame, 0, fRequestFrameSize);
-    request = (MPRPortEnableRequest *)frame;
+    MPRPortEnableRequest *request = (MPRPortEnableRequest *)frame;
     request->Function = MPI2_FUNCTION_PORT_ENABLE;
     request->PortFlags = 0;
-
-    fReplyCount = 0;
-    value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (3U << 16);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
-    if (!waitForReply(MPR_REPLY_TIMEOUT_MS)) {
+    UInt8 replyBuf[64], replyKind = 0;
+    postDefaultRequest(3);
+    if (!finishManagementRequest(3, MPR_PORT_ENABLE_TIMEOUT_MS, replyBuf, &replyKind)) {
         return false;
     }
-    {
-        MPRPortEnableReply *reply = (MPRPortEnableReply *)fLastReply;
-
-        setProperty("MPRPortEnableStatus",
-                    (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
-        setProperty("MPRPortEnableLogInfo",
-                    (unsigned long long)reply->IOCLogInfo, 32);
+    MPRPortEnableReply *reply = (MPRPortEnableReply *)replyBuf;
+    if (replyKind != 1 || reply->Function != MPI2_FUNCTION_PORT_ENABLE ||
+        reply->MsgLength * 4U < sizeof(MPRPortEnableReply)) {
+        noteBadReply(3, (UInt32)replyKind, 3, replyBuf, sizeof(replyBuf));
+        recordProtocolFault(kMPRProtocolManagementReply, 3);
+        return false;
     }
-    return true;
+    UInt16 status = reply->IOCStatus & MPI2_IOCSTATUS_MASK;
+    setProperty("MPRPortEnableStatus", (unsigned long long)status, 16);
+    setProperty("MPRPortEnableLogInfo", (unsigned long long)reply->IOCLogInfo, 32);
+    return status == MPI2_IOCSTATUS_SUCCESS;
 }
 
 bool
@@ -1178,91 +1424,85 @@ MPRController::readExtConfigPage(UInt8 extPageType, UInt32 pageAddress,
                                  UInt8 *buffer, UInt32 bufferBytes,
                                  UInt32 *actualBytes)
 {
-    MPRConfigRequest *config;
-    MPRConfigReply *reply;
-    UInt8 *frame;
-    UInt32 value32, headerDwords;
-
-    if (bufferBytes == 0 || bufferBytes > MPR_PAGE_BUF_BYTES ||
-        fRequestBuffer == NULL || fPageBuffer == NULL) {
-        return false;
-    }
-    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
-    if (frame == NULL) {
-        return false;
-    }
-    frame += 4 * fRequestFrameSize;     /* SMID 4 */
-
-    /* Step 1: page header without a data SGE. */
-    memset(frame, 0, fRequestFrameSize);
-    config = (MPRConfigRequest *)frame;
-    config->Function = MPI2_FUNCTION_CONFIG;
-    config->Action = MPI2_CONFIG_ACTION_PAGE_HEADER;
-    config->Header.PageType = MPI2_CONFIG_PAGETYPE_EXTENDED;
-    config->Header.PageNumber = 0;
-    config->Header.PageLength = 0;
-    config->ExtPageType = extPageType;
-    config->ExtPageLength = 0;
-    config->PageAddress = pageAddress;
-
-    fReplyCount = 0;
-    value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (4U << 16);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
-    if (!waitForReply(MPR_REPLY_TIMEOUT_MS)) {
-        setProperty("MPRConfigExtFailure", "page header timeout");
-        return false;
-    }
-    reply = (MPRConfigReply *)fLastReply;
-    setProperty("MPRConfigExtStatus",
-                (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
-    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
-        setProperty("MPRConfigExtFailure", "page header status");
-        return false;
-    }
-    headerDwords = reply->ExtPageLength;
-    if (headerDwords == 0 || (headerDwords * 4) > bufferBytes) {
-        headerDwords = bufferBytes / 4;
-    }
-    setProperty("MPRConfigExtLength", (unsigned long long)headerDwords, 16);
-
-    /* Step 2: page data through the SGE, same SMID. */
-    memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
-    memset(frame, 0, fRequestFrameSize);
-    config->Function = MPI2_FUNCTION_CONFIG;
-    config->Action = MPI2_CONFIG_ACTION_PAGE_READ_CURRENT;
-    config->Header.PageType = MPI2_CONFIG_PAGETYPE_EXTENDED;
-    config->Header.PageNumber = 0;
-    config->Header.PageLength = 0;
-    config->ExtPageType = extPageType;
-    config->ExtPageLength = (UInt16)headerDwords;
-    config->PageAddress = pageAddress;
-    config->SgeFlagsLength =
-        ((UInt32)(MPI2_SGE_FLAGS_SIMPLE_ELEMENT | MPI2_SGE_FLAGS_LAST_ELEMENT |
-                  MPI2_SGE_FLAGS_END_OF_BUFFER | MPI2_SGE_FLAGS_64_BIT_ADDRESSING)
-         << MPI2_SGE_FLAGS_SHIFT) |
-        (bufferBytes & MPI2_SGE_LENGTH_MASK);
-    config->SgeAddress = fPagePhys;
-
-    fReplyCount = 0;
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
-    if (!waitForReply(MPR_REPLY_TIMEOUT_MS)) {
-        setProperty("MPRConfigExtFailure", "page data timeout");
-        return false;
-    }
-    reply = (MPRConfigReply *)fLastReply;
-    setProperty("MPRConfigExtDataStatus",
-                (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
-    if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
-        setProperty("MPRConfigExtFailure", "page data status");
-        return false;
-    }
-
-    memcpy(buffer, fPageBuffer->getBytesNoCopy(), bufferBytes);
     if (actualBytes != NULL) {
-        *actualBytes = headerDwords * 4;
+        *actualBytes = 0;
     }
+    if (buffer == NULL || bufferBytes < sizeof(MPRExtPageHeader) ||
+        bufferBytes > MPR_PAGE_BUF_BYTES || fRequestBuffer == NULL ||
+        fPageBuffer == NULL || !beginManagementRequest(4)) {
+        return false;
+    }
+    UInt8 *frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL) {
+        recordProtocolFault(kMPRProtocolManagementReply, 4);
+        return false;
+    }
+    frame += 4 * fRequestFrameSize;
+    MPRConfigRequest *config = (MPRConfigRequest *)frame;
+    UInt8 replyBuf[64], replyKind = 0;
+    UInt32 pageBytes = 0;
+    UInt8 pageVersion = 0;
+
+    for (UInt32 phase = 0; phase < 2; phase++) {
+        if (phase != 0 && !beginManagementRequest(4)) {
+            return false;
+        }
+        memset(frame, 0, fRequestFrameSize);
+        config->Function = MPI2_FUNCTION_CONFIG;
+        config->Action = phase == 0 ? MPI2_CONFIG_ACTION_PAGE_HEADER
+                                    : MPI2_CONFIG_ACTION_PAGE_READ_CURRENT;
+        config->Header.PageType = MPI2_CONFIG_PAGETYPE_EXTENDED;
+        config->Header.PageNumber = 0;
+        config->Header.PageVersion = pageVersion;
+        config->ExtPageType = extPageType;
+        config->ExtPageLength = (UInt16)(pageBytes / 4);
+        config->PageAddress = pageAddress;
+        if (phase != 0) {
+            memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
+            config->SgeFlagsLength =
+                ((UInt32)(MPI2_SGE_FLAGS_SIMPLE_ELEMENT | MPI2_SGE_FLAGS_LAST_ELEMENT |
+                          MPI2_SGE_FLAGS_END_OF_BUFFER | MPI2_SGE_FLAGS_64_BIT_ADDRESSING)
+                 << MPI2_SGE_FLAGS_SHIFT) | pageBytes;
+            config->SgeAddress = fPagePhys;
+        }
+        postDefaultRequest(4);
+        if (!finishManagementRequest(4, MPR_REPLY_TIMEOUT_MS, replyBuf, &replyKind)) {
+            setProperty("MPRConfigExtFailure", phase == 0 ? "page header timeout" : "page data timeout");
+            return false;
+        }
+        MPRConfigReply *reply = (MPRConfigReply *)replyBuf;
+        if (replyKind != 1 || reply->Function != MPI2_FUNCTION_CONFIG ||
+            reply->MsgLength * 4U < sizeof(MPRConfigReply) ||
+            reply->Action != config->Action) {
+            noteBadReply(5, (UInt32)replyKind, 4, replyBuf, sizeof(replyBuf));
+            recordProtocolFault(kMPRProtocolManagementReply, 4);
+            setProperty("MPRConfigExtFailure", "unexpected config reply");
+            return false;
+        }
+        UInt16 status = reply->IOCStatus & MPI2_IOCSTATUS_MASK;
+        setProperty(phase == 0 ? "MPRConfigExtStatus" : "MPRConfigExtDataStatus",
+                    (unsigned long long)status, 16);
+        if (status != MPI2_IOCSTATUS_SUCCESS) {
+            setProperty("MPRConfigExtFailure", phase == 0 ? "page header status" : "page data status");
+            return false;
+        }
+        UInt32 bytes = (UInt32)reply->ExtPageLength * 4;
+        if ((reply->Header.PageType & 0x0F) != MPI2_CONFIG_PAGETYPE_EXTENDED ||
+            reply->Header.PageNumber != 0 || reply->ExtPageType != extPageType ||
+            bytes < sizeof(MPRExtPageHeader) || bytes > bufferBytes ||
+            (phase != 0 && bytes != pageBytes)) {
+            setProperty("MPRConfigExtFailure", "invalid config page header or length");
+            return false;
+        }
+        pageBytes = bytes;
+        pageVersion = reply->Header.PageVersion;
+    }
+    memset(buffer, 0, bufferBytes);
+    memcpy(buffer, fPageBuffer->getBytesNoCopy(), pageBytes);
+    if (actualBytes != NULL) {
+        *actualBytes = pageBytes;
+    }
+    setProperty("MPRConfigExtLength", (unsigned long long)(pageBytes / 4), 16);
     return true;
 }
 
@@ -1271,67 +1511,76 @@ MPRController::readSasIOUnitPage0(void)
 {
     UInt8 page[MPR_PAGE_BUF_BYTES];
     UInt32 actual = 0;
-    UInt32 numPhys, i;
+    UInt32 selectedHandle = 0, selectedInfo = 0, selectedPhy = 0;
+    bool oldFastPath = fFastPathEnabled, selectedFastPath = false;
     char name[32];
 
+    /* Keep the previous snapshot until the entire read succeeds. A failed
+     * management command is not evidence that a physical drive is absent. */
     if (!readExtConfigPage(MPI2_CONFIG_EXTPAGETYPE_SAS_IO_UNIT, 0,
-                           page, sizeof(page), &actual)) {
+                           page, sizeof(page), &actual) || actual < 0x10) {
         setProperty("MPRTopologyFailure", "SAS IO Unit Page0 read failed");
         return false;
     }
-
-    numPhys = page[0x0C];
-    if (numPhys > 16) {
-        numPhys = 16;
+    UInt32 numPhys = page[0x0C];
+    if (numPhys > 16 || actual < 0x10 + numPhys * 0x14) {
+        setProperty("MPRTopologyFailure", "truncated PHY list");
+        return false;
     }
     setProperty("MPRNumPhys", (unsigned long long)numPhys, 8);
     setProperty("MPRSasPageBytes", (unsigned long long)actual, 32);
-
-    for (i = 0; i < numPhys; i++) {
+    fSasDeviceMismatch = false;
+    UInt32 linkUpPhys = 0;
+    for (UInt32 i = 0; i < numPhys; i++) {
         const UInt8 *phy = page + 0x10 + i * 0x14;
-        UInt32 deviceInfo = (UInt32)phy[0x04] | ((UInt32)phy[0x05] << 8) |
-                            ((UInt32)phy[0x06] << 16) | ((UInt32)phy[0x07] << 24);
         UInt32 devHandle = (UInt32)phy[0x08] | ((UInt32)phy[0x09] << 8);
-        UInt32 linkRate = phy[0x03];
-
+        UInt32 linkRate = phy[0x03] & 0x0F; /* negotiated rate in CONFIG page */
+        if (linkRate >= 0x08) linkUpPhys++;
         snprintf(name, sizeof(name), "MPRPhy%uDevHandle", (unsigned int)i);
         setProperty(name, (unsigned long long)devHandle, 16);
-        snprintf(name, sizeof(name), "MPRPhy%uDeviceInfo", (unsigned int)i);
-        setProperty(name, (unsigned long long)deviceInfo, 32);
         snprintf(name, sizeof(name), "MPRPhy%uLinkRate", (unsigned int)i);
         setProperty(name, (unsigned long long)linkRate, 8);
+        if (selectedHandle != 0 || devHandle == 0 || linkRate < 0x08) continue;
 
-        /* Only a directly attached end device (SATA/STP/SSP target) is a
-         * usable media target; expanders and IR volumes are skipped. */
-        if (devHandle != 0 && fAttachedDevHandle == 0) {
-            UInt32 sasInfo = 0;
-
-            fAttachedDevHandle = devHandle;
-            if (readSasDevicePage0(devHandle, &sasInfo) &&
-                (sasInfo & MPI2_SAS_DEVICE_INFO_END_DEVICE) != 0 &&
-                (sasInfo & (MPI2_SAS_DEVICE_INFO_SATA_DEVICE |
-                            MPI2_SAS_DEVICE_INFO_STP_TARGET |
-                            MPI2_SAS_DEVICE_INFO_SSP_TARGET)) != 0 &&
-                (sasInfo & MPI2_SAS_DEVICE_INFO_DIRECT_ATTACH) != 0) {
-                setProperty("MPRAttachedDevHandle",
-                            (unsigned long long)devHandle, 16);
-                setProperty("MPRAttachedDeviceInfo",
-                            (unsigned long long)sasInfo, 32);
-                setProperty("MPRAttachedPhy", (unsigned long long)i, 8);
-                setProperty("MPRAttachedPortFlags", (unsigned long long)phy[0x01], 8);
-                setProperty("MPRAttachedPhyFlags", (unsigned long long)phy[0x02], 8);
-                setProperty("MPRAttachedDiscoveryStatus",
-                            (unsigned long long)((UInt32)phy[0x0C] |
-                                                 ((UInt32)phy[0x0D] << 8) |
-                                                 ((UInt32)phy[0x0E] << 16) |
-                                                 ((UInt32)phy[0x0F] << 24)), 32);
-            } else {
-                fAttachedDevHandle = 0;
-                removeProperty("MPRAttachedDevHandle");
-                removeProperty("MPRAttachedDeviceInfo");
+        UInt32 info = 0;
+        if (!readSasDevicePage0(devHandle, &info)) {
+            fFastPathEnabled = oldFastPath;
+            setProperty("MPRTopologyFailure", "SAS Device Page0 read failed");
+            if (fSasDeviceMismatch) {
+                /* The handle no longer names this target. Not a transport
+                 * failure: leave it unselected and let recovery rediscover. */
+                continue;
             }
+            return false;
         }
+        if ((info & MPI2_SAS_DEVICE_INFO_END_DEVICE) == 0 ||
+            (info & (MPI2_SAS_DEVICE_INFO_SATA_DEVICE |
+                     MPI2_SAS_DEVICE_INFO_STP_TARGET |
+                     MPI2_SAS_DEVICE_INFO_SSP_TARGET)) == 0 ||
+            (info & MPI2_SAS_DEVICE_INFO_DIRECT_ATTACH) == 0) continue;
+        selectedHandle = devHandle;
+        selectedInfo = info;
+        selectedPhy = i;
+        selectedFastPath = fFastPathEnabled;
     }
+    fAttachedDevHandle = selectedHandle;
+    fFastPathEnabled = selectedFastPath;
+    fLinkUpPhys = linkUpPhys;
+    if (selectedHandle == 0 && fSasDeviceMismatch) {
+        fIdentityLostCount++;
+    } else {
+        fIdentityLostCount = 0;
+    }
+    setProperty("MPRLinkUpPhys", (unsigned long long)linkUpPhys, 8);
+    setProperty("MPRIdentityLostCount", (unsigned long long)fIdentityLostCount, 8);
+    setProperty("MPRAttachedDevHandle", (unsigned long long)selectedHandle, 16);
+    setProperty("MPRAttachedDeviceInfo", (unsigned long long)selectedInfo, 32);
+    if (selectedHandle != 0) {
+        setProperty("MPRAttachedPhy", (unsigned long long)selectedPhy, 8);
+    } else {
+        removeProperty("MPRAttachedPhy");
+    }
+    removeProperty("MPRTopologyFailure");
     return true;
 }
 
@@ -1354,6 +1603,12 @@ MPRController::readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo)
         return false;
     }
 
+    if (actual < MPR_SASDEV0_DEVICEINFO_OFF + sizeof(deviceInfo) ||
+        actual < 0x22) {
+        setProperty("MPRSasDeviceFailure", "short SAS Device Page0");
+        return false;
+    }
+
     memcpy(&slot, page + MPR_SASDEV0_SLOT_OFF, sizeof(slot));
     memcpy(&enclHandle, page + MPR_SASDEV0_ENCLOSURE_OFF, sizeof(enclHandle));
     memcpy(&sasAddress, page + MPR_SASDEV0_SASADDRESS_OFF, sizeof(sasAddress));
@@ -1361,6 +1616,14 @@ MPRController::readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo)
     phyNum = page[MPR_SASDEV0_PHYNUM_OFF];
     memcpy(&pageDevHandle, page + MPR_SASDEV0_DEVHANDLE_OFF, sizeof(pageDevHandle));
     memcpy(&deviceInfo, page + MPR_SASDEV0_DEVICEINFO_OFF, sizeof(deviceInfo));
+    if (pageDevHandle != devHandle || page[0x17] != 0) {
+        /* The IOC answered, but the handle no longer names this target. */
+        fSasDeviceMismatch = true;
+        setProperty("MPRSasDeviceFailure", "device handle or access status");
+        setProperty("MPRSasDeviceAccessStatus", (unsigned long long)page[0x17], 8);
+        return false;
+    }
+
 
     if (deviceInfo & MPI2_SAS_DEVICE_INFO_SATA_DEVICE) {
         type = "SATA";
@@ -1406,31 +1669,23 @@ MPRController::readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo)
 bool
 MPRController::discoverTopology(void)
 {
-    IOByteCount segLength;
+    bool ownPage = (fPageBuffer == NULL);
     bool ok;
 
-    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-        MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
-    if (fPageBuffer == NULL) {
-        setProperty("MPRTopologyState", "failed-alloc");
+    if (fProtocolRecoveryPending || !allocatePageBuffer()) {
+        setProperty("MPRTopologyState", "failed-buffer-unavailable");
         return false;
     }
-    fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
-    if (fPagePhys == 0 || segLength < MPR_PAGE_BUF_BYTES ||
-        (fPagePhys + MPR_PAGE_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
-        setProperty("MPRTopologyState", "failed-alloc");
-        return false;
-    }
-
     ok = readSasIOUnitPage0();
     setProperty("MPRTopologyState", ok ? "ok" : "failed");
 
-    if (fPageBuffer != NULL) {
+    /* A timed-out command may still DMA into the page. Recovery owns it
+     * until the IOC has stopped; never free it merely because a probe ended. */
+    if (ownPage && !fProtocolRecoveryPending) {
         fPageBuffer->release();
         fPageBuffer = NULL;
+        fPagePhys = 0;
     }
-    fPagePhys = 0;
     return ok;
 }
 
@@ -1452,20 +1707,29 @@ mprFillIeeeSge(UInt8 *sge, UInt64 address, UInt32 length)
     memcpy(sge + 15, &flags, sizeof(flags));
 }
 
-void
+bool
 MPRController::postScsiIo(UInt32 smid)
 {
+    if (fReplyLock == NULL || smid == 0 || smid >= 128) return false;
     UInt32 flags = fFastPathEnabled
                        ? MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO
                        : MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE;
-    UInt32 low = flags | (smid << 16);
-
-    /* Fast path is used only when SAS Device Page0 reports both CAPABLE and
-     * ENABLED. Otherwise the default SCSI IO descriptor is posted; the
-     * devhandle still travels in descriptor word 1. */
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, low);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET,
-             (fAttachedDevHandle & 0xFFFF) << 16);
+    IOSimpleLockLock(fReplyLock);
+    bool runtime = smid >= 10 && smid <= 30;
+    if (fStopping || fProtocolRecoveryPending ||
+        (runtime && (fRemovalPending || !fMediaPresent || fDeviceOffline ||
+                     fReinitInProgress)) || fFrozenSmid == smid) {
+        IOSimpleLockUnlock(fReplyLock);
+        return false;
+    }
+    /* The caller owns this frame (management busy bit or serialized runtime
+     * IO). Discard a completed older use, then make the final removal check
+     * and the two-register submission atomic against topology events. */
+    fReplySlots[smid].valid = 0;
+    postRequestDescriptor(flags | (smid << 16),
+                          (fAttachedDevHandle & 0xFFFF) << 16);
+    IOSimpleLockUnlock(fReplyLock);
+    return true;
 }
 
 bool
@@ -1474,8 +1738,7 @@ MPRController::scsiTur(void)
     MPRScsiIoRequest *request;
     MPRScsiIoReply *reply;
     UInt8 *frame;
-    UInt32 attempt;
-    bool posted;
+    UInt8 replyBuf[64], replyKind = 0;
 
     if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fPageBuffer == NULL) {
         setProperty("MPRTurFailure", "no attached device or buffer");
@@ -1483,6 +1746,9 @@ MPRController::scsiTur(void)
     }
     frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
     if (frame == NULL) {
+        return false;
+    }
+    if (!beginManagementRequest(6)) {
         return false;
     }
     frame += 6 * fRequestFrameSize;     /* SMID 6 */
@@ -1503,28 +1769,23 @@ MPRController::scsiTur(void)
     /* A zero-length IEEE SGE is still required for a data-less command. */
     mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fPagePhys, 0);
 
-    posted = false;
-    for (attempt = 0; attempt < 10 && !posted; attempt++) {
-        fReplyCount = 0;
-        fLastReplyKind = 0;
-        fLastReplySmid = 0xFFFF;
-        postScsiIo(6);
-        if (waitForReply(MPR_REPLY_TIMEOUT_MS) && fLastReplySmid == 6) {
-            posted = true;
-            break;
-        }
-        IOSleep(1000);
-    }
-    setProperty("MPRTurAttempts", (unsigned long long)(attempt + 1), 32);
-    if (!posted) {
+    memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
+    if (!postScsiIo(6)) return false;
+    setProperty("MPRTurAttempts", 1ULL, 32);
+    if (!finishManagementRequest(6, MPR_REPLY_TIMEOUT_MS, replyBuf, &replyKind)) {
         setProperty("MPRTurFailure", "TEST UNIT READY timeout");
         return false;
     }
-
-    reply = (MPRScsiIoReply *)fLastReply;
-    setProperty("MPRTurKind", (unsigned long long)fLastReplyKind, 32);
+    if (replyKind != 2 && (replyKind != 1 ||
+        replyBuf[3] != MPI2_FUNCTION_SCSI_IO_REQUEST ||
+        replyBuf[2] * 4U < MPR_SCSIIO_REPLY_MIN_BYTES)) {
+        recordProtocolFault(kMPRProtocolManagementReply, 6);
+        return false;
+    }
+    reply = (MPRScsiIoReply *)replyBuf;
+    setProperty("MPRTurKind", (unsigned long long)replyKind, 32);
     setProperty("MPRTurSCSIState", (unsigned long long)reply->SCSIState, 8);
-    if (fLastReplyKind == 1) {
+    if (replyKind == 1) {
         setProperty("MPRTurIOCStatus",
                     (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
         setProperty("MPRTurScsiStatus", (unsigned long long)reply->SCSIStatus, 8);
@@ -1544,6 +1805,7 @@ MPRController::scsiInquiry(void)
     UInt8 *frame;
     UInt8 *data;
     bool   posted;
+    UInt8 replyBuf[64], replyKind = 0;
     char vendor[9], product[17], revision[5];
 
     if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fPageBuffer == NULL) {
@@ -1552,6 +1814,9 @@ MPRController::scsiInquiry(void)
     }
     frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
     if (frame == NULL) {
+        return false;
+    }
+    if (!beginManagementRequest(5)) {
         return false;
     }
     frame += 5 * fRequestFrameSize;     /* SMID 5 */
@@ -1588,14 +1853,11 @@ MPRController::scsiInquiry(void)
     }
 
     memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
-    fReplyCount = 0;
-    fLastReplyKind = 0;
-    fLastReplySmid = 0xFFFF;
-    postScsiIo(5);
-    posted = waitForReply(15000) && (fLastReplySmid == 5);
+    if (!postScsiIo(5)) return false;
+    posted = finishManagementRequest(5, 15000, replyBuf, &replyKind);
     setProperty("MPRInquiryAttempts", 1ULL, 32);
     if (!posted) {
-        setProperty("MPRInquiryKind", (unsigned long long)fLastReplyKind, 32);
+        setProperty("MPRInquiryKind", (unsigned long long)replyKind, 32);
         setProperty("MPRInquirySmid", (unsigned long long)fLastReplySmid, 16);
         setProperty("MPRInquiryPostIdx", (unsigned long long)fReplyPostIndex, 32);
         setProperty("MPRInquiryRegPostIdx",
@@ -1605,30 +1867,37 @@ MPRController::scsiInquiry(void)
         setProperty("MPRScsiProbeFailure", "INQUIRY timeout");
         return false;
     }
+    if (replyKind != 2 && (replyKind != 1 ||
+        replyBuf[3] != MPI2_FUNCTION_SCSI_IO_REQUEST ||
+        replyBuf[2] * 4U < MPR_SCSIIO_REPLY_MIN_BYTES)) {
+        recordProtocolFault(kMPRProtocolManagementReply, 5);
+        return false;
+    }
+
 
     {
         UInt64 w[4];
 
-        memcpy(w, fLastReply, sizeof(w));
+        memcpy(w, replyBuf, sizeof(w));
         setProperty("MPRInquiryReplyW0", w[0], 64);
         setProperty("MPRInquiryReplyW1", w[1], 64);
         setProperty("MPRInquiryReplyW2", w[2], 64);
         setProperty("MPRInquiryReplyW3", w[3], 64);
-        reply = (MPRScsiIoReply *)fLastReply;
+        reply = (MPRScsiIoReply *)replyBuf;
         setProperty("MPRInquirySCSIState", (unsigned long long)reply->SCSIState, 8);
         setProperty("MPRInquiryReplyFunction", (unsigned long long)reply->Function, 8);
         setProperty("MPRInquiryReplyMsgLength", (unsigned long long)reply->MsgLength, 8);
     }
 
-    if (fLastReplyKind == 1) {
-        reply = (MPRScsiIoReply *)fLastReply;
+    if (replyKind == 1) {
+        reply = (MPRScsiIoReply *)replyBuf;
         setProperty("MPRInquiryIOCStatus",
                     (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
         setProperty("MPRInquiryScsiStatus", (unsigned long long)reply->SCSIStatus, 8);
         setProperty("MPRInquiryTransferCount", (unsigned long long)reply->TransferCount, 32);
         setProperty("MPRInquiryResponseInfo", (unsigned long long)reply->ResponseInfo, 32);
         if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS ||
-            reply->SCSIStatus != 0) {
+            reply->SCSIStatus != 0 || reply->TransferCount < 36U) {
             setProperty("MPRScsiProbeFailure", "INQUIRY reply status");
             return false;
         }
@@ -1639,7 +1908,7 @@ MPRController::scsiInquiry(void)
         setProperty("MPRInquiryTransferCount", 36ULL, 32);
         setProperty("MPRInquiryResponseInfo", 0ULL, 32);
     }
-    setProperty("MPRInquiryReplyKind", (unsigned long long)fLastReplyKind, 32);
+    setProperty("MPRInquiryReplyKind", (unsigned long long)replyKind, 32);
 
     data = (UInt8 *)fPageBuffer->getBytesNoCopy();
     if (data == NULL) {
@@ -1679,6 +1948,7 @@ MPRController::scsiReadCapacity16(void)
     UInt64 lastLba = 0;
     UInt32 blockSize, i;
     bool posted;
+    UInt8 replyBuf[64], replyKind = 0;
 
     if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fPageBuffer == NULL) {
         setProperty("MPRCapacityProbeFailure", "no attached device or buffer");
@@ -1686,6 +1956,9 @@ MPRController::scsiReadCapacity16(void)
     }
     frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
     if (frame == NULL) {
+        return false;
+    }
+    if (!beginManagementRequest(7)) {
         return false;
     }
     frame += 7 * fRequestFrameSize;     /* SMID 7 */
@@ -1705,22 +1978,26 @@ MPRController::scsiReadCapacity16(void)
     mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fPagePhys, 32);
 
     memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
-    fReplyCount = 0;
-    fLastReplyKind = 0;
-    fLastReplySmid = 0xFFFF;
-    postScsiIo(7);
-    posted = waitForReply(15000) && (fLastReplySmid == 7);
+    if (!postScsiIo(7)) return false;
+    posted = finishManagementRequest(7, 15000, replyBuf, &replyKind);
     if (!posted) {
         setProperty("MPRCapacityProbeFailure", "READ CAPACITY(16) timeout");
         return false;
     }
-    if (fLastReplyKind == 1) {
-        reply = (MPRScsiIoReply *)fLastReply;
+    if (replyKind != 2 && (replyKind != 1 ||
+        replyBuf[3] != MPI2_FUNCTION_SCSI_IO_REQUEST ||
+        replyBuf[2] * 4U < MPR_SCSIIO_REPLY_MIN_BYTES)) {
+        recordProtocolFault(kMPRProtocolManagementReply, 7);
+        return false;
+    }
+
+    if (replyKind == 1) {
+        reply = (MPRScsiIoReply *)replyBuf;
         setProperty("MPRScsiIOCStatus",
                     (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
         setProperty("MPRScsiStatus", (unsigned long long)reply->SCSIStatus, 8);
         if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS ||
-            reply->SCSIStatus != 0) {
+            reply->SCSIStatus != 0 || reply->TransferCount < 32U) {
             setProperty("MPRCapacityProbeFailure", "READ CAPACITY(16) status");
             return false;
         }
@@ -1741,7 +2018,7 @@ MPRController::scsiReadCapacity16(void)
     setProperty("MPRCapacityBlocks", lastLba + 1, 64);
     IOLog("MPR READ CAPACITY(16) blocks=%llu blockSize=%u\n",
           (unsigned long long)(lastLba + 1), (unsigned int)blockSize);
-    if (blockSize == 0) {
+    if (blockSize == 0 || lastLba == 0xFFFFFFFFFFFFFFFFULL) {
         return false;
     }
     fBlockSize = blockSize;
@@ -1758,6 +2035,7 @@ MPRController::scsiReadCapacity10(void)
     UInt8 *frame, *data;
     UInt32 lastLba, blockSize;
     bool posted;
+    UInt8 replyBuf[64], replyKind = 0;
 
     if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fPageBuffer == NULL) {
         setProperty("MPRCapacityProbeFailure", "no attached device or buffer");
@@ -1765,6 +2043,9 @@ MPRController::scsiReadCapacity10(void)
     }
     frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
     if (frame == NULL) {
+        return false;
+    }
+    if (!beginManagementRequest(8)) {
         return false;
     }
     frame += 8 * fRequestFrameSize;     /* SMID 8 */
@@ -1784,22 +2065,26 @@ MPRController::scsiReadCapacity10(void)
     mprFillIeeeSge(frame + MPR_SCSIIO_SGE_DWORDS * 4, fPagePhys, 8);
 
     memset(fPageBuffer->getBytesNoCopy(), 0, MPR_PAGE_BUF_BYTES);
-    fReplyCount = 0;
-    fLastReplyKind = 0;
-    fLastReplySmid = 0xFFFF;
-    postScsiIo(8);
-    posted = waitForReply(15000) && (fLastReplySmid == 8);
+    if (!postScsiIo(8)) return false;
+    posted = finishManagementRequest(8, 15000, replyBuf, &replyKind);
     if (!posted) {
         setProperty("MPRCapacityProbeFailure", "READ CAPACITY(10) timeout");
         return false;
     }
-    if (fLastReplyKind == 1) {
-        reply = (MPRScsiIoReply *)fLastReply;
+    if (replyKind != 2 && (replyKind != 1 ||
+        replyBuf[3] != MPI2_FUNCTION_SCSI_IO_REQUEST ||
+        replyBuf[2] * 4U < MPR_SCSIIO_REPLY_MIN_BYTES)) {
+        recordProtocolFault(kMPRProtocolManagementReply, 8);
+        return false;
+    }
+
+    if (replyKind == 1) {
+        reply = (MPRScsiIoReply *)replyBuf;
         setProperty("MPRScsiIOCStatus",
                     (unsigned long long)(reply->IOCStatus & MPI2_IOCSTATUS_MASK), 16);
         setProperty("MPRScsiStatus", (unsigned long long)reply->SCSIStatus, 8);
         if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS ||
-            reply->SCSIStatus != 0) {
+            reply->SCSIStatus != 0 || reply->TransferCount < 8U) {
             setProperty("MPRCapacityProbeFailure", "READ CAPACITY(10) status");
             return false;
         }
@@ -1856,7 +2141,8 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
         *outStatus = kIOReturnNotReady;
     }
 
-    if (fDeviceOffline || fStopping ||
+    if ((fDeviceOffline && !fReinitInProgress) || fStopping ||
+        fProtocolRecoveryPending ||
         (fFrozenSmid != 0 && fFrozenSmid == (UInt16)smid)) {
         return false;
     }
@@ -1921,7 +2207,10 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
     fReplyCount = 0;
     fLastReplyKind = 0;
     fLastReplySmid = 0xFFFF;
-    postScsiIo(smid);
+    if (!postScsiIo(smid)) {
+        if (outStatus != NULL) *outStatus = kIOReturnNoMedia;
+        return false;
+    }
     posted = waitForSmid(15000, smid);
     if (!posted) {
         if (diagnostics) {
@@ -1938,7 +2227,11 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
          * frame. Freeze that SMID and abort/reset the target before any new
          * command reuses it (PLAN section 5 rule 5, risk R6). */
         if (fTimedOutSmid == (UInt16)smid) {
-            recoverTimedOutCommand(smid);
+            if (fReinitInProgress || fStarting) {
+                recordProtocolFault(kMPRProtocolManagementTimeout, smid);
+            } else {
+                recoverTimedOutCommand(smid);
+            }
         }
         return false;
     }
@@ -1958,6 +2251,13 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
             setProperty("MPRReadTransferCount", (unsigned long long)dataLen, 32);
         }
         return true;
+    }
+    if (replyKind != 1 || replyBuf[3] != MPI2_FUNCTION_SCSI_IO_REQUEST ||
+        replyBuf[2] * 4U < MPR_SCSIIO_REPLY_MIN_BYTES) {
+        noteBadReply(2, (UInt32)replyKind, smid, replyBuf, sizeof(replyBuf));
+        recordProtocolFault(kMPRProtocolManagementReply, smid);
+        if (outStatus != NULL) *outStatus = kIOReturnIOError;
+        return false;
     }
     reply = (MPRScsiIoReply *)replyBuf;
     if (diagnostics) {
@@ -2043,85 +2343,54 @@ MPRController::scsiReadWrite(bool write, UInt64 lba, UInt32 blocks,
 bool
 MPRController::probeBlockRead(void)
 {
-    IOByteCount segLength;
-    UInt64 pageSeg = 0, dataSeg = 0;
     UInt8 *data;
     bool ok = false;
     UInt32 i;
     char name[32];
 
-    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-        MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
-    fDataBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-        MPR_DATA_BUF_BYTES, MPR_DMA_LOW_MASK);
+    if (fProtocolRecoveryPending || !allocateResidentBuffers()) {
+        setProperty("MPRReadProbeState", "failed-buffer-unavailable");
+        return false;
+    }
+    /* Read the first 8 blocks and decode the MBR/GPT protective entry. */
+    ok = scsiReadWrite(false, 0, 8, 512, 9, true, false);
+    setProperty("MPRReadProbeState", ok ? "ok" : "failed");
 
-    if (fPageBuffer == NULL || fDataBuffer == NULL) {
-        setProperty("MPRReadProbeState", "failed-alloc");
-    } else {
-        fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
-        pageSeg = segLength;
-        fDataPhys = fDataBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
-        dataSeg = segLength;
-        fDataBytes = MPR_DATA_BUF_BYTES;
+    data = (UInt8 *)fDataBuffer->getBytesNoCopy();
+    if (ok && data != NULL) {
+        UInt64 w[2];
 
-        if (fPagePhys == 0 || fDataPhys == 0 ||
-            pageSeg < MPR_PAGE_BUF_BYTES || dataSeg < MPR_DATA_BUF_BYTES ||
-            (fPagePhys + MPR_PAGE_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1) ||
-            (fDataPhys + MPR_DATA_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
-            setProperty("MPRReadProbeState", "failed-alloc");
-        } else {
-            /* Read the first 8 blocks and decode the MBR/GPT protective entry. */
-            ok = scsiReadWrite(false, 0, 8, 512, 9, true, false);
-            setProperty("MPRReadProbeState", ok ? "ok" : "failed");
+        memcpy(w, data, sizeof(w));
+        setProperty("MPRReadWord0", w[0], 64);
+        setProperty("MPRReadWord1", w[1], 64);
+        setProperty("MPRReadSig",
+                    (unsigned long long)((UInt32)data[510] |
+                                         ((UInt32)data[511] << 8)), 16);
+        setProperty("MPRReadGptSig",
+                    (unsigned long long)((*(const UInt64 *)(data + 512)) ==
+                                         0x5452415020494645ULL), 8);
 
-            data = (UInt8 *)fDataBuffer->getBytesNoCopy();
-            if (ok && data != NULL) {
-                UInt64 w[2];
+        for (i = 0; i < 4; i++) {
+            const UInt8 *entry = data + 0x1BE + i * 16;
+            UInt32 start = (UInt32)entry[8] | ((UInt32)entry[9] << 8) |
+                           ((UInt32)entry[10] << 16) | ((UInt32)entry[11] << 24);
+            UInt32 count = (UInt32)entry[12] | ((UInt32)entry[13] << 8) |
+                           ((UInt32)entry[14] << 16) | ((UInt32)entry[15] << 24);
 
-                memcpy(w, data, sizeof(w));
-                setProperty("MPRReadWord0", w[0], 64);
-                setProperty("MPRReadWord1", w[1], 64);
-                setProperty("MPRReadSig",
-                            (unsigned long long)((UInt32)data[510] |
-                                                 ((UInt32)data[511] << 8)), 16);
-                setProperty("MPRReadGptSig",
-                            (unsigned long long)((*(const UInt64 *)(data + 512)) ==
-                                                 0x5452415020494645ULL), 8);
-
-                for (i = 0; i < 4; i++) {
-                    const UInt8 *entry = data + 0x1BE + i * 16;
-                    UInt32 start = (UInt32)entry[8] | ((UInt32)entry[9] << 8) |
-                                   ((UInt32)entry[10] << 16) | ((UInt32)entry[11] << 24);
-                    UInt32 count = (UInt32)entry[12] | ((UInt32)entry[13] << 8) |
-                                   ((UInt32)entry[14] << 16) | ((UInt32)entry[15] << 24);
-
-                    snprintf(name, sizeof(name), "MPRPart%uType", (unsigned int)i);
-                    setProperty(name, (unsigned long long)entry[4], 8);
-                    snprintf(name, sizeof(name), "MPRPart%uStart", (unsigned int)i);
-                    setProperty(name, (unsigned long long)start, 32);
-                    snprintf(name, sizeof(name), "MPRPart%uBlocks", (unsigned int)i);
-                    setProperty(name, (unsigned long long)count, 32);
-                }
-                IOLog("MPR LBA0 read ok, sig=0x%04x part0type=0x%02x\n",
-                      (unsigned int)((UInt32)data[510] | ((UInt32)data[511] << 8)),
-                      (unsigned int)data[0x1BE + 4]);
-            }
+            snprintf(name, sizeof(name), "MPRPart%uType", (unsigned int)i);
+            setProperty(name, (unsigned long long)entry[4], 8);
+            snprintf(name, sizeof(name), "MPRPart%uStart", (unsigned int)i);
+            setProperty(name, (unsigned long long)start, 32);
+            snprintf(name, sizeof(name), "MPRPart%uBlocks", (unsigned int)i);
+            setProperty(name, (unsigned long long)count, 32);
         }
+        IOLog("MPR LBA0 read ok, sig=0x%04x part0type=0x%02x\n",
+              (unsigned int)((UInt32)data[510] | ((UInt32)data[511] << 8)),
+              (unsigned int)data[0x1BE + 4]);
     }
 
-    if (fPageBuffer != NULL) {
-        fPageBuffer->release();
-        fPageBuffer = NULL;
-    }
-    if (fDataBuffer != NULL) {
-        fDataBuffer->release();
-        fDataBuffer = NULL;
-    }
-    fPagePhys = 0;
-    fDataPhys = 0;
-    fDataBytes = 0;
+    /* These are the runtime buffers as well. Keep the same pair for nub
+     * publication and recovery, including when a command has timed out. */
     return ok;
 }
 
@@ -2136,47 +2405,19 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
     UInt8 *staging;
     UInt64 byteCount, done = 0, maxBlocks, remaining, want;
     UInt32 chunkBlocks;
+    UInt32 generation = fMediaGeneration;
     IOByteCount copied, chunkBytes;
     IOReturn status;
 
     if (actualBytes != NULL) {
         *actualBytes = 0;
     }
-    /* Topology changes are recorded for the watchdog and media state. An
-     * automatic reset here re-enters discovery and can loop on the same
-     * DEVICE_STATUS_CHANGE, so recovery stays on the TMF/offline path until
-     * the event carries a verified handle change. */
-    if (fDeviceOffline || fStopping) {
-        return kIOReturnDeviceError;
-    }
-    if (buffer == NULL || fIOLock == NULL || fDataBuffer == NULL ||
-        fPageBuffer == NULL || fCapacityBlocks == 0 || fBlockSize == 0) {
-        return kIOReturnNotReady;
-    }
-    if (nblks == 0) {
-        return kIOReturnSuccess;
-    }
-    if (nblks > (0xFFFFFFFFFFFFFFFFULL / fBlockSize)) {
+    if (buffer == NULL) {
         return kIOReturnBadArgument;
     }
-    byteCount = nblks * fBlockSize;
-    if (buffer->getLength() < byteCount || block >= fCapacityBlocks ||
-        nblks > fCapacityBlocks - block ||
-        (block + nblks - 1) > 0xFFFFFFFFULL) {
-        return kIOReturnBadArgument;
-    }
-    staging = (UInt8 *)fDataBuffer->getBytesNoCopy();
-    if (staging == NULL) {
+    if (fIOLock == NULL) {
         return kIOReturnNotReady;
     }
-    maxBlocks = fDataBytes / fBlockSize;
-    if (maxBlocks == 0) {
-        return kIOReturnNotReady;
-    }
-    if (maxBlocks > 0xFFFFULL) {
-        maxBlocks = 0xFFFFULL;
-    }
-
     status = buffer->prepare();
     if (status != kIOReturnSuccess) {
         setProperty("MPRBlockIOFailure", "prepare");
@@ -2184,12 +2425,57 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
                     (unsigned long long)(UInt32)status, 32);
         return status;
     }
-    status = kIOReturnSuccess;
 
-    /* One reply slot and one staging buffer are shared by the whole driver,
-     * so the SCSI IO path must be serialized. The completion callback runs in
-     * MPRBlockDev after this method returns and the lock is released. */
+    /* Resolve all geometry and buffer pointers only after joining the same
+     * serialization domain used by discovery, recovery and shutdown. A
+     * request that waited across a media replacement must not reach it. */
     IOLockLock(fIOLock);
+    if (generation != fMediaGeneration || !fMediaPresent ||
+                mediaRemovalPending()) {
+        setProperty("MPRBlockRejectReason",
+                    generation != fMediaGeneration ? "media-generation" :
+                    !fMediaPresent ? "media-absent" : "removal-latched");
+        status = kIOReturnNoMedia;
+        goto out;
+    }
+    if (fDeviceOffline || fStopping || fReinitInProgress ||
+        fProtocolRecoveryPending || fDataBuffer == NULL ||
+        fPageBuffer == NULL || fCapacityBlocks == 0 || fBlockSize == 0) {
+        setProperty("MPRBlockRejectReason",
+                    fStopping ? "stopping" :
+                    fReinitInProgress ? "reinit" :
+                    fDeviceOffline ? "device-offline" :
+                    fProtocolRecoveryPending ? "protocol-recovery" :
+                    (fDataBuffer == NULL || fPageBuffer == NULL) ? "buffers" :
+                    "geometry");
+        status = kIOReturnNotReady;
+        goto out;
+    }
+    if (nblks == 0) {
+        status = kIOReturnSuccess;
+        goto out;
+    }
+    if (nblks > (0xFFFFFFFFFFFFFFFFULL / fBlockSize)) {
+        status = kIOReturnBadArgument;
+        goto out;
+    }
+    byteCount = nblks * fBlockSize;
+    if (buffer->getLength() < byteCount || block >= fCapacityBlocks ||
+        nblks > fCapacityBlocks - block ||
+        (block + nblks - 1) > 0xFFFFFFFFULL) {
+        status = kIOReturnBadArgument;
+        goto out;
+    }
+    staging = (UInt8 *)fDataBuffer->getBytesNoCopy();
+    maxBlocks = fDataBytes / fBlockSize;
+    if (staging == NULL || maxBlocks == 0) {
+        status = kIOReturnNotReady;
+        goto out;
+    }
+    if (maxBlocks > 0xFFFFULL) {
+        maxBlocks = 0xFFFFULL;
+    }
+
     while (done < byteCount) {
         UInt32 smid, attempt;
         UInt64 lba;
@@ -2199,6 +2485,23 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
          * Reads tolerate the UNIT ATTENTION a SATA link raises after reset. */
         UInt32 maxAttempts = write ? 1 : 5;
 
+        if (generation != fMediaGeneration || !fMediaPresent ||
+                mediaRemovalPending()) {
+            setProperty("MPRBlockRejectReason",
+                        generation != fMediaGeneration ? "chunk-media-generation" :
+                        !fMediaPresent ? "chunk-media-absent" : "chunk-removal-latched");
+            status = kIOReturnNoMedia;
+            break;
+        }
+        if (fDeviceOffline || fStopping || fReinitInProgress ||
+            fProtocolRecoveryPending) {
+            setProperty("MPRBlockRejectReason",
+                        fStopping ? "chunk-stopping" :
+                        fReinitInProgress ? "chunk-reinit" :
+                        fDeviceOffline ? "chunk-device-offline" : "chunk-protocol-recovery");
+            status = kIOReturnNotReady;
+            break;
+        }
         remaining = byteCount - done;
         want = remaining / fBlockSize;
         if (want > maxBlocks) {
@@ -2229,8 +2532,29 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
         }
 
         for (attempt = 0; attempt < maxAttempts && !ok; attempt++) {
+            if (generation != fMediaGeneration || !fMediaPresent ||
+                mediaRemovalPending()) {
+                ioStatus = kIOReturnNoMedia;
+                break;
+            }
+            if (fDeviceOffline || fStopping || fReinitInProgress ||
+                fProtocolRecoveryPending) {
+                ioStatus = kIOReturnNotReady;
+                break;
+            }
             ok = scsiReadWrite(write, lba, chunkBlocks, fBlockSize,
                                smid, false, fua, &ioStatus);
+            if (generation != fMediaGeneration || !fMediaPresent ||
+                mediaRemovalPending()) {
+                ok = false;
+                ioStatus = kIOReturnNoMedia;
+                break;
+            }
+            if (fProtocolRecoveryPending || fDeviceOffline || fStopping) {
+                ok = false;
+                ioStatus = kIOReturnNotReady;
+                break;
+            }
             if (!ok) {
                 fIoRetryCount++;
                 if (ioStatus == kIOReturnNotReady) {
@@ -2269,6 +2593,7 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
             done += (UInt64)chunkBytes;
         }
     }
+out:
     IOLockUnlock(fIOLock);
     buffer->complete();
 
@@ -2279,70 +2604,84 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
 }
 
 bool
-MPRController::allocateResidentBuffers(void)
+MPRController::allocatePageBuffer(void)
 {
     IOByteCount segLength;
-    UInt64 pageSeg, dataSeg;
+    IOBufferMemoryDescriptor *page = fPageBuffer;
+    UInt64 physical;
+    bool allocated = false;
 
-    /* Every earlier stage releases its staging buffers before returning. */
-    if (fPageBuffer != NULL || fDataBuffer != NULL) {
+    if (page == NULL) {
+        page = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+            MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
+        if (page == NULL) {
+            return false;
+        }
+        allocated = true;
+    }
+    physical = page->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+    if (page->getLength() < MPR_PAGE_BUF_BYTES || physical == 0 ||
+        segLength < MPR_PAGE_BUF_BYTES || physical > MPR_DMA_LOW_MASK ||
+        MPR_PAGE_BUF_BYTES - 1 > MPR_DMA_LOW_MASK - physical) {
+        if (allocated) {
+            page->release();
+        }
         return false;
     }
-    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-        MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
-    fDataBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-        MPR_DATA_BUF_BYTES, MPR_DMA_LOW_MASK);
-    if (fPageBuffer == NULL || fDataBuffer == NULL) {
-        return false;
-    }
-    fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
-    pageSeg = segLength;
-    fDataPhys = fDataBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
-    dataSeg = segLength;
-    fDataBytes = MPR_DATA_BUF_BYTES;
-
-    if (fPagePhys == 0 || fDataPhys == 0 ||
-        pageSeg < MPR_PAGE_BUF_BYTES || dataSeg < MPR_DATA_BUF_BYTES ||
-        (fPagePhys + MPR_PAGE_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1) ||
-        (fDataPhys + MPR_DATA_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
-        return false;
-    }
+    fPageBuffer = page;
+    fPagePhys = physical;
     return true;
 }
 
 bool
-MPRController::publishBlockDevice(void)
+MPRController::allocateResidentBuffers(void)
 {
-    MPRBlockDev *nub;
+    IOByteCount segLength;
+    IOBufferMemoryDescriptor *data = fDataBuffer;
+    UInt64 physical;
+    bool allocated = false;
+    bool ownPage = (fPageBuffer == NULL);
 
-    if (fAttachedDevHandle == 0 || fCapacityBlocks == 0 || fBlockSize == 0) {
-        setProperty("MPRBlockDeviceState", "skipped-no-media");
+    if (!allocatePageBuffer()) {
         return false;
     }
-    if (fIOLock == NULL) {
-        setProperty("MPRBlockDeviceState", "failed-alloc");
-        return false;
+    if (data == NULL) {
+        data = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+            MPR_DATA_BUF_BYTES, MPR_DMA_LOW_MASK);
+        allocated = (data != NULL);
     }
-    if (fPageBuffer == NULL || fDataBuffer == NULL) {
-        /* probeScsiIdentity()/probeCapacity() release the page buffer when
-         * they finish, while the data buffer from the initial probe remains.
-         * Drop the survivor and allocate a matching pair before rebuilding. */
-        if (fPageBuffer != NULL) {
-            fPageBuffer->release();
-            fPageBuffer = NULL;
+    if (data != NULL) {
+        physical = data->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
+        if (data->getLength() >= MPR_DATA_BUF_BYTES && physical != 0 &&
+            segLength >= MPR_DATA_BUF_BYTES && physical <= MPR_DMA_LOW_MASK &&
+            MPR_DATA_BUF_BYTES - 1 <= MPR_DMA_LOW_MASK - physical) {
+            fDataBuffer = data;
+            fDataPhys = physical;
+            fDataBytes = MPR_DATA_BUF_BYTES;
+            return true;
         }
-        if (fDataBuffer != NULL) {
-            fDataBuffer->release();
-            fDataBuffer = NULL;
-        }
+    }
+    if (allocated) {
+        data->release();
+    }
+    if (ownPage && !fProtocolRecoveryPending) {
+        fPageBuffer->release();
+        fPageBuffer = NULL;
         fPagePhys = 0;
-        fDataPhys = 0;
-        if (!allocateResidentBuffers()) {
-            setProperty("MPRBlockDeviceState", "failed-alloc");
-            return false;
-        }
+    }
+    return false;
+}
+
+bool
+MPRController::prepareTargetMedia(void)
+{
+    if (fAttachedDevHandle == 0 || fCapacityBlocks == 0 || fBlockSize == 0 ||
+        fRequestBuffer == NULL || fProtocolRecoveryPending ||
+        !allocateResidentBuffers()) {
+        setProperty("MPRMediaReady", false);
+        return false;
     }
 
     {
@@ -2367,6 +2706,47 @@ MPRController::publishBlockDevice(void)
         }
         setProperty("MPRUnmapEnabled",
                     (unsigned long long)(fUnmapEnabled ? 1 : 0), 8);
+    }
+
+    /* Do not publish merely because a nub or a capacity value exists. Read
+     * real blocks through the same path the storage stack will use, after
+     * absorbing bounded UNIT ATTENTION responses. */
+    UInt32 blocks = (UInt32)(fCapacityBlocks < 8 ? fCapacityBlocks : 8);
+    UInt32 maxBlocks = fDataBytes / fBlockSize;
+    if (blocks > maxBlocks) blocks = maxBlocks;
+    bool ready = false;
+    for (UInt32 attempt = 0; attempt < 5 && blocks != 0; attempt++) {
+        if (fStopping || fProtocolRecoveryPending) break;
+        (void)scsiTur();
+        IOReturn status = kIOReturnNotReady;
+        if (scsiReadWrite(false, 0, blocks, fBlockSize, 9, false, false,
+                          &status)) {
+            ready = true;
+            break;
+        }
+        if (status != kIOReturnNotReady && status != kIOReturnBusy) break;
+        IOSleep(100);
+    }
+    ready = ready && !fProtocolRecoveryPending &&
+            fPageBuffer != NULL && fPagePhys != 0 &&
+            fDataBuffer != NULL && fDataPhys != 0 && fDataBytes != 0;
+    setProperty("MPRMediaReady", ready);
+    return ready;
+}
+
+bool
+MPRController::publishBlockDevice(void)
+{
+    /* No DMA preparation or transport operation belongs here: matching can
+     * re-enter block IO immediately. The caller publishes outside fIOLock. */
+    MPRBlockDev *nub;
+    if (fBlockDev != NULL) return true;
+    if (!fMediaPresent || fDeviceOffline || fAttachedDevHandle == 0 ||
+        fCapacityBlocks == 0 || fBlockSize == 0 || fIOLock == NULL ||
+        fPageBuffer == NULL || fDataBuffer == NULL ||
+        fPagePhys == 0 || fDataPhys == 0 || fDataBytes == 0) {
+        setProperty("MPRBlockDeviceState", "skipped-not-ready");
+        return false;
     }
 
     nub = new MPRBlockDev;
@@ -2405,27 +2785,17 @@ MPRController::publishBlockDevice(void)
 bool
 MPRController::probeCapacity(void)
 {
-    IOByteCount segLength;
+    bool ownPage = (fPageBuffer == NULL);
     bool ok;
 
-    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-        MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
-    if (fPageBuffer == NULL) {
-        setProperty("MPRCapacityProbeState", "failed-alloc");
+    if (fProtocolRecoveryPending || !allocatePageBuffer()) {
+        setProperty("MPRCapacityProbeState", "failed-buffer-unavailable");
         return false;
     }
-    fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
-    if (fPagePhys == 0 || segLength < MPR_PAGE_BUF_BYTES ||
-        (fPagePhys + MPR_PAGE_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
-        setProperty("MPRCapacityProbeState", "failed-alloc");
-        return false;
-    }
-
     ok = scsiReadCapacity16();
     if (ok) {
         setProperty("MPRCapacityKind", "rc16");
-    } else {
+    } else if (!fProtocolRecoveryPending) {
         ok = scsiReadCapacity10();
         if (ok) {
             setProperty("MPRCapacityKind", "rc10");
@@ -2433,44 +2803,36 @@ MPRController::probeCapacity(void)
     }
     setProperty("MPRCapacityProbeState", ok ? "ok" : "failed");
 
-    if (fPageBuffer != NULL) {
+    if (ownPage && !fProtocolRecoveryPending) {
         fPageBuffer->release();
         fPageBuffer = NULL;
+        fPagePhys = 0;
     }
-    fPagePhys = 0;
     return ok;
 }
 
 bool
 MPRController::probeScsiIdentity(void)
 {
-    IOByteCount segLength;
+    bool ownPage = (fPageBuffer == NULL);
     bool ok;
 
-    fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-        MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
-    if (fPageBuffer == NULL) {
-        setProperty("MPRScsiProbeState", "failed-alloc");
+    if (fProtocolRecoveryPending || !allocatePageBuffer()) {
+        setProperty("MPRScsiProbeState", "failed-buffer-unavailable");
         return false;
     }
-    fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength, kIOMemoryMapperNone);
-    if (fPagePhys == 0 || segLength < MPR_PAGE_BUF_BYTES ||
-        (fPagePhys + MPR_PAGE_BUF_BYTES) > (MPR_DMA_LOW_MASK + 1)) {
-        setProperty("MPRScsiProbeState", "failed-alloc");
-        return false;
-    }
-
     ok = scsiTur();
     setProperty("MPRTurStatus", ok ? "ok" : "failed");
-    ok = scsiInquiry();
+    if (!fProtocolRecoveryPending) {
+        ok = scsiInquiry();
+    }
     setProperty("MPRScsiProbeState", ok ? "ok" : "failed");
 
-    if (fPageBuffer != NULL) {
+    if (ownPage && !fProtocolRecoveryPending) {
         fPageBuffer->release();
         fPageBuffer = NULL;
+        fPagePhys = 0;
     }
-    fPagePhys = 0;
     return ok;
 }
 
@@ -2486,6 +2848,7 @@ MPRController::readManufacturingPage0(void)
     UInt32 baddr = 0;
     UInt8  replyCopy[64];
     bool   ok = false;
+    UInt8 replyKind = 0;
 
     fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
@@ -2512,6 +2875,9 @@ MPRController::readManufacturingPage0(void)
      * through the 0xC0/0xC4 registers; the frame itself begins at the message
      * header because MPI2 request frames have no descriptor prefix
      * (mpr.c:1583-1587, mpr.c:3941). */
+    if (!beginManagementRequest(1)) {
+        return false;
+    }
     frame += fRequestFrameSize;
     memset(frame, 0, fRequestFrameSize);
     config = (MPRConfigRequest *)frame;
@@ -2534,8 +2900,7 @@ MPRController::readManufacturingPage0(void)
 
     /* Request descriptor: DEFAULT_TYPE plus SMID 1 in bits 16-31. */
     value32 = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (1U << 16);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET, value32);
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+    postRequestDescriptor(value32, 0);
 
     {
         UInt64 fw[4];
@@ -2550,15 +2915,17 @@ MPRController::readManufacturingPage0(void)
         setProperty("MPRConfigPagePhys", fPagePhys, 64);
     }
 
-    /* Wait for the reply interrupt; waitForReply falls back to one poll pass
-     * if the event source could not be installed. */
-    fReplyCount = 0;
-    if (!waitForReply(MPR_REPLY_TIMEOUT_MS)) {
+    /* Consume only this config command's completion slot. */
+    if (!finishManagementRequest(1, MPR_REPLY_TIMEOUT_MS, replyCopy, &replyKind)) {
         setProperty("MPRConfigPageFailure", "no reply descriptor received");
         return false;
     }
-    memcpy(replyCopy, fLastReply, sizeof(replyCopy));
     reply = (MPRConfigReply *)replyCopy;
+    if (replyKind != 1 || reply->Function != MPI2_FUNCTION_CONFIG ||
+        reply->MsgLength * 4U < sizeof(MPRConfigReply)) {
+        recordProtocolFault(kMPRProtocolManagementReply, 1);
+        return false;
+    }
     baddr = (UInt32)fReplyPhys;
     ok = true;
 
@@ -2634,13 +3001,42 @@ MPRController::readManufacturingInfo(void)
     fReplyPostIndex = 0;
     ok = readManufacturingPage0();
 
-    if (fPageBuffer != NULL) {
+    if (fPageBuffer != NULL && !fProtocolRecoveryPending) {
         fPageBuffer->release();
         fPageBuffer = NULL;
     }
-    fPagePhys = 0;
+    if (fPageBuffer == NULL) fPagePhys = 0;
     setProperty("MPRConfigPageState", ok ? "ok" : "failed");
     return ok;
+}
+
+bool
+MPRController::init(OSDictionary *properties)
+{
+    fIOLock = NULL;
+    fReplyLock = NULL;
+    fPostLock = NULL;
+    return super::init(properties);
+}
+
+void
+MPRController::free(void)
+{
+    /* stop() leaves these locks alive for already queued callers to wake,
+     * observe fStopping and return. The service's final release owns them. */
+    if (fIOLock != NULL) {
+        IOLockFree(fIOLock);
+        fIOLock = NULL;
+    }
+    if (fReplyLock != NULL) {
+        IOSimpleLockFree(fReplyLock);
+        fReplyLock = NULL;
+    }
+    if (fPostLock != NULL) {
+        IOSimpleLockFree(fPostLock);
+        fPostLock = NULL;
+    }
+    super::free();
 }
 
 bool
@@ -2687,6 +3083,26 @@ MPRController::start(IOService *provider)
     fBlockDev = NULL;
     fIOLock = IOLockAlloc();
     fReplyLock = IOSimpleLockAlloc();
+    fPostLock = IOSimpleLockAlloc();
+    memset(fManagementBusy, 0, sizeof(fManagementBusy));
+    memset(fTmfBusy, 0, sizeof(fTmfBusy));
+    memset(fEventAckQueue, 0, sizeof(fEventAckQueue));
+    fEventAckHead = fEventAckQueued = fEventAckAge = 0;
+    fEventAckBusy = false;
+    fEventAckCompleted = fEventAckFailed = fEventAckOverflow = 0;
+    fProtocolRecoveryPending = false;
+    fProtocolFaultCode = fProtocolFaultSmid = 0;
+    fStickyFaultCode = fStickyFaultSmid = fStickyFaultCount = 0;
+    fLastTopoHandle = fLastTopoReason = fLastTopoRate = 0;
+    fTopoRemovalHits = 0;
+    fBadReplySite = fBadReplyValue = fBadReplySmid = fBadReplyCount = 0;
+    fBadReplyFunction = fBadReplyMsgLen = fBadReplyWord = 0;
+    fLinkUpPhys = 0;
+    fSasDeviceMismatch = false;
+    fIdentityLostCount = 0;
+    fTopologyGeneration = 0;
+    fRemovalPending = false;
+    fHotplugRetryRequested = false;
     memset(fReplySlots, 0, sizeof(fReplySlots));
     fCapacityBlocks = 0;
     fBlockSize = 0;
@@ -2704,15 +3120,20 @@ MPRController::start(IOService *provider)
     fLastASC = 0;
     fLastASCQ = 0;
     fDeviceOffline = false;
+    fMediaPresent = false;
+    fMediaGeneration = 0;
+    fStarting = true;
+    fMediaOfflinePending = false;
+    fMediaOnlinePending = false;
+    fHotplugAttempts = 0;
     fStopping = false;
     fTopologyChanged = false;
     fWatchdogTimer = NULL;
     fHotplugCall = NULL;
     fHotplugPending = false;
-    /* Ignore discovery noise for the first seconds after boot; the initial
-     * media is already published by start(). Real cable swaps happen later. */
-    fHotplugCooldown = 10;
-    fHotplugRebuild = false;
+    fHotplugRunning = false;
+    /* A startup gate, not a blind time window, prevents concurrent probes. */
+    fHotplugCooldown = 0;
     fInjectTimeout = false;
     fInjectTmfFail = 0;
     fFastPathEnabled = false;
@@ -2726,6 +3147,16 @@ MPRController::start(IOService *provider)
     memset(fRevision, 0, sizeof(fRevision));
     memset(fLastReply, 0, sizeof(fLastReply));
     memset(fLastEventData, 0, sizeof(fLastEventData));
+
+    if (fIOLock == NULL || fReplyLock == NULL || fPostLock == NULL) {
+        if (fIOLock != NULL) IOLockFree(fIOLock);
+        if (fReplyLock != NULL) IOSimpleLockFree(fReplyLock);
+        if (fPostLock != NULL) IOSimpleLockFree(fPostLock);
+        fIOLock = NULL;
+        fReplyLock = fPostLock = NULL;
+        super::stop(provider);
+        return false;
+    }
 
     pci = OSDynamicCast(IOPCIDevice, provider);
     if (pci == NULL) {
@@ -2754,7 +3185,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.13");
+    setProperty("MPRBuild", "0.17.18");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -2779,13 +3210,13 @@ MPRController::start(IOService *provider)
     /* Failures during bring-up are recorded in IORegistry and never panic
      * the machine or prevent the kext from loading. Config-page reads
      * poll the reply queue and take no interrupts. */
-    setupInterrupts();
-    if (getWorkLoop() != NULL) {
+    bool interruptsReady = setupInterrupts();
+    if (fWorkLoop != NULL) {
         fWatchdogTimer = IOTimerEventSource::timerEventSource(this,
             OSMemberFunctionCast(IOTimerEventSource::Action, this,
                                  &MPRController::watchdogTimeout));
         if (fWatchdogTimer != NULL &&
-            getWorkLoop()->addEventSource(fWatchdogTimer) == kIOReturnSuccess) {
+            fWorkLoop->addEventSource(fWatchdogTimer) == kIOReturnSuccess) {
             fWatchdogTimer->setTimeoutMS(1000);
             setProperty("MPRWatchdogState", "armed");
         } else {
@@ -2797,20 +3228,31 @@ MPRController::start(IOService *provider)
     fHotplugCall = thread_call_allocate(hotplugCall, this);
     if (initializeController() && initializeQueues()) {
         readManufacturingInfo();
-        enableEventsAndPort();
-        discoverTopology();
-        probeScsiIdentity();
-        probeCapacity();
-        /* Only publish a nub after the first multi-block READ(10) proved the
-         * fast-path data transfer works. */
-        if (probeBlockRead()) {
-            publishBlockDevice();
+        bool eventsReady = interruptsReady && enableEventsAndPort();
+        if (!eventsReady) {
+            recordProtocolFault(interruptsReady ? kMPRProtocolManagementReply :
+                                kMPRProtocolInterruptUnavailable, 0);
         }
-        /* Discovery completes during bring-up; only later device/topology
-         * changes should drive a reset. */
-        fTopologyChanged = false;
+        /* A disk that is readable only through a timeout's fallback poll
+         * cannot support idle hotplug. IRQ, subscription and PortEnable
+         * success are mandatory before publishing a media object. */
+        if (eventsReady && discoverTopology() && fAttachedDevHandle != 0 &&
+            probeScsiIdentity() && probeCapacity() && probeBlockRead() &&
+            prepareTargetMedia()) {
+            fMediaPresent = true;
+            fMediaGeneration++;
+            if (!publishBlockDevice()) fMediaPresent = false;
+        }
     } else {
         setProperty("MPRConfigPageState", "skipped-earlier-stage-failed");
+        recordProtocolFault(kMPRProtocolManagementTimeout, 0);
+    }
+
+    fStarting = false;
+    if (!fMediaPresent && fReplyLock != NULL) {
+        IOSimpleLockLock(fReplyLock);
+        fHotplugPending = true;
+        IOSimpleLockUnlock(fReplyLock);
     }
 
     setProperty("MPRIntCount", (unsigned long long)fInterruptCount, 32);
@@ -2826,34 +3268,71 @@ MPRController::start(IOService *provider)
 void
 MPRController::stop(IOService *provider)
 {
+    MPRBlockDev *nub;
+    bool dmaStopped = false;
+
     fStopping = true;
     if (fWatchdogTimer != NULL) {
         fWatchdogTimer->cancelTimeout();
+        if (fWorkLoop != NULL) {
+            fWorkLoop->removeEventSource(fWatchdogTimer);
+        }
         fWatchdogTimer->release();
         fWatchdogTimer = NULL;
     }
     if (fHotplugCall != NULL) {
-        thread_call_cancel(fHotplugCall);
+        /* The callback may be waiting for fIOLock. Never hold that lock
+         * while waiting for the callback to finish. */
+        thread_call_cancel_wait(fHotplugCall);
         thread_call_free(fHotplugCall);
         fHotplugCall = NULL;
     }
+    if (fIOLock != NULL) {
+        IOLockLock(fIOLock);
+    }
+    fMediaPresent = false;
+    fDeviceOffline = true;
+    fMediaGeneration++;
+    nub = fBlockDev;
+    fBlockDev = NULL;
+    if (nub != NULL) {
+        nub->setController(NULL);
+    }
+
+    /* No command submitter remains. Stop the reply consumer and the IOC
+     * before releasing any host address previously supplied for DMA. */
     teardownInterrupts();
-    if (fBlockDev != NULL) {
-        fBlockDev->setController(NULL);
-        fBlockDev->terminate();
-        fBlockDev->detach(this);
-        fBlockDev->release();
-        fBlockDev = NULL;
+    if (fRegs != NULL) {
+        dmaStopped = diagReset();
     }
-    if (fDataBuffer != NULL) {
-        fDataBuffer->release();
-        fDataBuffer = NULL;
+    if (fPCIDevice != NULL) {
+        fPCIDevice->setBusMasterEnable(false);
+        UInt16 command = fPCIDevice->configRead16(kIOPCIConfigCommand);
+        if (command != 0xFFFF && (command & kIOPCICommandBusMaster) == 0) {
+            dmaStopped = true;
+        }
     }
-    if (fPageBuffer != NULL) {
-        fPageBuffer->release();
-        fPageBuffer = NULL;
+    if (dmaStopped) {
+        if (fDataBuffer != NULL) {
+            fDataBuffer->release();
+            fDataBuffer = NULL;
+        }
+        if (fPageBuffer != NULL) {
+            fPageBuffer->release();
+            fPageBuffer = NULL;
+        }
+        fPagePhys = fDataPhys = 0;
+        fDataBytes = 0;
+        freeQueueMemory();
+        setProperty("MPRStopDMAState", "stopped");
+    } else if (fQueueBuffer != NULL || fReplyBuffer != NULL ||
+               fRequestBuffer != NULL || fPageBuffer != NULL ||
+               fDataBuffer != NULL) {
+        /* A bounded leak is safer than DMA into reallocated kernel memory.
+         * Do not release these descriptors later without hardware proof. */
+        setProperty("MPRStopDMAState", "buffers-retained");
+        IOLog("MPR stop: DMA quiesce unconfirmed; buffers retained\n");
     }
-    freeQueueMemory();
     if (fMMIO != NULL) {
         fMMIO->release();
         fMMIO = NULL;
@@ -2863,12 +3342,19 @@ MPRController::stop(IOService *provider)
     fCapacityBlocks = 0;
     fBlockSize = 0;
     if (fIOLock != NULL) {
-        IOLockFree(fIOLock);
-        fIOLock = NULL;
+        IOLockUnlock(fIOLock);
     }
-    if (fReplyLock != NULL) {
-        IOSimpleLockFree(fReplyLock);
-        fReplyLock = NULL;
+
+    /* Client termination can synchronously re-enter the device. The offline
+     * gate is already closed and no controller lock is held here. IOKit
+     * owns the eventual detach; do not detach a still-terminating child. */
+    if (nub != NULL) {
+        nub->terminate();
+        nub->release();
+    }
+    if (fWorkLoop != NULL) {
+        fWorkLoop->release();
+        fWorkLoop = NULL;
     }
     super::stop(provider);
 }
@@ -2910,7 +3396,6 @@ MPRController::powerStateDidChangeTo(IOPMPowerFlags capabilities,
 #define MPR_SM_TMF_BASE         26
 #define MPR_SM_SYNC_CACHE       29
 #define MPR_SM_UNMAP            30
-#define MPR_SM_EVENT_ACK        31
 #define MPR_MAX_UNMAP_EXTENTS   32
 
 IOReturn
@@ -2925,9 +3410,7 @@ MPRController::postDefaultRequest(UInt32 smid)
 {
     /* Config and EventAck messages use the default descriptor type;
      * only SCSI IO uses the fast-path descriptor (see postScsiIo). */
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET,
-             MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (smid << 16));
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+    postRequestDescriptor(MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE | (smid << 16), 0);
 }
 
 void
@@ -2935,9 +3418,7 @@ MPRController::postHighPriorityRequest(UInt32 smid)
 {
     /* FreeBSD allocates TM requests from the high-priority pool
      * (mpr_sas.c:224-236); the descriptor type is 0x06, not 0x08. */
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_LOW_OFFSET,
-             MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY | (smid << 16));
-    writeReg(MPI2_REQUEST_DESCRIPTOR_POST_HIGH_OFFSET, 0);
+    postRequestDescriptor(MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY | (smid << 16), 0);
 }
 
 void
@@ -2973,24 +3454,62 @@ MPRController::releaseReplyFrame(UInt32 baddr)
 void
 MPRController::sendEventAck(UInt16 event, UInt32 context)
 {
-    UInt8 *frame;
-    MPREventAckRequest *request;
-
-    if (fRequestBuffer == NULL) {
+    /* Called only while fReplyLock is held. Keep each context until its
+     * command completes; never overwrite an IOC-owned request frame. */
+    if (fEventAckQueued == kMPREventAckQueueDepth) {
+        fEventAckOverflow++;
+        recordProtocolFaultLocked(kMPRProtocolAckOverflow, MPR_SM_EVENT_ACK);
         return;
     }
-    frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
-    if (frame == NULL) {
+    UInt32 tail = (fEventAckHead + fEventAckQueued) % kMPREventAckQueueDepth;
+    fEventAckQueue[tail].event = event;
+    fEventAckQueue[tail].context = context;
+    fEventAckQueued++;
+    postNextEventAckLocked();
+}
+
+void
+MPRController::postNextEventAckLocked(void)
+{
+    if (fEventAckBusy || fEventAckQueued == 0 || fRequestBuffer == NULL ||
+        fProtocolRecoveryPending || fStopping) {
+        return;
+    }
+    UInt8 *frame = (UInt8 *)fRequestBuffer->getBytesNoCopy();
+    if (frame == NULL || MPR_SM_EVENT_ACK >= fRequestCount) {
+        recordProtocolFaultLocked(kMPRProtocolAckReply, MPR_SM_EVENT_ACK);
         return;
     }
     frame += MPR_SM_EVENT_ACK * fRequestFrameSize;
     memset(frame, 0, fRequestFrameSize);
-    request = (MPREventAckRequest *)frame;
+    MPREventAckRequest *request = (MPREventAckRequest *)frame;
     request->Function = MPI2_FUNCTION_EVENT_ACK;
-    request->Event = event;
-    request->EventContext = context;
+    request->Event = fEventAckQueue[fEventAckHead].event;
+    request->EventContext = fEventAckQueue[fEventAckHead].context;
+    fEventAckBusy = true;
+    fEventAckAge = 0;
     fEventAckCount++;
     postDefaultRequest(MPR_SM_EVENT_ACK);
+}
+
+void
+MPRController::completeEventAckLocked(const UInt8 *reply, UInt32 replyBytes)
+{
+    UInt16 status = replyBytes >= 16
+        ? (UInt16)((UInt16)reply[14] | ((UInt16)reply[15] << 8)) : 0xFFFF;
+    if (!fEventAckBusy || fEventAckQueued == 0 || replyBytes < 20 ||
+        reply[3] != MPI2_FUNCTION_EVENT_ACK ||
+        (status & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
+        fEventAckFailed++;
+        recordProtocolFaultLocked(kMPRProtocolAckReply, MPR_SM_EVENT_ACK);
+        return;
+    }
+    fEventAckBusy = false;
+    fEventAckAge = 0;
+    fEventAckHead = (fEventAckHead + 1) % kMPREventAckQueueDepth;
+    fEventAckQueued--;
+    fEventAckCompleted++;
+    postNextEventAckLocked();
 }
 
 IOReturn
@@ -3064,11 +3583,13 @@ MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
     MPRScsiIoReply *reply;
     IOReturn mapped;
     bool posted;
+    UInt8 replyBuf[64], replyKind = 0;
 
     if (status != NULL) {
         *status = kIOReturnNotReady;
     }
-    if (fDeviceOffline || fStopping) {
+    if ((fDeviceOffline && !fReinitInProgress) || fStopping ||
+        fProtocolRecoveryPending) {
         if (status != NULL) {
             *status = kIOReturnDeviceError;
         }
@@ -3076,7 +3597,8 @@ MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
     }
     if (fRequestBuffer == NULL || fPageBuffer == NULL || fDataBuffer == NULL ||
         cdb == NULL || cdbLen == 0 || cdbLen > 32 || smid == 0 ||
-        smid >= fRequestCount || dataLen > fDataBytes ||
+        smid >= fRequestCount || smid >= 128 || smid == MPR_SM_EVENT_ACK ||
+        fReplyLock == NULL || dataLen > fDataBytes ||
         fAttachedDevHandle == 0) {
         return false;
     }
@@ -3091,6 +3613,15 @@ MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
     staging = (UInt8 *)fDataBuffer->getBytesNoCopy();
     if (frame == NULL || staging == NULL) {
         return false;
+    }
+    if (smid < 10) {
+        if (!beginManagementRequest(smid)) {
+            return false;
+        }
+    } else {
+        IOSimpleLockLock(fReplyLock);
+        fReplySlots[smid].valid = 0;
+        IOSimpleLockUnlock(fReplyLock);
     }
     frame += smid * fRequestFrameSize;
     memset(frame, 0, fRequestFrameSize);
@@ -3120,28 +3651,42 @@ MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
     }
 
     fCommandCount++;
-    fReplyCount = 0;
-    fLastReplyKind = 0;
-    fLastReplySmid = 0xFFFF;
-    postScsiIo(smid);
-    posted = waitForSmid(15000, smid);
+    memset((UInt8 *)fPageBuffer->getBytesNoCopy() + MPR_SENSE_OFFSET, 0, 96);
+    if (!postScsiIo(smid)) {
+        if (status != NULL) *status = kIOReturnNoMedia;
+        return false;
+    }
+    posted = smid < 10
+        ? finishManagementRequest(smid, 15000, replyBuf, &replyKind)
+        : (waitForSmid(15000, smid) &&
+           takeReplySlot(smid, replyBuf, sizeof(replyBuf), &replyKind));
     if (!posted) {
         if (status != NULL) {
             *status = kIOReturnTimeout;
         }
-        if (fTimedOutSmid == (UInt16)smid) {
-            recoverTimedOutCommand(smid);
+        if (smid >= 10 && fTimedOutSmid == (UInt16)smid) {
+            if (fReinitInProgress || fStarting) {
+                recordProtocolFault(kMPRProtocolManagementTimeout, smid);
+            } else {
+                recoverTimedOutCommand(smid);
+            }
         }
         return false;
     }
-    if (fLastReplyKind == 2) {
+    if (replyKind == 2) {
         if (status != NULL) {
             *status = kIOReturnSuccess;
         }
         return true;
     }
 
-    reply = (MPRScsiIoReply *)fLastReply;
+    if (replyKind != 1 || replyBuf[3] != MPI2_FUNCTION_SCSI_IO_REQUEST ||
+        replyBuf[2] * 4U < MPR_SCSIIO_REPLY_MIN_BYTES) {
+        recordProtocolFault(kMPRProtocolManagementReply, smid);
+        if (status != NULL) *status = kIOReturnIOError;
+        return false;
+    }
+    reply = (MPRScsiIoReply *)replyBuf;
     mapped = kIOReturnIOError;
     if ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) != MPI2_IOCSTATUS_SUCCESS) {
         mapped = kIOReturnDeviceError;
@@ -3155,7 +3700,7 @@ MPRController::issueScsiCommand(const UInt8 *cdb, UInt32 cdbLen,
     } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_TASK_ABORTED) {
         mapped = kIOReturnAborted;
     } else if (reply->SCSIStatus == MPI2_SCSI_STATUS_GOOD) {
-        mapped = kIOReturnSuccess;
+        mapped = reply->TransferCount < dataLen ? kIOReturnUnderrun : kIOReturnSuccess;
     }
 
     setProperty("MPRLastCommandStatus",
@@ -3291,7 +3836,8 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
     bool ok = false;
 
     if (fRequestBuffer == NULL || fAttachedDevHandle == 0 ||
-        smid == 0 || smid >= fRequestCount) {
+        smid < MPR_SM_TMF_BASE || smid >= MPR_SM_TMF_BASE + 3 ||
+        smid >= fRequestCount || fReplyLock == NULL || fProtocolRecoveryPending) {
         return false;
     }
     if (fHighPriorityCredit == 0) {
@@ -3302,6 +3848,15 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
     if (frame == NULL) {
         return false;
     }
+    IOSimpleLockLock(fReplyLock);
+    if (fTmfBusy[smid - MPR_SM_TMF_BASE]) {
+        IOSimpleLockUnlock(fReplyLock);
+        setProperty("MPRTmfState", "previous-command-still-owned");
+        return false;
+    }
+    fTmfBusy[smid - MPR_SM_TMF_BASE] = true;
+    fReplySlots[smid].valid = 0;
+    IOSimpleLockUnlock(fReplyLock);
     frame += smid * fRequestFrameSize;
     memset(frame, 0, fRequestFrameSize);
     request = (MPRScsiTaskMgmtRequest *)frame;
@@ -3311,13 +3866,18 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid)
     request->TaskMID = taskMid;
 
     fTmfCount++;
-    fReplyCount = 0;
-    fLastReplyKind = 0;
-    fLastReplySmid = 0xFFFF;
     postHighPriorityRequest(smid);
     if (waitForSmid(15000, smid) &&
         takeReplySlot(smid, replyBuf, sizeof(replyBuf), &replyKind) &&
         replyKind == 1) {
+        if (replyBuf[3] != MPI2_FUNCTION_SCSI_TASK_MGMT ||
+            replyBuf[2] * 4U < sizeof(MPRScsiTaskMgmtReply)) {
+            recordProtocolFault(kMPRProtocolManagementReply, smid);
+            return false;
+        }
+        IOSimpleLockLock(fReplyLock);
+        fTmfBusy[smid - MPR_SM_TMF_BASE] = false;
+        IOSimpleLockUnlock(fReplyLock);
         reply = (MPRScsiTaskMgmtReply *)replyBuf;
         ok = ((reply->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS) &&
              (reply->ResponseCode == MPI2_SCSITASKMGMT_RSP_TM_COMPLETE ||
@@ -3344,6 +3904,7 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
     };
     UInt32 i, injectFail;
     bool recovered = false;
+    bool controllerReset = false;
 
     if (smid == 0) {
         return false;
@@ -3374,7 +3935,27 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
         }
     }
     if (!recovered) {
+        controllerReset = true;
+        setProperty("MPRResetInitiator", "io-timeout");
         recovered = resetAndReinitialize();
+    }
+    bool removed;
+    IOSimpleLockLock(fReplyLock);
+    removed = fRemovalPending;
+    IOSimpleLockUnlock(fReplyLock);
+    if (controllerReset || removed || !recovered) {
+        /* Do not resume an old IO across a global reset or a physical
+         * removal. The unlocked worker performs OFFLINE -> ONLINE before
+         * clients issue new requests against the new media generation. */
+        invalidateMedia();
+        IOSimpleLockLock(fReplyLock);
+        fHotplugPending = true;
+        IOSimpleLockUnlock(fReplyLock);
+        if (!recovered) {
+            recordProtocolFault(kMPRProtocolManagementTimeout, smid);
+        }
+        setProperty("MPRRecoveryState", recovered ? "media-revalidation" : "failed");
+        return false;
     }
     if (recovered) {
         fFrozenSmid = 0;
@@ -3394,29 +3975,27 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
 void
 MPRController::watchdogTimeout(IOTimerEventSource *sender)
 {
-    if (fStopping) {
-        return;
+    if (fStopping) return;
+    serviceProtocolState();
+    bool schedule = false;
+    if (fReplyLock != NULL) {
+        IOSimpleLockLock(fReplyLock);
+        if (fHotplugCooldown != 0) fHotplugCooldown--;
+        if (!fStarting && !fReinitInProgress && !fHotplugRunning &&
+            fHotplugPending && fHotplugCooldown == 0 && fHotplugCall != NULL) {
+            /* Consume only this scheduling token. An event arriving while
+             * the worker runs sets it again and must survive completion. */
+            fHotplugPending = false;
+            fHotplugRunning = true;
+            schedule = true;
+        }
+        IOSimpleLockUnlock(fReplyLock);
     }
-    if (fTopologyChanged) {
-        setProperty("MPRWatchdogState", "topology-change");
-    } else if (fDeviceOffline) {
-        setProperty("MPRWatchdogState", "offline");
-    } else if (fFrozenSmid != 0) {
-        setProperty("MPRWatchdogState", "frozen");
-    } else {
-        setProperty("MPRWatchdogState", "ok");
-    }
-    if (fHotplugPending && !fReinitInProgress && !fStopping &&
-        fHotplugCall != NULL) {
-        fHotplugPending = false;
-        thread_call_enter(fHotplugCall);
-    }
-    if (fHotplugCooldown > 0) {
-        fHotplugCooldown--;
-    }
-    if (sender != NULL) {
-        sender->setTimeoutMS(1000);
-    }
+    setProperty("MPRWatchdogState", fProtocolRecoveryPending ? "protocol-recovery" :
+                fTopologyChanged ? "topology-change" :
+                !fMediaPresent ? "offline" : "ok");
+    if (schedule) thread_call_enter(fHotplugCall);
+    if (sender != NULL) sender->setTimeoutMS(1000);
 }
 
 void
@@ -3427,289 +4006,312 @@ MPRController::hotplugCall(thread_call_param_t param0,
     ((MPRController *)param0)->hotplugThread();
 }
 
-void
-MPRController::hotplugThread(void)
+bool
+MPRController::mediaRemovalPending(void)
 {
-    bool resetOk;
+    IOSimpleLockLock(fReplyLock);
+    bool pending = fRemovalPending;
+    IOSimpleLockUnlock(fReplyLock);
+    return pending;
+}
 
-    if (fStopping || fReinitInProgress) {
-        return;
+void
+MPRController::invalidateMedia(void)
+{
+    /* Caller holds fIOLock. Transport failure and publication state are
+     * separate: setting DeviceOffline must never suppress a later OFFLINE. */
+    if (fMediaPresent) {
+        fMediaPresent = false;
+        fMediaGeneration++;
+        fMediaOfflinePending = (fBlockDev != NULL);
     }
-
-    /* probeScsiIdentity()/probeCapacity() release the page buffer when they
-     * finish; a failed reset can therefore leave discovery without one. */
-    if (fPageBuffer == NULL) {
-        IOByteCount segLength;
-
-        fPageBuffer = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-            MPR_PAGE_BUF_BYTES, MPR_DMA_LOW_MASK);
-        if (fPageBuffer != NULL) {
-            fPagePhys = fPageBuffer->getPhysicalSegment(0, &segLength,
-                                                        kIOMemoryMapperNone);
-        }
-    }
-
-    /* While the target is gone, do not reset the controller on every retry.
-     * Keep the existing nub and media contract: terminate() is asynchronous,
-     * so tearing the nub down here leaves the old IOMedia registered when the
-     * reappeared device publishes a new one (duplicate disks). */
-    if (fAttachedDevHandle == 0) {
-        fReplyCount = 0;
-        fLastReplyKind = 0;
-        fLastReplySmid = 0xFFFF;
-        if (!readSasIOUnitPage0() || fAttachedDevHandle == 0) {
-            if (!fDeviceOffline && fBlockDev != NULL) {
-                fBlockDev->notifyMediaState(kIOMediaStateOffline);
-            }
-            fDeviceOffline = true;
-            setProperty("MPRHotplugState", "removed");
-            setProperty("MPRHotplugResetResult", "waiting");
-            setProperty("MPRHotplugBlockDev",
-                        (unsigned long long)(fBlockDev != NULL ? 1 : 0), 8);
-            setProperty("MPRHotplugHandle", 0ULL, 16);
-            fHotplugPending = true;
-            fHotplugCooldown = 1;
-            return;
-        }
-    }
-
-    /* Present (or reappeared): rebuild via the verified reset path. Clear the
-     * offline gate so IOBlockStorageDriver can read LBA1 while probing. */
-    fDeviceOffline = false;
-    fHotplugRebuild = true;
-    resetOk = resetAndReinitialize();
-    fHotplugRebuild = false;
-    setProperty("MPRHotplugResetResult", resetOk ? "ok" : "failed");
-    setProperty("MPRHotplugBlockDev",
-                (unsigned long long)(fBlockDev != NULL ? 1 : 0), 8);
-    setProperty("MPRHotplugHandle",
-                (unsigned long long)fAttachedDevHandle, 16);
-    if (resetOk) {
-        if (fBlockDev != NULL) {
-            /* Re-accept the media so IOStorageFamily re-reads LBA1 and
-             * re-matches IOGUIDPartitionScheme. */
-            fBlockDev->notifyMediaState(kIOMediaStateOnline);
-        }
-        setProperty("MPRHotplugState",
-                    fAttachedDevHandle != 0 ? "rebuilt" : "removed");
-        fHotplugPending = false;
-        fTopologyChanged = false;
-        fHotplugCooldown = 5;
-    } else {
-        setProperty("MPRHotplugState", "reset-failed");
-        fDeviceOffline = true;
-        fHotplugPending = true;
-        fHotplugCooldown = 1;
-    }
+    fMediaOnlinePending = false;
+    fDeviceOffline = true;
+    setProperty("MPRDeviceOffline", true);
+    setProperty("MPRMediaPresent", false);
+    setProperty("MPRMediaReady", false);
 }
 
 bool
-MPRController::wholeMediaHasPartitions(void)
+MPRController::takeMediaOffline(void)
 {
-    OSIterator *iter;
-    IORegistryEntry *child;
-    IOBlockStorageDriver *driver = NULL;
-    bool partitioned = false;
-
-    if (fBlockDev == NULL) {
-        return false;
+    /* Caller holds fIOLock; return with it held. Storage notifications can
+     * re-enter the transport, so never send them while holding this lock. */
+    invalidateMedia();
+    if (!fMediaOfflinePending || fBlockDev == NULL) return true;
+    MPRBlockDev *nub = fBlockDev;
+    nub->retain();
+    IOLockUnlock(fIOLock);
+    IOReturn status = nub->notifyMediaState(kIOMediaStateOffline);
+    nub->release();
+    IOLockLock(fIOLock);
+    setProperty("MPRMediaOfflineStatus", (unsigned long long)(UInt32)status, 32);
+    /* Before matching there is no old IOBlockStorageDriver/IOMedia to retire.
+     * Its eventual initial probe will observe fMediaPresent == false. */
+    if (status == kIOReturnSuccess || status == kIOReturnNotAttached) {
+        fMediaOfflinePending = false;
+        return true;
     }
-    iter = fBlockDev->getChildIterator(gIOServicePlane);
-    if (iter == NULL) {
-        return false;
-    }
-    while ((child = (IORegistryEntry *)iter->getNextObject()) != NULL) {
-        driver = OSDynamicCast(IOBlockStorageDriver, child);
-        if (driver != NULL) {
-            break;
-        }
-    }
-    iter->release();
-    if (driver == NULL) {
-        return false;
-    }
-    iter = driver->getChildIterator(gIOServicePlane);
-    if (iter == NULL) {
-        return false;
-    }
-    while ((child = (IORegistryEntry *)iter->getNextObject()) != NULL) {
-        IOMedia *media = OSDynamicCast(IOMedia, child);
-
-        if (media != NULL &&
-            media->getProperty(kIOMediaWholeKey) == kOSBooleanTrue) {
-            /* A whole media with an empty Content is a leaf, so no partition
-             * scheme matched it. Only that case needs a new nub. */
-            partitioned = (media->getProperty("Leaf") != kOSBooleanTrue);
-            break;
-        }
-    }
-    iter->release();
-    return partitioned;
+    return false;
 }
 
 void
-MPRController::rescanPartitions(void)
+MPRController::hotplugThread(void)
 {
-    OSIterator *iter;
-    IORegistryEntry *child;
-    IOBlockStorageDriver *driver = NULL;
-    IOMedia *media = NULL;
+    UInt32 generation = 0, oldHandle = 0;
+    bool removal = false, retry = false, resetOk = false;
+    bool retryRequested = false;
+    const char *state = "stopped";
+    IOReturn notification = kIOReturnSuccess;
 
-    if (fBlockDev == NULL) {
-        return;
-    }
-    iter = fBlockDev->getChildIterator(gIOServicePlane);
-    if (iter == NULL) {
-        setProperty("MPRPartitionRescan", "no-child-iterator");
-        return;
-    }
-    while ((child = (IORegistryEntry *)iter->getNextObject()) != NULL) {
-        driver = OSDynamicCast(IOBlockStorageDriver, child);
-        if (driver != NULL) {
-            break;
+    if (fIOLock == NULL) return;
+    IOLockLock(fIOLock);
+    IOSimpleLockLock(fReplyLock);
+    generation = fTopologyGeneration;
+    removal = fRemovalPending;
+    fRemovalPending = false;
+    retryRequested = fHotplugRetryRequested;
+    fHotplugRetryRequested = false;
+    IOSimpleLockUnlock(fReplyLock);
+    if (fStopping || fStarting) goto done;
+
+    oldHandle = fAttachedDevHandle;
+    if (removal || retryRequested) fHotplugAttempts = 0;
+    if (removal || fDeviceOffline || fProtocolRecoveryPending ||
+        fMediaOfflinePending) {
+        /* Which of the four independent reasons tore the medium down. */
+        setProperty("MPRMediaOfflineCause",
+                    removal ? "removal-event" :
+                    fMediaOfflinePending ? "offline-not-completed" :
+                    fProtocolRecoveryPending ? "protocol-recovery" :
+                    "device-offline");
+        if (!takeMediaOffline()) {
+            state = "offline-notification-failed";
+            retry = true;
+            goto done;
         }
     }
-    iter->release();
-    if (driver == NULL) {
-        setProperty("MPRPartitionRescan", "no-driver");
-        return;
-    }
+    if (fStopping) goto done;
 
-    iter = driver->getChildIterator(gIOServicePlane);
-    if (iter == NULL) {
-        setProperty("MPRPartitionRescan", "no-media-iterator");
-        return;
-    }
-    while ((child = (IORegistryEntry *)iter->getNextObject()) != NULL) {
-        IOMedia *candidate = OSDynamicCast(IOMedia, child);
-
-        if (candidate != NULL &&
-            candidate->getProperty(kIOMediaWholeKey) == kOSBooleanTrue) {
-            media = candidate;
-            break;
+    if (!fProtocolRecoveryPending) {
+        if (!allocatePageBuffer() || !readSasIOUnitPage0()) {
+            state = "topology-read-failed";
+            retry = true;
+            goto done;
+        }
+        if (fAttachedDevHandle == 0 && fLinkUpPhys == 0) {
+            /* A successful empty snapshot with no negotiated link anywhere is
+             * absence; a failed read above is not. Poll it without resetting. */
+            retry = true;
+            state = takeMediaOffline() ? "removed" : "offline-notification-failed";
+            fCapacityBlocks = 0;
+            fBlockSize = 0;
+            fUnmapEnabled = false;
+            fHotplugAttempts = 0;
+            goto done;
+        }
+        if (fAttachedDevHandle == 0) {
+            /* A phy negotiates a link but the IOC attaches no target, or the
+             * handle it listed no longer names that target. Both need the
+             * bounded diagnostic reset below; a single mismatch sample is
+             * given one poll to settle first. */
+            if (fSasDeviceMismatch && fIdentityLostCount < 2) {
+                state = "target-identity-pending";
+                retry = true;
+                goto done;
+            }
+            state = fSasDeviceMismatch ? "target-identity-lost" :
+                                        "link-without-target";
+        } else if (fMediaPresent && !removal && oldHandle == fAttachedDevHandle &&
+                   !fDeviceOffline) {
+            if (!fMediaOnlinePending) {
+                state = "online";
+                goto done;
+            }
+            goto notifyOnline;
+        } else if (oldHandle == 0) {
+            /* A target that was absent before this snapshot is a new
+             * insertion: it gets a full recovery budget. */
+            fHotplugAttempts = 0;
+        }
+        if (!takeMediaOffline()) {
+            state = "offline-notification-failed";
+            retry = true;
+            goto done;
         }
     }
-    iter->release();
-    if (media == NULL) {
-        setProperty("MPRPartitionRescan", "no-whole-media");
-        return;
+
+    /* Single-target prototype: a diagnostic reset is the bounded fallback
+     * for reappearing targets. Do not reset endlessly while a disk is gone
+     * or while firmware repeatedly reports its own discovery events. */
+    if (fHotplugAttempts >= 3) {
+        state = "recovery-exhausted";
+        /* Keep the snapshot polled. A target that finally appears clears the
+         * budget above; an empty fabric is never reset again. */
+        retry = true;
+        goto done;
     }
-    setProperty("MPRPartitionRescanMedia", media->getProperty("BSD Name"));
-    /* resetAndReinitialize() re-enumerated the media with an empty Content,
-     * so IOStorageFamily stopped matching IOGUIDPartitionScheme. Republish
-     * the content key; that re-runs the partition-scheme probe. */
-    media->setProperty(kIOMediaContentKey, "GUID_partition_scheme");
-    media->setProperty(kIOMediaContentHintKey, "");
-    setProperty("MPRPartitionRescan", "guid");
+    fHotplugAttempts++;
+    setProperty("MPRResetInitiator", "hotplug");
+    resetOk = resetAndReinitialize();
+    setProperty("MPRHotplugResetResult", resetOk ? "ok" : "failed");
+    if (!resetOk) {
+        invalidateMedia();
+        if (fAttachedDevHandle == 0 && !fProtocolRecoveryPending) {
+            state = "removed";
+            fHotplugAttempts = 0;
+            retry = true;
+        } else {
+            state = "recovery-failed";
+            retry = fHotplugAttempts < 3;
+        }
+        goto done;
+    }
+    /* A new physical removal observed during reset must be processed before
+     * any ONLINE notification. Do not erase it with a final pending=false. */
+    IOSimpleLockLock(fReplyLock);
+    removal = fRemovalPending;
+    IOSimpleLockUnlock(fReplyLock);
+    if (removal || fProtocolRecoveryPending || fStopping) {
+        invalidateMedia();
+        state = "topology-changed-during-recovery";
+        retry = !fStopping;
+        goto done;
+    }
+    fDeviceOffline = false;
+    fMediaPresent = true;
+    fMediaGeneration++;
+    fMediaOnlinePending = true;
+
+notifyOnline:
+    {
+        UInt32 publication = fMediaGeneration;
+        MPRBlockDev *nub = fBlockDev;
+        if (nub != NULL) nub->retain();
+        IOLockUnlock(fIOLock);
+        if (nub != NULL) {
+            notification = nub->notifyMediaState(kIOMediaStateOnline);
+            nub->release();
+        } else {
+            notification = publishBlockDevice() ? kIOReturnSuccess : kIOReturnNoMemory;
+        }
+        IOLockLock(fIOLock);
+        setProperty("MPRMediaOnlineStatus",
+                    (unsigned long long)(UInt32)notification, 32);
+        if (fStopping || publication != fMediaGeneration || fDeviceOffline ||
+            fProtocolRecoveryPending || mediaRemovalPending()) {
+            state = "publication-interrupted";
+            retry = !fStopping;
+            goto done;
+        }
+        if (notification == kIOReturnNotAttached) {
+            state = "awaiting-storage-driver";
+            retry = true;
+        } else if (notification != kIOReturnSuccess) {
+            invalidateMedia();
+            state = "online-notification-failed";
+            retry = true;
+        } else {
+            fMediaOnlinePending = false;
+            fHotplugAttempts = 0;
+            state = "online";
+        }
+    }
+
+done:
+    setProperty("MPRHotplugState", state);
+    setProperty("MPRMediaPresent", fMediaPresent);
+    setProperty("MPRDeviceOffline", fDeviceOffline);
+    setProperty("MPRMediaGeneration", (unsigned long long)fMediaGeneration, 32);
+    setProperty("MPRHotplugAttempts", (unsigned long long)fHotplugAttempts, 32);
+    setProperty("MPRHotplugHandle", (unsigned long long)fAttachedDevHandle, 16);
+    setProperty("MPRHotplugBlockDev", fBlockDev != NULL);
+    IOSimpleLockLock(fReplyLock);
+    if (generation == fTopologyGeneration && !fHotplugPending && !retry) {
+        fTopologyChanged = false;
+    }
+    if (retry) {
+        fHotplugPending = true;
+        fHotplugCooldown = 1;
+    }
+    fHotplugRunning = false;
+    IOSimpleLockUnlock(fReplyLock);
+    IOLockUnlock(fIOLock);
 }
 
 bool
 MPRController::resetAndReinitialize(void)
 {
+    /* Called with fIOLock held. Only restore transport and target readiness;
+     * storage notifications and registration belong to the unlocked worker. */
     bool ok = false;
-    UInt32 retry;
-
-    if (fReinitInProgress || fStopping) {
-        return false;
-    }
+    const char *state = "failed";
+    if (fReinitInProgress || fStopping) return false;
     fReinitInProgress = true;
+    fDeviceOffline = true;
+    fUnmapEnabled = false;
     fResetCount++;
+    setProperty("MPRMediaReady", false);
 
-    /* Quiesce first: stop the interrupt source, then reset the IOC so it no
-     * longer touches host DMA. Only afterwards release and rebuild pools. */
     teardownInterrupts();
     if (!diagReset()) {
-        fReinitInProgress = false;
-        setProperty("MPRReinitState", "diag-reset-failed");
-        return false;
+        state = "diag-reset-failed";
+        /* Old requests can still own DMA; do not free their buffers. */
+        recordProtocolFault(kMPRProtocolManagementTimeout, fTimedOutSmid);
+        goto finished;
+    }
+    resetProtocolState();
+    /* A timed-out startup manufacturing probe used a smaller temporary
+     * page. It is safe to replace only after this successful IOC reset. */
+    if (fPageBuffer != NULL && fPageBuffer->getLength() < MPR_PAGE_BUF_BYTES) {
+        fPageBuffer->release();
+        fPageBuffer = NULL;
+        fPagePhys = 0;
     }
     freeQueueMemory();
-    fReplyPostIndex = 0;
-    fReplyCount = 0;
+    fReplyPostIndex = fReplyCount = 0;
     fLastReplySmid = 0xFFFF;
     fLastReplyKind = 0;
-    if (fReplyLock != NULL) {
-        IOSimpleLockLock(fReplyLock);
-        memset(fReplySlots, 0, sizeof(fReplySlots));
-        IOSimpleLockUnlock(fReplyLock);
+    fFrozenSmid = fTimedOutSmid = 0;
+    fAttachedDevHandle = 0;
+    fCapacityBlocks = 0;
+    fBlockSize = 0;
+
+    /* IOC Init advertises the installed interrupt vector and initializeQueues
+     * unmasks reply interrupts only when the source already exists. */
+    if (!setupInterrupts()) {
+        state = "interrupt-setup-failed";
+        recordProtocolFault(kMPRProtocolInterruptUnavailable, 0);
+        goto finished;
     }
-
-    setupInterrupts();
-    if (initializeController() && initializeQueues()) {
-        sendEventNotification();
-        sendPortEnable();
-        /* The firmware rebuilt its device table. Clear the cached handle
-         * property so the topology read accepts the new devhandle. */
-        removeProperty("MPRAttachedDevHandle");
-        fAttachedDevHandle = 0;
-        /* After diag reset the target needs a moment to reappear; retry the
-         * topology read instead of failing the whole recovery immediately. */
-        IOSleep(500);
-        for (retry = 0; retry < 5; retry++) {
-            fReplyCount = 0;
-            fLastReplyKind = 0;
-            fLastReplySmid = 0xFFFF;
-            if (readSasIOUnitPage0() && fAttachedDevHandle != 0) {
-                break;
-            }
-            IOSleep(200);
+    if (!initializeController() || !initializeQueues()) goto finished;
+    if (!allocatePageBuffer() || !sendEventNotification() || !sendPortEnable())
+        goto finished;
+    for (UInt32 retry = 0; retry < 5 && !fStopping; retry++) {
+        IOSleep(200);
+        if (!readSasIOUnitPage0()) {
+            if (fProtocolRecoveryPending) goto finished;
+            continue;
         }
-        if (fAttachedDevHandle != 0) {
-            char oldVendor[16], oldProduct[20];
-            UInt64 oldBlocks = fCapacityBlocks;
-            UInt32 oldBlockSize = fBlockSize;
-            bool changed;
-
-            memcpy(oldVendor, fVendor, sizeof(oldVendor));
-            memcpy(oldProduct, fProduct, sizeof(oldProduct));
-            if (probeScsiIdentity() && probeCapacity()) {
-                bool identityChanged =
-                    (memcmp(oldVendor, fVendor, sizeof(oldVendor)) != 0) ||
-                    (memcmp(oldProduct, fProduct, sizeof(oldProduct)) != 0);
-
-                setProperty("MPRIdentityChanged",
-                            identityChanged ? "yes" : "no");
-                /* Only a geometry change requires a new IOMedia; vendor/
-                 * product padding differences are not a reliable identity. */
-                changed = (oldBlocks != fCapacityBlocks) ||
-                          (oldBlockSize != fBlockSize);
-                if (changed && fBlockDev != NULL) {
-                    /* A different target or geometry must not keep the old
-                     * media contract; tear the nub down and republish. */
-                    fBlockDev->setController(NULL);
-                    fBlockDev->terminate();
-                    fBlockDev->detach(this);
-                    fBlockDev->release();
-                    fBlockDev = NULL;
-                    setProperty("MPRBlockDeviceState", "identity-changed");
-                }
-                ok = (fBlockDev != NULL) || publishBlockDevice();
-            }
-        }
+        if (fAttachedDevHandle != 0) break;
     }
+    if (fAttachedDevHandle == 0) {
+        state = "no-media";
+        goto finished;
+    }
+    if (!probeScsiIdentity() || !probeCapacity() || !prepareTargetMedia())
+        goto finished;
+    ok = !fProtocolRecoveryPending && !fStopping;
+    state = ok ? "ok" : "failed";
 
+finished:
     fReinitInProgress = false;
-    setProperty("MPRReinitState", ok ? "ok" : "failed");
+    fDeviceOffline = !ok;
+    setProperty("MPRReinitState", state);
     setProperty("MPRResetCount", (unsigned long long)fResetCount, 32);
-    if (ok) {
-        /* IOMedia's Content is fixed when the media object is created, so a
-         * property write cannot re-run the GPT probe. A TMF/timeout reset
-         * always rebuilds the nub (0.15.10 partition rescan). A cable-swap
-         * reset reuses an intact nub, otherwise the asynchronously terminated
-         * old media stays registered and a duplicate disk appears. */
-        if (!fHotplugRebuild) {
-            if (fBlockDev != NULL) {
-                fBlockDev->setController(NULL);
-                fBlockDev->terminate();
-                fBlockDev->detach(this);
-                fBlockDev->release();
-                fBlockDev = NULL;
-            }
-            IOSleep(500);
-            ok = publishBlockDevice();
-        }
-    }
+    setProperty("MPRResidentBuffersReady",
+                fPageBuffer != NULL && fPagePhys != 0 &&
+                fDataBuffer != NULL && fDataPhys != 0 && fDataBytes != 0);
     return ok;
 }
 
@@ -3717,26 +4319,39 @@ IOReturn
 MPRController::synchronizeCache(UInt64 block, UInt64 nblks, bool barrier)
 {
     UInt32 blocks;
+    UInt32 generation = fMediaGeneration;
     IOReturn status;
 
-    if (fDeviceOffline || fStopping) {
-        return kIOReturnDeviceError;
-    }
-    if (fIOLock == NULL || fDataBuffer == NULL || fPageBuffer == NULL ||
-        fCapacityBlocks == 0 || fBlockSize == 0) {
+    if (fIOLock == NULL) {
         return kIOReturnNotReady;
     }
+    IOLockLock(fIOLock);
+    if (generation != fMediaGeneration || !fMediaPresent ||
+                mediaRemovalPending()) {
+        status = kIOReturnNoMedia;
+        goto out;
+    }
+    if (fDeviceOffline || fStopping || fReinitInProgress ||
+        fProtocolRecoveryPending || fDataBuffer == NULL ||
+        fPageBuffer == NULL || fCapacityBlocks == 0 || fBlockSize == 0) {
+        status = kIOReturnNotReady;
+        goto out;
+    }
     if (block >= fCapacityBlocks) {
-        return kIOReturnBadArgument;
+        status = kIOReturnBadArgument;
+        goto out;
     }
     if (nblks == 0 || nblks > fCapacityBlocks - block) {
         nblks = fCapacityBlocks - block;
     }
     /* NUMBER OF LOGICAL BLOCKS is 16-bit; zero means "to end of media". */
     blocks = (nblks > 0xFFFFULL) ? 0 : (UInt32)nblks;
-
-    IOLockLock(fIOLock);
     status = scsiSynchronizeCache(block, blocks, MPR_SM_SYNC_CACHE, barrier);
+    if (generation != fMediaGeneration || !fMediaPresent ||
+                mediaRemovalPending()) {
+        status = kIOReturnNoMedia;
+    }
+out:
     IOLockUnlock(fIOLock);
     return status;
 }
@@ -3746,18 +4361,31 @@ MPRController::unmapBlocks(const IOBlockStorageDeviceExtent *extents,
                            UInt32 extentsCount)
 {
     UInt32 i;
+    UInt32 generation = fMediaGeneration;
     IOReturn status;
 
-    if (fDeviceOffline || fStopping) {
-        return kIOReturnDeviceError;
+    if (extents == NULL || extentsCount == 0 ||
+        extentsCount > MPR_MAX_UNMAP_EXTENTS) {
+        return kIOReturnBadArgument;
+    }
+    if (fIOLock == NULL) {
+        return kIOReturnNotReady;
+    }
+    IOLockLock(fIOLock);
+    if (generation != fMediaGeneration || !fMediaPresent ||
+                mediaRemovalPending()) {
+        status = kIOReturnNoMedia;
+        goto out;
+    }
+    if (fDeviceOffline || fStopping || fReinitInProgress ||
+        fProtocolRecoveryPending || fDataBuffer == NULL ||
+        fPageBuffer == NULL || fCapacityBlocks == 0 || fBlockSize == 0) {
+        status = kIOReturnNotReady;
+        goto out;
     }
     if (!fUnmapEnabled) {
-        return kIOReturnUnsupported;
-    }
-    if (extents == NULL || extentsCount == 0 ||
-        extentsCount > MPR_MAX_UNMAP_EXTENTS || fIOLock == NULL ||
-        fCapacityBlocks == 0 || fBlockSize == 0) {
-        return kIOReturnBadArgument;
+        status = kIOReturnUnsupported;
+        goto out;
     }
     for (i = 0; i < extentsCount; i++) {
         UInt64 start = extents[i].blockStart;
@@ -3766,11 +4394,16 @@ MPRController::unmapBlocks(const IOBlockStorageDeviceExtent *extents,
         if (count == 0 || start >= fCapacityBlocks ||
             count > fCapacityBlocks - start ||
             count > 0xFFFFFFFFULL) {
-            return kIOReturnBadArgument;
+            status = kIOReturnBadArgument;
+            goto out;
         }
     }
-    IOLockLock(fIOLock);
     status = scsiUnmap(extents, extentsCount, MPR_SM_UNMAP);
+    if (generation != fMediaGeneration || !fMediaPresent ||
+                mediaRemovalPending()) {
+        status = kIOReturnNoMedia;
+    }
+out:
     IOLockUnlock(fIOLock);
     return status;
 }

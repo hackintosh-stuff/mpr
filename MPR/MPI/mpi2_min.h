@@ -388,6 +388,15 @@ static_assert(offsetof(MPRConfigPageMan0, ChipName) == 0x04, "ChipName offset");
 #define MPI2_EVENT_LOG_ENTRY_ADDED                 0x0021
 #define MPI2_EVENT_SAS_DEVICE_DISCOVERY_ERROR      0x0035
 
+/* SAS topology PHY reason codes (FreeBSD mpi2_ioc.h). */
+#define MPI2_EVENT_SAS_TOPO_RC_MASK                0x0F
+#define MPI2_EVENT_SAS_TOPO_RC_TARG_ADDED          0x01
+#define MPI2_EVENT_SAS_TOPO_RC_TARG_NOT_RESPONDING 0x02
+#define MPI2_EVENT_SAS_TOPO_RC_PHY_CHANGED         0x03
+#define MPI2_EVENT_SAS_TOPO_RC_NO_CHANGE           0x04
+#define MPI2_EVENT_SAS_TOPO_RC_DELAY_NOT_RESPONDING 0x05
+#define MPI2_EVENT_SAS_TOPO_PHYSTATUS_VACANT       0x80
+
 #define MPR_EVENT_MASK_WORDS                       4
 
 #pragma pack(push, 1)
@@ -619,6 +628,15 @@ typedef struct {
 
 static_assert(sizeof(MPRScsiIoRequest) == 0x60, "SCSI IO request layout");
 static_assert(sizeof(MPRScsiIoReply) == 0x34, "SCSI IO reply layout");
+
+/* The EEDP fields above are MPI 2.5 additions. Firmware that predates them
+ * answers with the classic 0x30-byte reply, and a size test against
+ * sizeof(MPRScsiIoReply) then rejects a perfectly valid reply. Only the
+ * prefix this driver reads has to be present: IOCStatus, SCSIStatus,
+ * SCSIState, SenseCount and ResponseInfo, which ends at 0x20. */
+#define MPR_SCSIIO_REPLY_MIN_BYTES 0x20U
+static_assert(offsetof(MPRScsiIoReply, ResponseInfo) + 4 ==
+              MPR_SCSIIO_REPLY_MIN_BYTES, "SCSI IO reply consumed prefix");
 static_assert(offsetof(MPRScsiIoRequest, CDB) == 0x40, "SCSI IO CDB offset");
 static_assert(offsetof(MPRScsiIoRequest, Control) == 0x3C, "SCSI IO control offset");
 

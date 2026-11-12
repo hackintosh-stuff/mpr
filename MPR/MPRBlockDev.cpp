@@ -6,27 +6,91 @@
 #define super IOBlockStorageDevice
 OSDefineMetaClassAndStructors(MPRBlockDev, IOBlockStorageDevice)
 
-static char kMPREmptyString[] = "";
 static char kMPRDeviceInfo[] = "MPR SAS3008 STP/SATA";
 
 bool
 MPRBlockDev::init(OSDictionary *properties)
 {
     fController = NULL;
+    fControllerLock = NULL;
     fLastMediaPresent = false;
-    fForceMediaStateChange = false;
-    return super::init(properties);
+    bzero(fVendor, sizeof(fVendor));
+    bzero(fProduct, sizeof(fProduct));
+    bzero(fRevision, sizeof(fRevision));
+    if (!super::init(properties)) return false;
+    fControllerLock = IOLockAlloc();
+    return fControllerLock != NULL;
 }
 
 void
+MPRBlockDev::free(void)
+{
+    setController(NULL);
+    if (fControllerLock != NULL) {
+        IOLockFree(fControllerLock);
+        fControllerLock = NULL;
+    }
+    super::free();
+}
+
+MPRController *
+MPRBlockDev::copyController(void)
+{
+    if (fControllerLock == NULL) return NULL;
+    IOLockLock(fControllerLock);
+    MPRController *controller = fController;
+    if (controller != NULL) controller->retain();
+    IOLockUnlock(fControllerLock);
+    return controller;
+}
+
+void
+MPRBlockDev::refreshIdentity(void)
+{
+    IOLockLock(fControllerLock);
+    if (fController != NULL) {
+        strlcpy(fVendor, fController->getVendorString(), sizeof(fVendor));
+        strlcpy(fProduct, fController->getProductString(), sizeof(fProduct));
+        strlcpy(fRevision, fController->getRevisionString(), sizeof(fRevision));
+    }
+    IOLockUnlock(fControllerLock);
+}
+
+IOReturn
 MPRBlockDev::notifyMediaState(UInt32 state)
 {
-    /* Force reportMediaState() to report a change, even when the cached
-     * present flag already matches. IOBlockStorageDriver only re-probes the
-     * partition table when mediaStateHasChanged() sees a transition. */
-    fForceMediaStateChange = true;
-    messageClients(kIOMessageMediaStateHasChanged,
-                   (void *)(uintptr_t)state);
+    if (state == kIOMediaStateOnline) refreshIdentity();
+    /* Deliver to the matched storage driver and preserve its actual result.
+     * messageClients() does not expose each recipient's failure. In
+     * particular, ONLINE is rejected while the old IOMedia still exists.
+     * The controller must call this with no transport lock held. */
+    IOBlockStorageDriver *driver = NULL;
+    OSIterator *iter = getClientIterator();
+    if (iter != NULL) {
+        OSObject *object;
+        while ((object = iter->getNextObject()) != NULL) {
+            driver = OSDynamicCast(IOBlockStorageDriver, object);
+            if (driver != NULL) {
+                driver->retain();
+                break;
+            }
+        }
+        iter->release();
+    }
+    if (driver == NULL) {
+        return kIOReturnNotAttached;
+    }
+    /* Initial matching may have accepted the new media before a deferred
+     * ONLINE notification. OFFLINE is always delivered explicitly. */
+    if (state == kIOMediaStateOnline &&
+        driver->getMediaState() == kIOMediaStateOnline) {
+        driver->release();
+        return kIOReturnSuccess;
+    }
+    IOReturn result = messageClient(kIOMessageMediaStateHasChanged, driver,
+                                    (void *)(uintptr_t)state);
+    driver->release();
+    return result;
 }
 
 bool
@@ -48,14 +112,21 @@ MPRBlockDev::start(IOService *provider)
 void
 MPRBlockDev::stop(IOService *provider)
 {
-    fController = NULL;
+    setController(NULL);
     super::stop(provider);
 }
 
 void
 MPRBlockDev::setController(MPRController *controller)
 {
+    if (fControllerLock == NULL) return;
+    if (controller != NULL) controller->retain();
+    IOLockLock(fControllerLock);
+    MPRController *previous = fController;
     fController = controller;
+    IOLockUnlock(fControllerLock);
+    if (previous != NULL) previous->release();
+    if (controller != NULL) refreshIdentity();
 }
 
 IOReturn
@@ -80,19 +151,19 @@ MPRBlockDev::doGetFormatCapacities(UInt64 *capacities,
 char *
 MPRBlockDev::getVendorString(void)
 {
-    return fController != NULL ? fController->getVendorString() : kMPREmptyString;
+    return fVendor;
 }
 
 char *
 MPRBlockDev::getProductString(void)
 {
-    return fController != NULL ? fController->getProductString() : kMPREmptyString;
+    return fProduct;
 }
 
 char *
 MPRBlockDev::getRevisionString(void)
 {
-    return fController != NULL ? fController->getRevisionString() : kMPREmptyString;
+    return fRevision;
 }
 
 char *
@@ -106,10 +177,11 @@ MPRBlockDev::reportBlockSize(UInt64 *blockSize)
 {
     UInt64 size;
 
-    if (blockSize == NULL || fController == NULL) {
-        return kIOReturnBadArgument;
-    }
-    size = fController->getBlockSize();
+    if (blockSize == NULL) return kIOReturnBadArgument;
+    MPRController *controller = copyController();
+    if (controller == NULL) return kIOReturnNoMedia;
+    size = controller->getBlockSize();
+    controller->release();
     if (size == 0) {
         return kIOReturnNoMedia;
     }
@@ -132,10 +204,11 @@ MPRBlockDev::reportMaxValidBlock(UInt64 *maxBlock)
 {
     UInt64 blocks;
 
-    if (maxBlock == NULL || fController == NULL) {
-        return kIOReturnBadArgument;
-    }
-    blocks = fController->getCapacityBlocks();
+    if (maxBlock == NULL) return kIOReturnBadArgument;
+    MPRController *controller = copyController();
+    if (controller == NULL) return kIOReturnNoMedia;
+    blocks = controller->getCapacityBlocks();
+    controller->release();
     if (blocks == 0) {
         return kIOReturnNoMedia;
     }
@@ -149,17 +222,14 @@ MPRBlockDev::reportMediaState(bool *mediaPresent, bool *changedState)
     if (mediaPresent == NULL) {
         return kIOReturnBadArgument;
     }
-    bool present = (fController != NULL) &&
-                   !fController->isDeviceOffline() &&
-                   (fController->getCapacityBlocks() != 0) &&
-                   (fController->getBlockSize() != 0);
+    MPRController *controller = copyController();
+    bool present = controller != NULL && controller->isMediaPresent();
+    if (controller != NULL) controller->release();
 
     *mediaPresent = present;
     if (changedState != NULL) {
-        *changedState = (present != fLastMediaPresent) ||
-                        fForceMediaStateChange;
+        *changedState = (present != fLastMediaPresent);
     }
-    fForceMediaStateChange = false;
     fLastMediaPresent = present;
     return kIOReturnSuccess;
 }
@@ -183,8 +253,9 @@ MPRBlockDev::reportWriteProtection(bool *isWriteProtected)
     /* Only publish a writable media once the target and capacity are known.
      * UNMAP is still gated in the controller and is disabled at runtime on
      * the first failure (risk R11). */
-    *isWriteProtected = (fController == NULL ||
-                         fController->getCapacityBlocks() == 0);
+    MPRController *controller = copyController();
+    *isWriteProtected = controller == NULL || !controller->isMediaPresent();
+    if (controller != NULL) controller->release();
     return kIOReturnSuccess;
 }
 
@@ -198,9 +269,9 @@ MPRBlockDev::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     IOReturn status;
     bool    write, fua;
 
-    if (buffer == NULL || completion == NULL || fController == NULL) {
-        return kIOReturnBadArgument;
-    }
+    if (buffer == NULL || completion == NULL) return kIOReturnBadArgument;
+    MPRController *controller = copyController();
+    if (controller == NULL) return kIOReturnNoMedia;
 
     /* A descriptor with kIODirectionOut carries data from memory to the
      * device; kIODirectionIn carries data read from the device. */
@@ -211,8 +282,9 @@ MPRBlockDev::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     /* MPRController::transferBlocks() completes synchronously; the completion
      * is invoked after the controller lock has been released, so a client that
      * immediately issues another request cannot deadlock on that lock. */
-    status = fController->transferBlocks(write, buffer, block, nblks,
-                                         fua, &actualBytes);
+    status = controller->transferBlocks(write, buffer, block, nblks,
+                                        fua, &actualBytes);
+    controller->release();
     if (completion->action != NULL) {
         completion->action(completion->target, completion->parameter,
                            status, actualBytes);
@@ -224,8 +296,11 @@ IOReturn
 MPRBlockDev::doSynchronizeCache(void)
 {
     /* Deprecated entry point, kept for older IOStorageFamily clients. */
-    return (fController != NULL) ? fController->synchronizeCache(0, 0, false)
-                                 : kIOReturnNotReady;
+    MPRController *controller = copyController();
+    if (controller == NULL) return kIOReturnNoMedia;
+    IOReturn status = controller->synchronizeCache(0, 0, false);
+    controller->release();
+    return status;
 }
 
 IOReturn
@@ -234,18 +309,20 @@ MPRBlockDev::doSynchronize(UInt64 block, UInt64 nblks,
 {
     bool barrier = (options & kIOStorageSynchronizeOptionBarrier) != 0;
 
-    if (fController == NULL) {
-        return kIOReturnNotReady;
-    }
-    return fController->synchronizeCache(block, nblks, barrier);
+    MPRController *controller = copyController();
+    if (controller == NULL) return kIOReturnNoMedia;
+    IOReturn status = controller->synchronizeCache(block, nblks, barrier);
+    controller->release();
+    return status;
 }
 
 IOReturn
 MPRBlockDev::doUnmap(IOBlockStorageDeviceExtent *extents,
                      UInt32 extentsCount, IOStorageUnmapOptions options)
 {
-    if (fController == NULL) {
-        return kIOReturnNotReady;
-    }
-    return fController->unmapBlocks(extents, extentsCount);
+    MPRController *controller = copyController();
+    if (controller == NULL) return kIOReturnNoMedia;
+    IOReturn status = controller->unmapBlocks(extents, extentsCount);
+    controller->release();
+    return status;
 }
