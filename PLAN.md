@@ -463,7 +463,25 @@ macOS 通过 FSKit 挂载卷后会写元数据。
 4. 验收：读/写吞吐对比、`bs=512` 小请求不退化、写在途与读在途各一轮真实
    拔插、`MPRWriteCount` 计数口径与新批处理对齐。
 
-### 10.7 仍然不覆盖的范围
+### 10.7 电源管理（2026-11-12，0.17.24）
+
+睡眠不再借用 `fStopping`：只置 `fSuspended`，块 I/O 以 `MPRBlockRejectReason=suspended` 拒绝，watchdog 在睡眠期间不调度热插拔线程。唤醒时清 `fSuspended` 并置 `fHotplugPending` + `fMediaOfflinePending`，由工作线程完成"下线 → 受限复位 → 重新探测 → 重新发布"，不再让用户第一笔 I/O 去撞失效的 IOC。
+
+关键前提：此前 PM 回调从未被调用，因为没有 `PMinit()`/`registerPowerDriver()`，`MPRPowerState` 属性根本不存在。0.17.24 在 `start()` 末尾注册两态电源驱动（off/on），在 `stop()` 中 `PMstop()`。
+
+实测（`pmset sleepnow` → 40 秒 → NanoKVM gpio503 短按唤醒）：
+
+| 项 | 结果 |
+|---|---|
+| 入睡 | `Sleeping now...` rc=0 |
+| 唤醒 | 主机醒来，未重启；`MPRPowerState=wake`（证明回调已执行） |
+| 媒体 | 自动重建：generation 1→3、`ResetCount=1`、`disk5s2` 恢复 |
+| 唤醒后读取 | 64 MiB 退出 0，0.47 s（142.8 MB/s） |
+| 故障 | `MPRStickyFaultCode=3`（唤醒后首个管理命令超时，随后由复位收敛），无 panic |
+
+环境注意：`pmset sleepnow` 会被 `bluetoothd`、`mds`/`mds_stores` 断言与外置卷阻止并返回 `0xE00002E2`；需先卸载外置卷并临时 `mdutil -a -i off`，测试后恢复。
+
+### 10.8 仍然不覆盖的范围
 
 单目标、直连 SATA 原型：没有多目标隔离，没有逐目标 TARGET_RESET /
 REMOVE_DEVICE 协议，没有 SAS expander 或 RAID 卷；仍是单一暂存缓冲 + `fIOLock`

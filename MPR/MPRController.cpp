@@ -75,6 +75,23 @@ enum {
     kMPRProtocolInterruptUnavailable
 };
 
+/* Power management. Without registerPowerDriver() the powerState* overrides
+ * are never called, so sleep and wake bypassed this driver entirely and the
+ * first post-wake IO had to discover that the IOC lost its state. Two states
+ * are enough: a child driver only needs to be told when the system leaves the
+ * working state and when it comes back. */
+enum {
+    kMPRPowerOff = 0,
+    kMPRPowerOn
+};
+static const unsigned long kMPRPowerStateCount = 2;
+
+static IOPMPowerState gMPRPowerStates[kMPRPowerStateCount] = {
+    { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { kIOPMPowerStateVersion1, kIOPMPowerOn | kIOPMDeviceUsable,
+      kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 }
+};
+
 struct MPRRegisterInfo
 {
     const char *name;
@@ -3377,7 +3394,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.23");
+    setProperty("MPRBuild", "0.17.24");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3451,6 +3468,12 @@ MPRController::start(IOService *provider)
     setProperty("MPRReplyViaIrq", (unsigned long long)fReplyViaIrq, 32);
     setProperty("MPREventCount", (unsigned long long)fEventCount, 32);
     setProperty("MPRLastEvent", (unsigned long long)fLastEvent, 16);
+    /* Join the power tree only once the controller is usable, so a sleep
+     * arriving during bring-up cannot race the discovery path. */
+    PMinit();
+    provider->joinPMtree(this);
+    registerPowerDriver(this, gMPRPowerStates, kMPRPowerStateCount);
+    setProperty("MPRPowerState", "on");
     IOLog("MPR start complete, irq=%u replyViaIrq=%u events=%u last=0x%04x\n",
           (unsigned int)fInterruptCount, (unsigned int)fReplyViaIrq,
           (unsigned int)fEventCount, (unsigned int)fLastEvent);
@@ -3548,6 +3571,9 @@ MPRController::stop(IOService *provider)
         fWorkLoop->release();
         fWorkLoop = NULL;
     }
+    /* Leave the power tree only after the hardware is quiesced: PMstop()
+     * waits for an in-flight power transition to finish. */
+    PMstop();
     super::stop(provider);
 }
 
