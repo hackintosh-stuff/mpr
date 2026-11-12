@@ -32,6 +32,9 @@ struct MPRReplySlot
 };
 
 enum { kMPREventAckQueueDepth = 64 };
+/* Watchdog ticks between unconditional topology snapshots. Discovery cannot
+ * rely on firmware events: an expander may reattach a disk without one. */
+enum { kMPRIdleScanTicks = 5 };
 struct MPREventAckEntry
 {
     UInt16 event;
@@ -84,6 +87,9 @@ struct MPRTargetSlot
     bool   offlinePending;
     bool   onlinePending;
     bool   removalRequested;
+    /* Last completed stage of the removal protocol, so a failure is attributed
+     * to the step that produced it instead of being flattened to "requested". */
+    char   removalState[24];
     UInt32 scanToken;       /* last topology scan that listed this handle */
     UInt32 probeFailures;   /* bounded read-only probe retries for this device */
     UInt32 failureCount;
@@ -243,6 +249,19 @@ private:
      * fReplyLock and promoted into the target table by the hotplug worker,
      * which is the only context allowed to change that table. */
     volatile UInt16            fPendingRemovalHandle;
+    /* A removal that could not be proved, and controller-level recoveries that
+     * were forced by a protocol fault which no I/O waiter owned. */
+    UInt32                     fRemovalFailures;
+    UInt32                     fFaultRecoveries;
+    UInt32                     fIdleScanTicks;
+    /* A disk that leaves the fabric behind an expander is not necessarily
+     * rediscovered when it returns: without SMP there is no per-phy reset, so
+     * the IOC only re-runs discovery on PortEnable. These count the age of the
+     * removed media and the bounded rediscovery resets already spent. */
+    volatile UInt32            fRemovedMediaCount;
+    UInt32                     fRemovedAgeTicks;
+    UInt32                     fRediscoveryResets;
+    bool                       fRediscoverRequest;
 
     /* Bulk data buffer for block transfers. It stays resident
      * for the lifetime of the nub instead of being freed after one probe. */
@@ -427,6 +446,7 @@ private:
     void   invalidateTarget(MPRTargetSlot *slot);
     void   invalidateTargets(void);
     bool   retireTarget(MPRTargetSlot *slot);
+    void   setTargetRemovalState(MPRTargetSlot *slot, const char *state);
     bool   removeTargetDevice(UInt16 handle);
     bool   targetDevicePresent(UInt16 handle, bool *present, UInt64 *sasAddress);
     UInt32 liveTargetCount(void);

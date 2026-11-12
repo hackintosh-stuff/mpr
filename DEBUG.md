@@ -1,6 +1,6 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.20.0.
+Date: 2026-11-13. Driver version: 0.20.5.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
@@ -144,15 +144,39 @@ cache synchronisation is a no-op that sends no command. The nub records
 The watchdog monitors IOC state, event acknowledgement and topology work, and
 republishes the per-target counters. One worker serialises topology work under
 the transport lock and delivers media-state changes per target with no lock
-held.
+held. It also takes an unconditional snapshot every five seconds: discovery
+must not depend on firmware events, because a returned disk is not always
+announced.
 
-Each pass takes one snapshot and merges it into the target table. A target the
-fabric dropped is retired with TARGET_RESET -> drain of its aborted commands ->
-SAS IO Unit Control REMOVE_DEVICE, all naming that slot's handle, so a reset
-never lands on another target. A live handle that still carries the same SAS
-address cancels the removal; a handle now naming a different device is adopted
-as a new target and never receives the old removal. Uncertain state falls back
-to bounded controller recovery.
+Each pass merges the snapshot into the target table. A target the fabric dropped
+is retired with TARGET_RESET -> drain of its aborted commands -> SAS IO Unit
+Control REMOVE_DEVICE, all naming that slot's handle, so a reset never lands on
+another target. A live handle that still carries the same SAS address cancels
+the removal; a handle now naming a different device is adopted as a new target
+and never receives the old removal. A removal that cannot be proved is that
+target's failure (`MPRTargetNRemovalState`, `MPRRemovalFailures`), not a
+controller protocol fault, and escalates to the bounded IOC reset.
+
+Presence decides a removal: once the device page answers "absent", the medium is
+unbound locally even if REMOVE_DEVICE is refused, because the device is already
+gone from the fabric and a disk that was only reported absent is rediscovered by
+a later snapshot. Only "commands may still be in flight" keeps the medium bound
+and escalates.
+
+Behind this expander a reinserted disk is not reliably re-listed by
+GET_NEXT_HANDLE and produces no TARG_ADDED event, so enumeration alone cannot
+find it: the IOC re-runs fabric discovery only on PortEnable. The watchdog
+therefore spends at most two rediscovery resets, at 8 s and 45 s after a medium
+was retired, and then stops. Each reset interrupts the other targets: they are
+invalidated, re-probed and reported OFFLINE -> ONLINE again, which takes seconds
+to about 25 s depending on the fabric. That cost is inherent to an IOC-level
+rediscovery without per-phy SMP control.
+
+A disk that returns after REMOVE_DEVICE carries a new firmware handle. It is
+matched by SAS address to its retired slot, so its nub and IOMedia come back and
+the same BSD disk number is republished. A retired slot whose disk does not
+return is released once a fresh medium is published, so repeated replugs do not
+exhaust the target table.
 
 A target that is present but not yet published is probed in place. Probing is
 bounded per target: after three failed attempts the disk is left offline until
@@ -209,6 +233,7 @@ service release so callers retained before stop can unwind safely.
 |---|---|
 | Build and media | `MPRBuild`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady`, `MPRPublishedTargetCount` |
 | Targets | `MPRTargetCount`, `MPRTargetNHandle`, `MPRTargetNSasAddress`, `MPRTargetNPresent`, `MPRTargetNProbed`, `MPRTargetNOnline`, `MPRTargetNRemovalState`, `MPRTargetNMediaStatus`, `MPRTargetNGeneration` |
+| Discovery and removal | `MPRScanCount`, `MPRRemovedMediaCount`, `MPRRemovalFailures`, `MPRRemovalStage`, `MPRRetiredSlotsReleased`, `MPRRediscoveryResets`, `MPRRediscoveryState`, `MPRFaultRecoveries`, `MPRFaultRecoveryState` |
 | Async and DMA | `MPRAsyncRequestLimit`, `MPRAsyncCommandLimit`, `MPRAsyncPeakRequests`, `MPRMappedCommands`, `MPRChainedCommands`, `MPRBounceCommands` |
 | Identity/filter | `MPRStableIdentityValid`, `MPRStableIdentity`, `MPRIdentityState`, `MPRRaidFilterState`, `MPRStandaloneTargetCount`, `MPRSasDevicePageState` |
 | Capabilities | `MPRNativeFuaSupported`, `MPRFuaPolicy`, `MPRUnmapEnabled`, `MPRUnmapMaxLbaCount`, `MPRUnmapMaxDescriptors`, `MPRUnmapReadsZero` |
@@ -248,13 +273,12 @@ names are not macOS requirements.
 | Sleep and shutdown | FreeBSD suspend/resume return EINVAL; separate shutdown path | Native IOKit PM with per-target flush and wake revalidation |
 | Builds | OS-specific build system | All driver translation units in the CLI and Xcode builds |
 
-Outside this configuration, and not silently treated as implemented: per-target
-removal, hotplug and sleep/wake have not been exercised on hardware with a
-second target attached; multiple LUNs and general SCSI passthrough; DPM
-persistent numbering and multipath; IR logical volumes and RAID management;
-SES/enclosure control, SMP passthrough, firmware update and user-space tools;
-NVMe/PCIe/Tri-Mode, SAS2 and GEN35 hardware; direct DMA into client buffers,
-multi-queue/MSI-X scaling and tuning.
+Outside this configuration, and not silently treated as implemented: sleep and
+wake with several targets behind an expander; multiple LUNs and general SCSI
+passthrough; DPM persistent numbering and multipath; IR logical volumes and RAID
+management; SES/enclosure control, SMP passthrough, firmware update and
+user-space tools; NVMe/PCIe/Tri-Mode, SAS2 and GEN35 hardware; direct DMA into
+client buffers, multi-queue/MSI-X scaling and tuning.
 
 ## 9. Host-side checks
 

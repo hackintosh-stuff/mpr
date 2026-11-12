@@ -257,18 +257,45 @@ MPRController::readSasIOUnitPage0(void)
                 setProperty("MPRTargetReuseState", "handle-reassigned");
             }
         } else {
-            slot = allocTargetSlot();
-            if (slot == NULL) {
-                setProperty("MPRTopologyFailure", "too-many-targets");
-                return false;
+            /* A disk that returns after REMOVE_DEVICE gets a new firmware
+             * handle. Reuse the retired slot of the same SAS address when one
+             * exists, so its nub and IOMedia come back instead of leaking a
+             * slot and creating a second medium for the same disk. */
+            MPRTargetSlot *retired = NULL;
+            for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+                MPRTargetSlot *candidate = &fTargets[i];
+                /* The same SAS address means the same physical disk: reuse its
+                 * nub even if an OFFLINE notification is still owed, which the
+                 * worker delivers before ONLINE. */
+                if (candidate->handle == 0 && candidate->nub != NULL &&
+                    candidate->sasAddress == address) {
+                    retired = candidate;
+                    break;
+                }
             }
-            /* A recycled slot can still own the nub of its previous device;
-             * that nub is re-pointed when this target is published. */
-            MPRBlockDev *reusedNub = slot->nub;
-            memset(slot, 0, sizeof(*slot));
-            slot->nub = reusedNub;
-            slot->handle = handle;
-            slot->readOnly = true;
+            if (retired != NULL) {
+                slot = retired;
+                slot->handle = handle;
+                slot->probeValid = false;
+                slot->identityValid = false;
+                slot->generation++;
+                slot->removalRequested = false;
+                slot->onlinePending = false;
+                setTargetRemovalState(slot, "reinserted");
+            } else {
+                slot = allocTargetSlot();
+                if (slot == NULL) {
+                    setProperty("MPRTopologyFailure", "too-many-targets");
+                    return false;
+                }
+                /* A recycled slot can still own the nub of its previous device;
+                 * that nub is re-pointed when this target is published. */
+                MPRBlockDev *reusedNub = slot->nub;
+                memset(slot, 0, sizeof(*slot));
+                slot->nub = reusedNub;
+                slot->handle = handle;
+                slot->readOnly = true;
+            }
         }
         slot->handle = handle;
         slot->deviceInfo = info;
@@ -842,7 +869,8 @@ MPRController::publishTargetProperties(void)
         MPRTargetSlot *slot = &fTargets[i];
         if (slot->handle == 0 && slot->nub == NULL) continue;
         char name[48], address[24];
-        const char *removal = slot->removalRequested ? "requested" :
+        const char *removal = slot->removalState[0] != 0 ? slot->removalState :
+                              slot->removalRequested ? "requested" :
                               slot->present ? "live" : "gone";
         snprintf(name, sizeof(name), "MPRTarget%uHandle", (unsigned)i);
         setProperty(name, (unsigned long long)slot->handle, 16);
@@ -884,6 +912,11 @@ MPRController::publishTargetProperties(void)
 void
 MPRController::publishTargetCounters(void)
 {
+    setProperty("MPRScanCount", (unsigned long long)fScanSerial, 32);
+    setProperty("MPRRemovedMediaCount", (unsigned long long)fRemovedMediaCount, 32);
+    setProperty("MPRRemovalFailures", (unsigned long long)fRemovalFailures, 32);
+    setProperty("MPRFaultRecoveries", (unsigned long long)fFaultRecoveries, 32);
+    setProperty("MPRRediscoveryResets", (unsigned long long)fRediscoveryResets, 32);
     /* Called from the watchdog: the counters move without a topology event, so
      * they are republished periodically instead of only on publication. */
     for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
@@ -900,11 +933,19 @@ MPRController::publishTargetCounters(void)
 }
 
 void
+MPRController::setTargetRemovalState(MPRTargetSlot *slot, const char *state)
+{
+    if (slot == NULL || state == NULL) return;
+    strlcpy(slot->removalState, state, sizeof(slot->removalState));
+}
+
+void
 MPRController::requestTargetRemoval(MPRTargetSlot *slot)
 {
     if (slot == NULL || slot->handle == 0 || slot->removalRequested) return;
     slot->removalRequested = true;
-    setProperty("MPRTargetRemovalState", "requested");
+    setTargetRemovalState(slot, "requested");
+    publishTargetProperties();
 }
 
 void
@@ -1041,6 +1082,7 @@ MPRController::publishTarget(MPRTargetSlot *slot)
          * unlocked worker deliver OFFLINE -> ONLINE around the transition. */
         slot->nub->setController(this, slot->handle, slot->readOnly);
         slot->onlinePending = true;
+        setTargetRemovalState(slot, "live");
         publishTargetProperties();
         return true;
     }
@@ -1066,6 +1108,7 @@ MPRController::publishTarget(MPRTargetSlot *slot)
     slot->online = true;
     slot->offlinePending = false;
     slot->onlinePending = false;
+    setTargetRemovalState(slot, "live");
     nub->registerService();
     publishTargetProperties();
     return true;
@@ -1168,29 +1211,37 @@ MPRController::retireTarget(MPRTargetSlot *slot)
     /* Firmware expects TARGET_RESET (which aborts the commands still owned by
      * the device) followed by SAS IO Unit Control REMOVE_DEVICE. Both name the
      * removed handle explicitly: the controller's current default may point at
-     * a different, healthy target. */
+     * a different, healthy target.
+     *
+     * Presence decides the outcome. A handle that still names this device is the
+     * disk coming back; a device that has left the fabric has nothing left to
+     * reset, and the medium is unbound locally even if REMOVE_DEVICE cannot be
+     * sent. The only result that keeps the medium bound is "commands may still
+     * be in flight", which the caller escalates to a bounded IOC reset. */
     if (slot == NULL || slot->handle == 0 || !slot->removalRequested) return true;
-    if (fProtocolRecoveryPending) return false;
     const UInt16 handle = slot->handle;
     bool present = false;
     UInt64 address = 0;
-    /* A live handle that still carries the same SAS address is the device
-     * coming back; REMOVE_DEVICE would tear down the disk that just returned. */
-    if (!targetDevicePresent(handle, &present, &address)) {
-        setProperty("MPRTargetRemovalState", "state-unknown");
-        return false;
-    }
-    if (present) {
+    bool known = targetDevicePresent(handle, &present, &address);
+    if (known && present) {
         slot->removalRequested = false;
         if (address == slot->sasAddress) {
             slot->present = true;
-            setProperty("MPRTargetRemovalState", "reinsert-preserved");
+            setTargetRemovalState(slot, "reinserted");
         } else {
             /* Reused by a different device: the scan already adopted it, so
              * the new target must not receive the old removal. */
-            setProperty("MPRTargetRemovalState", "handle-reassigned");
+            setTargetRemovalState(slot, "handle-reassigned");
         }
+        publishTargetProperties();
         return true;
+    }
+    if (fProtocolRecoveryPending) {
+        /* The controller is already being repaired; a reset cannot be issued
+         * from here without a second owner of the same fault. */
+        setTargetRemovalState(slot, "recovery-pending");
+        publishTargetProperties();
+        return false;
     }
     UInt16 iocStatus = 0xFFFF;
     (void)sendTaskMgmt(MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET, 0, 28, handle,
@@ -1198,36 +1249,35 @@ MPRController::retireTarget(MPRTargetSlot *slot)
     setProperty("MPRTargetResetStatus", (unsigned long long)iocStatus, 16);
     if (iocStatus == 0xFFFF) {
         /* No completion at all: the firmware may still own the request frame. */
-        setProperty("MPRTargetRemovalState", "reset-reply-timeout");
+        setTargetRemovalState(slot, "reset-reply-timeout");
+        publishTargetProperties();
         return false;
     }
     /* A reset that answered with a non-success status usually means the device
-     * is already gone; the drain below is the evidence that its commands have
-     * finished, so the removal continues either way. */
-    /* The TMF reply consumes its own SMID but not the SCSI replies it aborted;
-     * drain those before asking the IOC to drop the device. */
+     * is already gone; the drain below is the evidence that matters. The TMF
+     * reply consumes its own SMID but not the SCSI replies it aborted. */
     if (!drainTaskManagedCommands(handle, 0, true) || fProtocolRecoveryPending) {
-        setProperty("MPRTargetRemovalState", "commands-still-owned");
+        setTargetRemovalState(slot, "commands-still-owned");
+        publishTargetProperties();
         return false;
     }
-    if (!targetDevicePresent(handle, &present, &address)) {
-        setProperty("MPRTargetRemovalState", "state-unknown");
-        return false;
-    }
-    if (present) {
+    known = targetDevicePresent(handle, &present, &address);
+    if (known && present) {
         slot->removalRequested = false;
         if (address == slot->sasAddress) {
             slot->present = true;
-            setProperty("MPRTargetRemovalState", "reinsert-during-reset-preserved");
+            setTargetRemovalState(slot, "reinserted-during-reset");
         } else {
-            setProperty("MPRTargetRemovalState", "handle-reassigned-during-reset");
+            setTargetRemovalState(slot, "handle-reassigned-during-reset");
         }
+        publishTargetProperties();
         return true;
     }
-    if (!removeTargetDevice(handle)) {
-        setProperty("MPRTargetRemovalState", "remove-failed");
-        return false;
-    }
+    /* The device is gone from the fabric. A failed or unanswered REMOVE_DEVICE
+     * is not a reason to keep the medium bound: the slot is detached locally,
+     * and a disk that was only reported absent is rediscovered by the next
+     * scan and published again. */
+    const bool removed = removeTargetDevice(handle);
     slot->removalRequested = false;
     slot->present = false;
     slot->probeValid = false;
@@ -1239,7 +1289,7 @@ MPRController::retireTarget(MPRTargetSlot *slot)
         slot->offlinePending = true;
     }
     slot->handle = 0;   /* free the firmware address; the nub stays offline */
-    setProperty("MPRTargetRemovalState", "removed");
+    setTargetRemovalState(slot, removed ? "removed" : "removed-unconfirmed");
     publishTargetProperties();
     return true;
 }

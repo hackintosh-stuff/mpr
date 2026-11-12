@@ -1,6 +1,6 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.20.0.
+Date: 2026-11-13. Driver version: 0.20.5.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes every eligible
@@ -33,11 +33,20 @@ system the array member's read-only media was reported as such, raw reads at LBA
 write was attributed to the writable target while the array member's write count
 stayed zero.
 
-Not covered: per-target removal, hotplug and sleep/wake have not been repeated
-on hardware with the second target attached; SAS/SSP write paths, multipath,
-multiple LUNs, enclosure services, long duration or concurrent stress, and
-throughput tuning are out of scope. Wire-format and large-LBA cases are checked
-on the host, not on this hardware.
+Pulling either disk while the other stays published was also exercised. The
+dropped target is retired with TARGET_RESET, a drain of its aborted commands and
+SAS IO Unit Control REMOVE_DEVICE, all naming that handle; its medium goes
+offline and the other target keeps serving I/O. A returned disk is re-probed and
+republished, matched by SAS address, so the same disk number comes back rather
+than a second medium for the same drive. Reinsertion behind this expander is not
+announced, so the driver spends at most two bounded IOC resets (8 s and 45 s
+after the removal) to re-run fabric discovery; each takes seconds to about 25 s,
+during which the other targets are briefly offline.
+
+Not covered: sleep and wake with two targets behind the expander; SAS/SSP write
+paths, multipath, multiple LUNs, enclosure services, long duration or concurrent
+stress, and throughput tuning are out of scope. Wire-format and large-LBA cases
+are checked on the host, not on this hardware.
 
 ## Capabilities
 

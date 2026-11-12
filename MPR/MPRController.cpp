@@ -3012,6 +3012,13 @@ MPRController::start(IOService *provider)
     fRemovalPending = false;
     fHotplugRetryRequested = false;
     fPendingRemovalHandle = 0;
+    fRemovalFailures = 0;
+    fFaultRecoveries = 0;
+    fIdleScanTicks = 0;
+    fRemovedMediaCount = 0;
+    fRemovedAgeTicks = 0;
+    fRediscoveryResets = 0;
+    fRediscoverRequest = false;
     fScanSerial = 0;
     fTargetCount = 0;
     memset(fTargets, 0, sizeof(fTargets));
@@ -3100,7 +3107,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.20.0");
+    setProperty("MPRBuild", "0.20.5");
     setProperty("MPRFeatures",
                 "async-pool,ieee-sgl-chain,read-write16,cache16,unmap-limits,"
                 "stable-identity,raid-filter,auto-sense,tmf,remove-device,pm-quiesce");
@@ -4005,6 +4012,31 @@ MPRController::watchdogTimeout(IOTimerEventSource *sender)
     if (fReplyLock != NULL) {
         IOSimpleLockLock(fReplyLock);
         if (fHotplugCooldown != 0) fHotplugCooldown--;
+        if (fRemovedMediaCount != 0) {
+            fRemovedAgeTicks++;
+            /* Without SMP there is no per-phy reset behind an expander, and a
+             * disk that returns is only re-listed by a fresh PortEnable
+             * discovery. Spend at most two resets on that, at 8 s and 45 s
+             * after the medium was retired. */
+            if ((fRemovedAgeTicks == 8 || fRemovedAgeTicks == 45) &&
+                fRediscoveryResets < 2) {
+                fRediscoverRequest = true;
+                fHotplugPending = true;
+            }
+        } else {
+            fRemovedAgeTicks = 0;
+            fRediscoveryResets = 0;
+            fRediscoverRequest = false;
+        }
+        /* Discovery cannot depend on firmware events alone: an expander can
+         * reattach a disk without reporting an add, and a device that was
+         * removed by REMOVE_DEVICE is only re-listed by enumeration. A slow
+         * periodic snapshot keeps hotplug event-independent at a bounded cost. */
+        if (++fIdleScanTicks >= kMPRIdleScanTicks) {
+            fIdleScanTicks = 0;
+            if (!fStarting && !fReinitInProgress && !fHotplugRunning && !fSuspended)
+                fHotplugPending = true;
+        }
         if (!fStarting && !fReinitInProgress && !fHotplugRunning &&
             !fSuspended && fHotplugPending && fHotplugCooldown == 0 &&
             fHotplugCall != NULL) {
@@ -4051,8 +4083,9 @@ MPRController::hotplugThread(void)
         IOReturn status;
     };
     MPRNotifyAction actions[2 * kMPRMaxTargets];
-    UInt32 generation = 0, actionCount = 0, live = 0;
-    bool retry = false, resetNeeded = false, probeFailed = false;
+    UInt32 generation = 0, actionCount = 0, live = 0, cooldown = 1;
+    bool retry = false, resetNeeded = false, probeFailed = false, dirty = false;
+    bool publishedNew = false;
     bool retryRequested = false, physicalChange = false;
     UInt16 pendingRemoval = 0;
     const char *state = "stopped";
@@ -4084,6 +4117,23 @@ MPRController::hotplugThread(void)
      * A handle that is still listed keeps its nub and medium; a vanished one
      * is marked for the guarded removal sequence. */
     if (!allocatePageBuffer() || !readSasIOUnitPage0()) {
+        if (fProtocolRecoveryPending) {
+            /* A protocol fault blocks every config-page read and every posted
+             * command. An I/O waiter would run its own reset under this lock,
+             * so a fault still pending here has no owner: drive one bounded
+             * reset, or the controller stays frozen with healthy targets in
+             * the table. */
+            fFaultRecoveries++;
+            setProperty("MPRResetInitiator", "protocol-fault");
+            bool ok = resetAndReinitialize();
+            setProperty("MPRFaultRecoveryState", ok ? "ok" : "failed");
+            setProperty("MPRFaultRecoveryCount",
+                        (unsigned long long)fFaultRecoveries, 32);
+            cooldown = 5;
+            retry = true;
+            state = ok ? "fault-recovered" : "fault-recovery-failed";
+            goto done;
+        }
         state = "topology-read-failed";
         retry = true;
         goto done;
@@ -4103,13 +4153,18 @@ MPRController::hotplugThread(void)
     }
 
     /* 2. Retire what the fabric dropped: TARGET_RESET, drain of the aborted
-     * commands, then REMOVE_DEVICE, each naming this slot's handle. A target
-     * whose removal cannot be proved goes through the bounded IOC reset. */
+     * commands, then REMOVE_DEVICE, each naming this slot's handle. A removal
+     * that cannot be proved is this target's failure, not a controller
+     * protocol fault, and escalates to the bounded IOC reset. */
     for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
         MPRTargetSlot *slot = &fTargets[i];
         if (!slot->removalRequested) continue;
+        dirty = true;
         if (!retireTarget(slot)) {
-            recordProtocolFault(kMPRTargetRemovalUncertain, slot->handle);
+            fRemovalFailures++;
+            setProperty("MPRTargetRemovalFailures",
+                        (unsigned long long)fRemovalFailures, 32);
+            setProperty("MPRRemovalStage", slot->removalState);
             resetNeeded = true;
             break;
         }
@@ -4123,6 +4178,7 @@ MPRController::hotplugThread(void)
         for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
             MPRTargetSlot *slot = &fTargets[i];
             if (slot->handle == 0 || !slot->present) continue;
+            dirty = true;
             if (!slot->probeValid) {
                 if (slot->probeFailures >= 3) continue;
                 if (!probeTarget(slot)) {
@@ -4136,11 +4192,62 @@ MPRController::hotplugThread(void)
                 }
                 slot->probeFailures = 0;
             }
+            const bool freshNub = (slot->nub == NULL);
             if (!publishTarget(slot)) {
                 slot->failureCount++;
                 probeFailed = true;
+            } else if (freshNub) {
+                publishedNew = true;
             }
         }
+    }
+
+    /* 3c. A disk that came back under a new handle leaves the retired slot
+     * holding an offline nub and a table index. Both are dead weight once a
+     * fresh medium was published; release them without the transport lock so
+     * client termination may re-enter. */
+    if (publishedNew) {
+        UInt32 stale = 0;
+        for (UInt32 i = 0; i < kMPRMaxTargets && stale < 2 * kMPRMaxTargets; i++) {
+            MPRTargetSlot *slot = &fTargets[i];
+            if (slot->nub == NULL || slot->handle != 0 || slot->offlinePending ||
+                slot->removalRequested) continue;
+            slot->nub->retain();
+            actions[stale].index = i;
+            actions[stale].nub = slot->nub;
+            actions[stale].online = false;
+            actions[stale].status = kIOReturnSuccess;
+            stale++;
+            memset(slot, 0, sizeof(*slot));
+            dirty = true;
+        }
+        if (stale != 0) {
+            IOLockUnlock(fIOLock);
+            for (UInt32 a = 0; a < stale; a++) {
+                actions[a].nub->terminate();
+                actions[a].nub->release();
+            }
+            IOLockLock(fIOLock);
+            setProperty("MPRRetiredSlotsReleased",
+                        (unsigned long long)stale, 32);
+        }
+    }
+
+    /* 3b. A medium that left the fabric may return without an add event; the
+     * watchdog asks for one bounded rediscovery reset after the removal. It
+     * re-runs PortEnable discovery, which is the only way the IOC re-lists a
+     * device behind an expander without per-phy SMP control. */
+    if (fRediscoverRequest && !fStopping) {
+        fRediscoverRequest = false;
+        fRediscoveryResets++;
+        setProperty("MPRResetInitiator", "removed-rediscovery");
+        bool ok = resetAndReinitialize();
+        setProperty("MPRRediscoveryState", ok ? "reset" : "failed");
+        setProperty("MPRRediscoveryCount",
+                    (unsigned long long)fRediscoveryResets, 32);
+        state = ok ? "rediscovery-reset" : "rediscovery-failed";
+        retry = true;
+        goto done;
     }
 
     /* 4. Deliver media-state changes per target. Notifications can re-enter the
@@ -4167,6 +4274,7 @@ MPRController::hotplugThread(void)
             actionCount++;
         }
         if (actionCount == 0) continue;
+        dirty = true;
         IOLockUnlock(fIOLock);
         for (UInt32 a = 0; a < actionCount; a++) {
             actions[a].status = actions[a].nub->notifyMediaState(
@@ -4252,6 +4360,16 @@ done:
      * when this pass ended on an error path. */
     live = liveTargetCount();
     fMediaPresent = live != 0;
+    {
+        /* A retired medium keeps its nub for the next insertion; its age drives
+         * the bounded rediscovery reset in the watchdog. */
+        UInt32 removedMedia = 0;
+        for (UInt32 i = 0; i < kMPRMaxTargets; i++)
+            if (fTargets[i].handle == 0 && fTargets[i].nub != NULL) removedMedia++;
+        IOSimpleLockLock(fReplyLock);
+        fRemovedMediaCount = removedMedia;
+        IOSimpleLockUnlock(fReplyLock);
+    }
     setProperty("MPRHotplugState", state);
     setProperty("MPRMediaPresent", fMediaPresent);
     setProperty("MPRDeviceOffline", fDeviceOffline);
@@ -4259,14 +4377,16 @@ done:
     setProperty("MPRHotplugAttempts", (unsigned long long)fHotplugAttempts, 32);
     setProperty("MPRHotplugHandle", (unsigned long long)fAttachedDevHandle, 16);
     setProperty("MPRHotplugBlockDev", live != 0);
-    publishTargetProperties();
+    /* A periodic pass that changed nothing must not rewrite the whole target
+     * property set; the watchdog republishes the counters anyway. */
+    if (dirty) publishTargetProperties();
     IOSimpleLockLock(fReplyLock);
     if (generation == fTopologyGeneration && !fHotplugPending && !retry) {
         fTopologyChanged = false;
     }
     if (retry) {
         fHotplugPending = true;
-        fHotplugCooldown = 1;
+        fHotplugCooldown = cooldown;
     }
     fHotplugRunning = false;
     IOSimpleLockUnlock(fReplyLock);
