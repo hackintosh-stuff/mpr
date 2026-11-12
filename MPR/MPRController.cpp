@@ -2712,6 +2712,7 @@ MPRController::start(IOService *provider)
     /* Ignore discovery noise for the first seconds after boot; the initial
      * media is already published by start(). Real cable swaps happen later. */
     fHotplugCooldown = 10;
+    fHotplugRebuild = false;
     fInjectTimeout = false;
     fInjectTmfFail = 0;
     fFastPathEnabled = false;
@@ -2753,7 +2754,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.10");
+    setProperty("MPRBuild", "0.17.12");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3450,26 +3451,18 @@ MPRController::hotplugThread(void)
     }
 
     /* While the target is gone, do not reset the controller on every retry.
-     * Probe discovery first; when it is still absent, drop the stale nub and
-     * keep a short retry armed. */
+     * Keep the existing nub and media contract: terminate() is asynchronous,
+     * so tearing the nub down here leaves the old IOMedia registered when the
+     * reappeared device publishes a new one (duplicate disks). */
     if (fAttachedDevHandle == 0) {
         fReplyCount = 0;
         fLastReplyKind = 0;
         fLastReplySmid = 0xFFFF;
         if (!readSasIOUnitPage0() || fAttachedDevHandle == 0) {
-            if (fBlockDev != NULL) {
-                fBlockDev->setController(NULL);
-                fBlockDev->terminate();
-                fBlockDev->detach(this);
-                fBlockDev->release();
-                fBlockDev = NULL;
-            }
-            fCapacityBlocks = 0;
-            fBlockSize = 0;
-            fDeviceOffline = true;
             setProperty("MPRHotplugState", "removed");
             setProperty("MPRHotplugResetResult", "waiting");
-            setProperty("MPRHotplugBlockDev", 0ULL, 8);
+            setProperty("MPRHotplugBlockDev",
+                        (unsigned long long)(fBlockDev != NULL ? 1 : 0), 8);
             setProperty("MPRHotplugHandle", 0ULL, 16);
             fHotplugPending = true;
             fHotplugCooldown = 1;
@@ -3480,7 +3473,9 @@ MPRController::hotplugThread(void)
     /* Present (or reappeared): rebuild via the verified reset path. Clear the
      * offline gate so IOBlockStorageDriver can read LBA1 while probing. */
     fDeviceOffline = false;
+    fHotplugRebuild = true;
     resetOk = resetAndReinitialize();
+    fHotplugRebuild = false;
     setProperty("MPRHotplugResetResult", resetOk ? "ok" : "failed");
     setProperty("MPRHotplugBlockDev",
                 (unsigned long long)(fBlockDev != NULL ? 1 : 0), 8);
@@ -3498,6 +3493,50 @@ MPRController::hotplugThread(void)
         fHotplugPending = true;
         fHotplugCooldown = 1;
     }
+}
+
+bool
+MPRController::wholeMediaHasPartitions(void)
+{
+    OSIterator *iter;
+    IORegistryEntry *child;
+    IOBlockStorageDriver *driver = NULL;
+    bool partitioned = false;
+
+    if (fBlockDev == NULL) {
+        return false;
+    }
+    iter = fBlockDev->getChildIterator(gIOServicePlane);
+    if (iter == NULL) {
+        return false;
+    }
+    while ((child = (IORegistryEntry *)iter->getNextObject()) != NULL) {
+        driver = OSDynamicCast(IOBlockStorageDriver, child);
+        if (driver != NULL) {
+            break;
+        }
+    }
+    iter->release();
+    if (driver == NULL) {
+        return false;
+    }
+    iter = driver->getChildIterator(gIOServicePlane);
+    if (iter == NULL) {
+        return false;
+    }
+    while ((child = (IORegistryEntry *)iter->getNextObject()) != NULL) {
+        IOMedia *media = OSDynamicCast(IOMedia, child);
+
+        if (media != NULL &&
+            media->getProperty(kIOMediaWholeKey) == kOSBooleanTrue) {
+            /* A whole media with an empty Content is a leaf, so no partition
+             * scheme matched it. Only that case needs a new nub. */
+            partitioned = (media->getProperty("Leaf") != kOSBooleanTrue);
+            break;
+        }
+    }
+    iter->release();
+    return partitioned;
 }
 
 void
@@ -3646,17 +3685,22 @@ MPRController::resetAndReinitialize(void)
     setProperty("MPRResetCount", (unsigned long long)fResetCount, 32);
     if (ok) {
         /* IOMedia's Content is fixed when the media object is created, so a
-         * property write cannot re-run the GPT probe. Rebuild the nub and let
-         * IOBlockStorageDriver create a new media and read LBA1 again. */
-        if (fBlockDev != NULL) {
-            fBlockDev->setController(NULL);
-            fBlockDev->terminate();
-            fBlockDev->detach(this);
-            fBlockDev->release();
-            fBlockDev = NULL;
+         * property write cannot re-run the GPT probe. A TMF/timeout reset
+         * always rebuilds the nub (0.15.10 partition rescan). A cable-swap
+         * reset reuses an intact nub, otherwise the asynchronously terminated
+         * old media stays registered and a duplicate disk appears. */
+        if (!fHotplugRebuild || fBlockDev == NULL ||
+            !wholeMediaHasPartitions()) {
+            if (fBlockDev != NULL) {
+                fBlockDev->setController(NULL);
+                fBlockDev->terminate();
+                fBlockDev->detach(this);
+                fBlockDev->release();
+                fBlockDev = NULL;
+            }
+            IOSleep(500);
+            ok = publishBlockDevice();
         }
-        IOSleep(500);
-        ok = publishBlockDevice();
     }
     return ok;
 }

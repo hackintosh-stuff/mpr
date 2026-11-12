@@ -111,6 +111,7 @@ private:
     thread_call_t              fHotplugCall;
     volatile bool              fHotplugPending;
     volatile UInt32            fHotplugCooldown;
+    bool                       fHotplugRebuild;  /* reset came from a cable swap */
     UInt32                     fHighPriorityCredit;
     volatile UInt32            fEventReplyCount;
     volatile UInt32            fEventAckCount;
@@ -160,6 +161,7 @@ private:
                                 int index);
     void   processReplyQueue(void);
     void   rescanPartitions(void);
+    bool   wholeMediaHasPartitions(void);
     void   watchdogTimeout(IOTimerEventSource *sender);
     void   hotplugThread(void);
     static void hotplugCall(thread_call_param_t param0,
