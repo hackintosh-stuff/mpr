@@ -2602,10 +2602,11 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
         status = kIOReturnNoMedia;
         goto out;
     }
-    if (fDeviceOffline || fStopping || fReinitInProgress ||
+    if (fSuspended || fDeviceOffline || fStopping || fReinitInProgress ||
         fProtocolRecoveryPending || fDataBuffer == NULL ||
         fPageBuffer == NULL || fCapacityBlocks == 0 || fBlockSize == 0) {
         setProperty("MPRBlockRejectReason",
+                    fSuspended ? "suspended" :
                     fStopping ? "stopping" :
                     fReinitInProgress ? "reinit" :
                     fDeviceOffline ? "device-offline" :
@@ -3376,7 +3377,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.22");
+    setProperty("MPRBuild", "0.17.23");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3556,11 +3557,10 @@ MPRController::powerStateWillChangeTo(IOPMPowerFlags capabilities,
                                       IOService *whatDevice)
 {
     if ((capabilities & kIOPMPowerOn) == 0) {
-        /* Sleep: stop accepting new IO. The controller is revalidated by the
-         * next IO after wake; an HBA that lost state will time out and drive
-         * the normal TMF/reset recovery. */
+        /* Sleep refuses new IO through fSuspended alone. fStopping keeps its
+         * own meaning (the driver is going away) so stop() and the watchdog
+         * are not confused by a power transition. */
         fSuspended = true;
-        fStopping = true;
         setProperty("MPRPowerState", "sleep");
     }
     return super::powerStateWillChangeTo(capabilities, stateNumber, whatDevice);
@@ -3572,9 +3572,16 @@ MPRController::powerStateDidChangeTo(IOPMPowerFlags capabilities,
                                      IOService *whatDevice)
 {
     if ((capabilities & kIOPMPowerOn) != 0 && fSuspended) {
+        /* Across a power transition the IOC can lose PortEnable, its event
+         * subscription and the target itself. Rebuild instead of letting the
+         * first user IO discover that: request an offline plus the bounded
+         * reinitialise/reprobe/publish the worker already owns. */
         fSuspended = false;
-        fStopping = false;
         setProperty("MPRPowerState", "wake");
+        IOSimpleLockLock(fReplyLock);
+        fHotplugPending = true;
+        fMediaOfflinePending = true;
+        IOSimpleLockUnlock(fReplyLock);
     }
     return super::powerStateDidChangeTo(capabilities, stateNumber, whatDevice);
 }
@@ -4173,7 +4180,8 @@ MPRController::watchdogTimeout(IOTimerEventSource *sender)
         IOSimpleLockLock(fReplyLock);
         if (fHotplugCooldown != 0) fHotplugCooldown--;
         if (!fStarting && !fReinitInProgress && !fHotplugRunning &&
-            fHotplugPending && fHotplugCooldown == 0 && fHotplugCall != NULL) {
+            !fSuspended && fHotplugPending && fHotplugCooldown == 0 &&
+            fHotplugCall != NULL) {
             /* Consume only this scheduling token. An event arriving while
              * the worker runs sets it again and must survive completion. */
             fHotplugPending = false;
