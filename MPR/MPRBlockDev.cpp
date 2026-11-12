@@ -14,6 +14,8 @@ MPRBlockDev::init(OSDictionary *properties)
     fController = NULL;
     fControllerLock = NULL;
     fLastMediaPresent = false;
+    fDevHandle = 0;
+    fReadOnly = true;
     bzero(fVendor, sizeof(fVendor));
     bzero(fProduct, sizeof(fProduct));
     bzero(fRevision, sizeof(fRevision));
@@ -117,16 +119,26 @@ MPRBlockDev::stop(IOService *provider)
 }
 
 void
-MPRBlockDev::setController(MPRController *controller)
+MPRBlockDev::setController(MPRController *controller, UInt16 handle, bool readOnly)
 {
     if (fControllerLock == NULL) return;
     if (controller != NULL) controller->retain();
     IOLockLock(fControllerLock);
     MPRController *previous = fController;
     fController = controller;
+    if (controller != NULL) {
+        fDevHandle = handle;
+        fReadOnly = readOnly;
+    } else {
+        fReadOnly = true;
+    }
     IOLockUnlock(fControllerLock);
     if (previous != NULL) previous->release();
-    if (controller != NULL) refreshIdentity();
+    if (controller != NULL) {
+        refreshIdentity();
+        setProperty("MPRBlockDevReadOnly", fReadOnly);
+        setProperty("MPRBlockDevHandle", (unsigned long long)fDevHandle, 16);
+    }
 }
 
 IOReturn
@@ -250,11 +262,12 @@ MPRBlockDev::reportWriteProtection(bool *isWriteProtected)
     if (isWriteProtected == NULL) {
         return kIOReturnBadArgument;
     }
-    /* Only publish a writable media once the target and capacity are known.
-     * UNMAP is still gated in the controller and is disabled at runtime on
-     * the first failure (risk R11). */
+    /* A target is writable only when an explicit MPRWritableDevices rule
+     * matched its identity. Everything else stays read-only for its whole
+     * lifetime, so a newly attached ZFS member can never receive a write. */
     MPRController *controller = copyController();
-    *isWriteProtected = controller == NULL || !controller->isMediaPresent();
+    *isWriteProtected = fReadOnly || controller == NULL ||
+                        !controller->isMediaPresent();
     if (controller != NULL) controller->release();
     return kIOReturnSuccess;
 }
@@ -280,6 +293,12 @@ MPRBlockDev::doAsyncReadWrite(IOMemoryDescriptor *buffer,
     write = (buffer->getDirection() & kIODirectionOut) != 0;
     fua = (attributes != NULL &&
            (attributes->options & kIOStorageOptionForceUnitAccess) != 0);
+    /* Defence in depth: even if a storage client ignores reportWriteProtection,
+     * no write descriptor is accepted for a read-only target. */
+    if (write && fReadOnly) {
+        controller->release();
+        return kIOReturnNotWritable;
+    }
 
     /* Acceptance retains the buffer and copies the completion. Commands from
      * different requests share the bounded pool; callback runs outside locks
@@ -294,6 +313,7 @@ IOReturn
 MPRBlockDev::doSynchronizeCache(void)
 {
     /* Deprecated entry point, kept for older IOStorageFamily clients. */
+    if (fReadOnly) return kIOReturnSuccess; /* nothing was written: no command */
     MPRController *controller = copyController();
     if (controller == NULL) return kIOReturnNoMedia;
     IOReturn status = controller->synchronizeCache(0, 0, false);
@@ -305,6 +325,7 @@ IOReturn
 MPRBlockDev::doSynchronize(UInt64 block, UInt64 nblks,
                            IOStorageSynchronizeOptions options)
 {
+    if (fReadOnly) return kIOReturnSuccess;
     bool barrier = (options & kIOStorageSynchronizeOptionBarrier) != 0;
 
     MPRController *controller = copyController();
@@ -318,6 +339,7 @@ IOReturn
 MPRBlockDev::doUnmap(IOBlockStorageDeviceExtent *extents,
                      UInt32 extentsCount, IOStorageUnmapOptions options)
 {
+    if (fReadOnly) return kIOReturnNotWritable;
     MPRController *controller = copyController();
     if (controller == NULL) return kIOReturnNoMedia;
     IOReturn status = controller->unmapBlocks(extents, extentsCount);

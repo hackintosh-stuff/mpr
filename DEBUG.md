@@ -1,6 +1,6 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.18.1.
+Date: 2026-11-13. Driver version: 0.19.0.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
@@ -104,6 +104,22 @@ identity. Recovery rechecks the stable identity, block count and block size.
 A physical insertion publishes a new media generation after retiring the
 previous medium; a transport recovery cannot silently bind old I/O to a
 different disk.
+
+Every eligible handle from GET_NEXT_HANDLE is recorded in a bounded target
+table (`MPRTargetSlot`) and published as `MPRTargetCount` plus per-target
+`MPRTargetNHandle`, `MPRTargetNDeviceInfo` and `MPRTargetNSasAddress`
+properties. Publication is still gated to one nub: a topology with more than
+one disk is refused rather than choosing an arbitrary target.
+
+Access is fail-closed. `MPRWritableDevices` in the kext personality is an array
+of Model/Serial rules; only a disk whose ATA model and serial match a rule with
+a concrete serial is published writable. Every other target, including a disk
+from an unknown array, stays read-only: `reportWriteProtection()` reports write
+protection, write requests are rejected with `kIOReturnNotWritable`, UNMAP is
+rejected, and cache synchronisation is a no-op that sends no command. The nub
+records `MPRBlockDevReadOnly`, `MPRBlockDevHandle` and the controller records
+`MPRTargetReadOnly`, `MPRTargetModel`, `MPRTargetSerial` and
+`MPRWriteRuleCount`.
 
 ## 4. Hotplug and recovery
 

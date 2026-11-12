@@ -23,6 +23,10 @@ private:
     MPRController *copyController(void);
     void refreshIdentity(void);
     bool           fLastMediaPresent;
+    /* Each nub belongs to one target. Access is fail-closed: a nub created
+     * without an explicit write rule stays read-only for its whole lifetime. */
+    UInt16         fDevHandle;
+    bool           fReadOnly;
 
 public:
     virtual bool init(OSDictionary *properties) APPLE_KEXT_OVERRIDE;
@@ -30,7 +34,8 @@ public:
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 
-    void setController(MPRController *controller);
+    void setController(MPRController *controller, UInt16 handle = 0,
+                       bool readOnly = true);
     IOReturn notifyMediaState(UInt32 state);
 
     virtual IOReturn doEjectMedia(void) APPLE_KEXT_OVERRIDE;

@@ -1,6 +1,6 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.18.1.
+Date: 2026-11-13. Driver version: 0.19.0.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes one independent
@@ -20,6 +20,13 @@ readback, including concurrent reads. Direct attach additionally passed unplug
 and replug, including unplug with I/O in flight; reply-timeout injection through
 ABORT_TASK, LUN RESET, TARGET RESET and controller reset; sleep/wake; and
 shutdown.
+
+Multi-target discovery records every eligible device in a bounded target table
+and publishes per-device handles, device info and SAS addresses in the
+IORegistry. A topology with more than one disk is not published yet, so no
+arbitrary disk is chosen. Access is fail-closed: a nub is read-only unless an
+explicit `MPRWritableDevices` rule in the kext personality matches the disk's
+model and serial; an unidentified disk therefore cannot receive a write.
 
 Not covered: more than one target, SAS/SSP drives, multipath, multiple LUNs,
 enclosure services, physical unplug/replug and power management behind the

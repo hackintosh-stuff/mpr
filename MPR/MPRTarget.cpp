@@ -1,6 +1,9 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSString.h>
 #include <string.h>
 #include "MPRController.h"
 #include "MPI/mpi2_target.h"
@@ -191,6 +194,8 @@ MPRController::readSasIOUnitPage0(void)
     /* GET_NEXT_HANDLE reaches the terminal disk behind a backplane/expander.
      * IOC PHY handles alone can name the expander, not its attached disk. */
     bool finished = false;
+    fTargetCount = 0;
+    memset(fTargets, 0, sizeof(fTargets));
     UInt32 bound = fMaxDeviceHandle != 0 ? fMaxDeviceHandle : 0xFFFE;
     for (UInt32 n = 0; n <= bound; n++) {
         UInt16 status = 0xFFFF;
@@ -231,13 +236,40 @@ MPRController::readSasIOUnitPage0(void)
             setProperty("MPRRaidExcludedHandle", (unsigned long long)handle, 16);
             continue;
         }
+        if (fTargetCount < kMPRMaxTargets) {
+            MPRTargetSlot *slot = &fTargets[fTargetCount++];
+            slot->handle = handle;
+            slot->deviceInfo = info;
+            slot->flags = flags;
+            slot->sasAddress = mprReadLe64(page + 0x0C);
+            slot->fastPath =
+                (flags & MPI25_SAS_DEVICE0_FLAGS_ENABLED_FAST_PATH) != 0 &&
+                (flags & MPI25_SAS_DEVICE0_FLAGS_FAST_PATH_CAPABLE) != 0;
+            slot->present = true;
+            slot->readOnly = true; /* fail-closed until a write rule matches */
+        }
         candidates++;
         selected = handle;
     }
     if (!finished) return false;
     setProperty("MPRStandaloneTargetCount", (unsigned long long)candidates, 32);
-    if (candidates > 1) {
-        setProperty("MPRTopologyFailure", "multiple-standalone-targets-not-supported");
+    setProperty("MPRTargetCount", (unsigned long long)fTargetCount, 32);
+    for (UInt32 i = 0; i < fTargetCount; i++) {
+        char name[40], address[24];
+        snprintf(name, sizeof(name), "MPRTarget%uHandle", (unsigned)i);
+        setProperty(name, (unsigned long long)fTargets[i].handle, 16);
+        snprintf(name, sizeof(name), "MPRTarget%uDeviceInfo", (unsigned)i);
+        setProperty(name, (unsigned long long)fTargets[i].deviceInfo, 32);
+        snprintf(name, sizeof(name), "MPRTarget%uSasAddress", (unsigned)i);
+        snprintf(address, sizeof(address), "%016llx",
+                 (unsigned long long)fTargets[i].sasAddress);
+        setProperty(name, address);
+    }
+    if (fTargetCount > 1) {
+        /* Publication stays gated until per-target I/O routing and removal
+         * are wired. Never pick an arbitrary disk when a ZFS member is
+         * present: an unidentified target must not become writable. */
+        setProperty("MPRTopologyFailure", "multi-target-isolation-pending");
         return false;
     }
     if (selected != 0 && !readSasDevicePage0(selected)) return false;
@@ -351,11 +383,21 @@ MPRController::probeStableIdentity(void)
     if (scsiSataIdentify(page)) {
         UInt8 key[60];
         bool serial = false;
-        for (UInt32 i = 0; i < 40; i++) key[i] = page[54 + (i ^ 1)];
+        char model[41], serialText[21];
+        for (UInt32 i = 0; i < 40; i++) {
+            key[i] = page[54 + (i ^ 1)];
+            model[i] = (char)key[i];
+        }
         for (UInt32 i = 0; i < 20; i++) {
             key[40 + i] = page[20 + (i ^ 1)];
+            serialText[i] = (char)key[40 + i];
             serial |= key[40 + i] != ' ' && key[40 + i] != 0;
         }
+        model[40] = serialText[20] = 0;
+        for (UInt32 i = 40; i > 0 && model[i - 1] == ' '; i--) model[i - 1] = 0;
+        for (UInt32 i = 20; i > 0 && serialText[i - 1] == ' '; i--) serialText[i - 1] = 0;
+        strlcpy(fTargetModel, model, sizeof(fTargetModel));
+        strlcpy(fTargetSerial, serialText, sizeof(fTargetSerial));
         if (serial) fTargetIdentityValid = mprHexIdentity(fTargetIdentity,
             sizeof(fTargetIdentity), "ata-model-serial", key, sizeof(key));
         setProperty("MPRSataSolidState", mprReadLe16(page + 434) == 1);
@@ -407,6 +449,62 @@ MPRController::probeStableIdentity(void)
     if (fTargetIdentityValid) setProperty("MPRStableIdentity", fTargetIdentity);
     else removeProperty("MPRStableIdentity");
     return fTargetIdentityValid && !fProtocolRecoveryPending;
+}
+
+bool
+MPRController::loadWritePolicy(void)
+{
+    fWriteRuleCount = 0;
+    fTargetModel[0] = 0;
+    fTargetSerial[0] = 0;
+    fTargetReadOnly = true;
+    for (UInt32 i = 0; i < kMPRMaxWriteRules; i++) {
+        fWriteRuleModel[i][0] = 0;
+        fWriteRuleSerial[i][0] = 0;
+    }
+    OSArray *rules = OSDynamicCast(OSArray, getProperty("MPRWritableDevices"));
+    if (rules != NULL) {
+        for (UInt32 i = 0;
+             i < rules->getCount() && fWriteRuleCount < kMPRMaxWriteRules; i++) {
+            OSDictionary *rule = OSDynamicCast(OSDictionary, rules->getObject(i));
+            if (rule == NULL) continue;
+            OSString *model = OSDynamicCast(OSString, rule->getObject("Model"));
+            OSString *serial = OSDynamicCast(OSString, rule->getObject("Serial"));
+            if (model == NULL || serial == NULL) continue;
+            strlcpy(fWriteRuleModel[fWriteRuleCount], model->getCStringNoCopy(),
+                    sizeof(fWriteRuleModel[0]));
+            strlcpy(fWriteRuleSerial[fWriteRuleCount], serial->getCStringNoCopy(),
+                    sizeof(fWriteRuleSerial[0]));
+            fWriteRuleCount++;
+        }
+    }
+    setProperty("MPRWriteRuleCount", (unsigned long long)fWriteRuleCount, 8);
+    return true;
+}
+
+bool
+MPRController::isWritableIdentity(const char *model, const char *serial) const
+{
+    /* An unidentified target is never writable. A wildcard serial would make
+     * every disk writable, so only concrete serial rules can grant access. */
+    if (model == NULL || serial == NULL || serial[0] == 0) return false;
+    for (UInt32 i = 0; i < fWriteRuleCount; i++) {
+        if (fWriteRuleSerial[i][0] == 0 ||
+            strcmp(fWriteRuleSerial[i], "*") == 0) continue;
+        bool modelMatch = strcmp(fWriteRuleModel[i], "*") == 0 ||
+                          strcmp(fWriteRuleModel[i], model) == 0;
+        if (modelMatch && strcmp(fWriteRuleSerial[i], serial) == 0) return true;
+    }
+    return false;
+}
+
+MPRTargetSlot *
+MPRController::findTarget(UInt16 handle)
+{
+    if (handle == 0) return NULL;
+    for (UInt32 i = 0; i < fTargetCount && i < kMPRMaxTargets; i++)
+        if (fTargets[i].handle == handle) return &fTargets[i];
+    return NULL;
 }
 
 bool

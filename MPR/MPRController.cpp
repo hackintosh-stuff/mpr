@@ -2702,7 +2702,7 @@ MPRController::publishBlockDevice(void)
         setProperty("MPRBlockDeviceState", "failed-nub-init");
         return false;
     }
-    nub->setController(this);
+    nub->setController(this, (UInt16)fAttachedDevHandle, fTargetReadOnly);
     if (!nub->attach(this)) {
         nub->release();
         setProperty("MPRBlockDeviceState", "failed-nub-attach");
@@ -3136,7 +3136,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.18.1");
+    setProperty("MPRBuild", "0.19.0");
     setProperty("MPRFeatures",
                 "async-pool,ieee-sgl-chain,read-write16,cache16,unmap-limits,"
                 "stable-identity,raid-filter,auto-sense,tmf,remove-device,pm-quiesce");
@@ -3200,9 +3200,16 @@ MPRController::start(IOService *provider)
         /* A disk that is readable only through a timeout's fallback poll
          * cannot support idle hotplug. IRQ, subscription and PortEnable
          * success are mandatory before publishing a media object. */
+        loadWritePolicy();
         if (eventsReady && discoverTopology() && fAttachedDevHandle != 0 &&
             probeScsiIdentity() && probeCapacity() && probeBlockRead() &&
             prepareTargetMedia()) {
+            /* Fail-closed: only a target whose identity matches an explicit
+             * MPRWritableDevices rule is published writable. */
+            fTargetReadOnly = !isWritableIdentity(fTargetModel, fTargetSerial);
+            setProperty("MPRTargetReadOnly", fTargetReadOnly);
+            setProperty("MPRTargetModel", fTargetModel);
+            setProperty("MPRTargetSerial", fTargetSerial);
             fMediaPresent = true;
             fMediaGeneration++;
             if (!publishBlockDevice()) fMediaPresent = false;
