@@ -55,11 +55,16 @@ Decisions, in order:
    block read, then publish (or re-notify) the medium while the lock is
    released.
 
-A removal is latched (`fRemovalPending`) even if a fast replug reuses the same
-handle, so the old medium is always taken down first. The latch is not the only
-signal: a fast replug that never lets the link drop still shows up as a device
-page identity mismatch, and that path also takes the medium offline before
-recovery.
+A removal is latched (`fRemovalPending`) on `TARGET_NOT_RESPONDING` and on any
+`PHY_CHANGED` for the phy that carries the attached handle, even if a fast
+replug reuses the same handle, so the old medium is always taken down first. A
+phy change means the link was renegotiated, which only happens after it
+dropped; requiring the reported rate to be low was wrong, because a replug
+shorter than one poll interval can produce a phy change with a healthy rate and
+no removal event at all — measured on this adapter, and the reason a two-second
+replug used to keep the old medium alive. The latch is not the only signal
+either: a replug can also surface as a device page identity mismatch, and that
+path takes the medium offline before recovery as well.
 
 ## 3. IORegistry diagnostics
 
@@ -210,3 +215,13 @@ which is the operating system protecting a filesystem it believes it owns.
 Offsets in `dd` are in `bs` units, so `bs=1m seek=34` is byte 34 MiB, not LBA
 34. Use `oflag=seek_bytes`/`iflag=skip_bytes`, or byte offsets through
 `pread`/`pwrite`, whenever the target is an LBA.
+
+Unplug during a write uses a continuous 2 MiB pwrite loop against the same
+scratch range, logging every attempt's elapsed time and result. The write that
+meets the removal must fail with an error — measured at 3.9 s for a ten-second
+unplug and 2.0 s for a two-second one, both far inside the 60 s deadline — and
+every later attempt through the stale handle must fail in about 0.1 ms, which
+is what shows nothing was replayed onto the new medium. With the phy-change
+removal rule in place the two-second case also retires the old medium
+(`MPRMediaOfflineCause=removal-event`, generation 1→2→3, one reset) and comes
+back with its partition, read verified.

@@ -310,8 +310,14 @@ MPRController::recordTopologyEventLocked(const UInt8 *data, UInt32 bytes)
             continue;
         }
         bool affected = (handle == fAttachedDevHandle && fAttachedDevHandle != 0);
+        /* A change on the phy that carries our target means the link was
+         * renegotiated, which only happens after it dropped. Treating that as
+         * removal is what makes a replug shorter than one poll interval still
+         * retire the old medium: the firmware may report only PHY_CHANGED and
+         * never TARGET_NOT_RESPONDING, and the reattached target can keep the
+         * same handle with an identical device page. */
         bool removed = reason == MPI2_EVENT_SAS_TOPO_RC_TARG_NOT_RESPONDING ||
-                       (reason == MPI2_EVENT_SAS_TOPO_RC_PHY_CHANGED && rate < 8);
+                       reason == MPI2_EVENT_SAS_TOPO_RC_PHY_CHANGED;
         /* Diagnostics: the last reason that carried a target handle decides
          * which transition the driver reacts to. Plain members only; the
          * watchdog publishes them outside this lock. */
@@ -3200,7 +3206,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.20");
+    setProperty("MPRBuild", "0.17.21");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
