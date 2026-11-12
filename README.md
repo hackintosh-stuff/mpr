@@ -6,59 +6,65 @@ MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes one independent
 disk through `IOBlockStorageDriver` as a whole-disk `IOMedia`.
 
-This source version implements the disk path and controller mechanisms listed
-below. It is built, loaded and qualified on the test machine (macOS 26.7.2).
-Acceptance hardware is one Adaptec AEC-82885T expander, one backplane and one
-SATA disk: a single terminal disk behind the expander is published as a
-whole-disk `IOMedia` and passes bounded read/write/flush/UNMAP checks.
+## Status
 
-## Implemented capabilities
+Built, linked, signed ad hoc and loaded from the internal ESP on the test machine
+(macOS 26.7.2); the running version is confirmed with `kmutil showloaded` and
+`MPRBuild`.
 
-- Controller initialization, IOC Facts constrained queues, interrupt-driven
-  replies, bounded polling fallback, event subscription and EVENT_ACK.
-- An asynchronous request queue with four concurrent command windows shared
-  by different requests, separate client completion delivery, and ordered
-  cache/UNMAP fences.
-- Device-visible scatter/gather mappings and bounded MPI 2.5 IEEE chains.
-  Resident staging buffers retain a contiguous fallback when mapping or
-  chain geometry cannot represent a transfer.
-- READ/WRITE(10) and (16), READ CAPACITY(10)/(16), TEST UNIT READY,
-  standard/extended INQUIRY, SYNCHRONIZE CACHE(10)/(16), and FUA with an
-  ordered cache-flush fallback when native FUA is not advertised.
-- UNMAP only after Block Limits and Logical Block Provisioning capabilities
-  are verified. Large requests split to the reported limits without extending
-  a caller's discard range.
+The driver is qualified in two configurations: the test SATA disk attached
+directly to the SAS3008, and the same disk as the only terminal disk behind an
+Adaptec AEC-82885T expander and one backplane. Both publish one whole-disk
+`IOMedia` and pass bounded read, write, flush and UNMAP with byte-exact
+readback, including concurrent reads. Direct attach additionally passed unplug
+and replug, including unplug with I/O in flight; reply-timeout injection through
+ABORT_TASK, LUN RESET, TARGET RESET and controller reset; sleep/wake; and
+shutdown.
+
+Not covered: more than one target, SAS/SSP drives, multipath, multiple LUNs,
+enclosure services, physical unplug/replug and power management behind the
+expander, long duration or concurrent stress, and throughput tuning.
+Wire-format and large-LBA cases are checked on the host, not on this hardware.
+
+## Capabilities
+
+- IOC initialization and IOC-Facts-constrained queues; interrupt-driven replies
+  with a bounded polling fallback; event subscription and EVENT_ACK.
+- Asynchronous request scheduling over four command windows shared by
+  concurrent requests, with client completions delivered from a separate
+  serialized context.
+- Device-visible scatter/gather and bounded IEEE chains, with resident
+  contiguous staging when a mapping cannot be represented.
+- READ/WRITE(10)/(16), READ CAPACITY(10)/(16), TEST UNIT READY, INQUIRY,
+  SYNCHRONIZE CACHE(10)/(16), and FUA with an ordered cache-flush fallback.
+- UNMAP after Block Limits and Logical Block Provisioning verification, split to
+  the reported limits without extending the caller's discard range.
 - SAS device-handle enumeration, independent-disk filtering on IR-capable
-  firmware, and stable disk identity with capacity/block-size revalidation.
-- Per-command sense storage and completion ownership checks; bounded TMF
-  escalation and IOC recovery; no automatic replay of an uncertain write.
-- Offline/online media lifecycle, conservative TARGET_RESET/REMOVE_DEVICE,
-  handle-reuse checks, and bounded full-controller recovery.
-- Registered power-state transitions and shutdown quiesce: stop accepting
-  requests, retire accepted work, flush, and stop DMA before power loss;
+  firmware, and stable identity with capacity and block-size revalidation.
+- Per-command sense and completion ownership; bounded TMF escalation and
+  controller recovery; no replay of a write with uncertain completion.
+- Media offline/online lifecycle, guarded TARGET_RESET / REMOVE_DEVICE, and
+  bounded full-controller recovery.
+- Registered power states: quiesce, flush and DMA stop for sleep and shutdown;
   rebuild and revalidate on wake.
 
-Implementation, memory ownership and diagnostic details are in
-[DEBUG.md](DEBUG.md). The FreeBSD comparison and validation boundaries are in
-[PORTING.md](PORTING.md). Project scope and historical test evidence are in
-[PLAN.md](PLAN.md).
+Implementation, memory ownership, locking and diagnostic details are in
+[DEBUG.md](DEBUG.md). Scope, reference baseline, milestone status and remaining
+work are in [PLAN.md](PLAN.md).
 
 ## Scope
 
-The published storage path remains single-target and LUN 0. If more than one
-eligible independent target is discovered, publication is refused rather
-than choosing an arbitrary disk.
+The storage path is single-target and LUN 0. If more than one eligible
+independent target is discovered, publication is refused rather than choosing an
+arbitrary disk.
 
-IR RAID volumes, multi-target isolation, multipath, multi-LUN devices,
-SES/SMP management, NVMe/Tri-Mode, firmware flashing and FreeBSD user ioctl
-compatibility are outside this driver configuration. Client buffers are
-copied through bounded resident DMA windows; direct zero-copy client DMA
-and multiple hardware reply queues are not implemented.
+IR RAID volumes, multi-target isolation, multipath, multi-LUN devices, SES/SMP
+management, NVMe/Tri-Mode, firmware flashing and FreeBSD user ioctl
+compatibility are outside this driver. Client buffers are copied through
+bounded resident DMA windows; direct zero-copy client DMA and multiple hardware
+reply queues are not implemented.
 
-These limits are not additional hardware requirements for acceptance. Tests
-for this project use only the existing backplane and SATA disk. Wire-format
-boundaries that the disk cannot exercise, such as LBAs above 2 TiB, are checked
-off-device and are not reported as hardware results.
+These limits are not additional hardware requirements.
 
 ## Build and local checks
 
@@ -77,10 +83,10 @@ On macOS with the Command Line Tools and MacKernelSDK:
 MACKERNELSDK=/path/to/MacKernelSDK sh tools/build-noxcode.sh
 ```
 
-The build produces `build/MPR.kext`, validates the kmod entry points,
-bundle type, driver-internal symbols and plist, then signs it ad hoc. The
-Xcode project and CLI build include all driver translation units.
-A cross-compiled Mach-O object is not a linked, signed or load-tested kext.
+The build produces `build/MPR.kext`, validates the kmod entry points, bundle
+type, driver-internal symbols and plist, then signs it ad hoc. The Xcode project
+and CLI build include all driver translation units. A cross-compiled Mach-O
+object is not a linked, signed or load-tested kext.
 
 ## Install
 
@@ -89,8 +95,8 @@ Install only on the verified internal SATA disk's ESP, under
 Never install this driver in `/Library/Extensions` or on USB install/rescue
 media.
 
-Before any write, identify the internal disk and EFI partition by their
-current model, capacity, location and UUID. Back up `config.plist` beside
-itself only if that configuration must change; validate any changed plist.
-After a deliberate deployment and reboot, confirm the loaded version with
+Before any write, identify the internal disk and EFI partition by their current
+model, capacity, location and UUID. Back up `config.plist` beside itself only if
+that configuration must change, and validate any changed plist. After a
+deliberate deployment and reboot, confirm the loaded version with
 `kmutil showloaded` and `MPRBuild`. This patch does not deploy or reboot.

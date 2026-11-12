@@ -2,9 +2,9 @@
 
 Date: 2026-11-13. Driver version: 0.18.1.
 
-This document describes source behavior and diagnostics. It does not claim
-that the current source has passed runtime acceptance. See [PORTING.md](PORTING.md)
-for the comparison and validation boundary.
+This document describes source behavior and diagnostics. What has been
+qualified at runtime, and what has not, is in [README.md](README.md); scope and
+remaining work are in [PLAN.md](PLAN.md).
 
 ## 1. Concurrency and ordering
 
@@ -125,8 +125,9 @@ an endless reset loop.
 
 Timeout recovery attempts ABORT TASK, LUN RESET and TARGET RESET subject to
 available TMF credit and terminated-command evidence, then a bounded IOC
-reset. Writes with uncertain completion are not replayed. The legacy
-synchronous path may retry a zero-transfer UNIT ATTENTION read once.
+reset. Writes with uncertain completion are not replayed. A read whose whole
+batch failed with a decoded UNIT ATTENTION is retried once, after all DMA for
+that batch has ended.
 
 ## 5. Cache, FUA and UNMAP
 
@@ -154,8 +155,8 @@ disables PCI bus mastering. Ownership is reset only after DMA stop is proved.
 Wake restores PCI access, rebuilds queues/events/topology, revalidates the
 disk, then reopens acceptance. A failed wake retires media and requests
 bounded recovery. `systemWillShutdown` follows the same quiesce path.
-Sleep/wake and shutdown behavior in this version remains unqualified on
-hardware; source hooks and compilation are not runtime evidence.
+Sleep/wake and shutdown are qualified on the directly attached disk only; they
+have not been repeated behind an expander.
 
 Stop waits for the I/O and completion workers outside the transport lock,
 then tears down DMA. Scheduler/transport locks remain alive until final
@@ -177,6 +178,57 @@ service release so callers retained before stop can unwind safely.
 A property saying "online" is not data-integrity evidence. Always pair it with
 the active IOMedia count, actual byte count and readback content.
 
-Existing opt-in boot arguments `mpr_timeout_test`, `mpr_tmf_fail` and
-`mpr_timeout_every` exercise recovery. They are not enabled by this patch.
-Serial kernel logging remains off by default under the workspace rules.
+Opt-in boot arguments `mpr_timeout_test=1`, `mpr_tmf_fail=N` and
+`mpr_timeout_every=N` exercise recovery; none is set by default. Serial kernel
+logging remains off by default under the workspace rules.
+
+## 8. Coverage against the FreeBSD driver
+
+The comparison uses the fixed FreeBSD source in
+`reference/freebsd/sys/dev/mpr` (commit in PLAN section 2) and covers the
+controller mechanisms plus the disk-level equivalents this driver needs.
+FreeBSD's CAM/newbus/bus_dma/sysctl interfaces are platform glue; their API
+names are not macOS requirements.
+
+| Mechanism | FreeBSD reference | Implementation |
+|---|---|---|
+| Request ownership and completion | `mpr_command`, `mpr_complete_command`, `mpr_intr_locked` | Per-SMID ownership states, checked replies, independent sense, quarantined timeouts and cancelled reset completions |
+| Asynchronous dispatch | CAM submission and command callbacks | Request queue, four shared command windows, separate completion context, sequence fences |
+| DMA, scatter/gather and chain | `mpr_add_chain`, `mpr_push_ieee_sge`, IOC Facts | Device-visible resident mappings, bounded IEEE chains, explicit contiguous fallback |
+| Queue resources | `mpr_resize_queues`, high-priority command pool | Facts-constrained geometry, reserved management/TMF/ACK resources |
+| SCSI data contract | `mprsas_action_scsiio` plus CAM disk policy | READ/WRITE(10)/(16), exact block transfers, bounded sense, SYNC(10)/(16), FUA fallback |
+| Thin provisioning | CAM disk and UNMAP policy | B0/B2 capability probe, input validation, bounded descriptor and block batching |
+| Discovery | SAS config pages and discovery events | GET_NEXT_HANDLE enumeration; SEP/SES devices excluded; one terminal independent disk |
+| IR membership protection | IR config handling, RAID_COMPONENT filtering | RAID Configuration Page0 enumeration; volumes, members, spares and expansion disks refused |
+| Persistent identity | SATA IDENTIFY, SCSI identifiers | ATA model+serial or validated VPD identifier, capacity/block-size comparison, media generations |
+| Target removal | `mprsas_prepare_remove`, `mprsas_remove_device` | Guarded TARGET_RESET/drain/REMOVE_DEVICE with handle-reuse checks and bounded fallback |
+| Recovery | abort/LUN/target/IOC reset and watchdog | Credit-aware TMF escalation, ownership proof, no replay of uncertain writes, IOC state monitoring |
+| Sleep and shutdown | FreeBSD suspend/resume return EINVAL; separate shutdown path | Native IOKit PM and shutdown quiesce with wake revalidation |
+| Builds | OS-specific build system | All driver translation units in the CLI and Xcode builds |
+
+Outside this configuration, and not silently treated as implemented: multiple
+targets with target-local scheduling and fault isolation; multiple LUNs and
+general SCSI passthrough; DPM persistent numbering and multipath; IR logical
+volumes and RAID management; SES/enclosure control, SMP passthrough, firmware
+update and user-space tools; NVMe/PCIe/Tri-Mode, SAS2 and GEN35 hardware;
+direct DMA into client buffers, multi-queue/MSI-X scaling and tuning.
+
+## 9. Host-side checks
+
+`tools/test_protocol.cpp` exercises the shared wire-format helpers against
+independent golden bytes and a separate chain decoder: 10- and 16-byte CDB
+boundaries, high LBAs, arithmetic overflow, legal and truncated VPD, RAID page
+layouts and membership, bounded fixed and descriptor sense, chain
+depth/address/length rejection, sentinel protection and randomized SGL
+reconstruction. AddressSanitizer and UndefinedBehaviorSanitizer are used when
+available: 136,593 assertions and 2,000 deterministic SGL cases pass, including
+the intentional rejection cases.
+
+`tools/validate-build-inputs.py` checks LF text, bundle and runtime version
+consistency, and inclusion of every driver translation unit in the Xcode
+project; the CLI build compiles every source file. Against MacKernelSDK with a
+Darwin target, compilation verifies C++/IOKit declarations and produces Mach-O
+objects with no diagnostics under `-Wall -Wextra -Werror`, and the driver has no
+unresolved driver-internal symbols. Linking, ad hoc signing and loading are
+separate checks that require macOS; all three pass on the test machine.
+

@@ -8,8 +8,8 @@ capacity and memory accounting, synchronization, ABI formats, IORegistry
 properties and debugging procedures in `DEBUG.md`, and link to them from the
 README instead of duplicating them there.
 
-`README.md` is state documents. They say what is true of this driver now,
-not what happened round by round.
+`README.md`, `DEBUG.md` and `PLAN.md` are state documents. They say what is
+true of this driver now, not what happened round by round.
 
 - **State only.** State facts that hold at the time of writing.
   Do not record "round N passed / round N failed". Once a defect is fixed
