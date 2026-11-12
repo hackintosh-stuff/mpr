@@ -16,6 +16,7 @@ class MPRBlockDev : public IOBlockStorageDevice
 private:
     MPRController *fController;
     bool           fLastMediaPresent;
+    bool           fForceMediaStateChange;
 
 public:
     virtual bool init(OSDictionary *properties) APPLE_KEXT_OVERRIDE;
@@ -23,6 +24,7 @@ public:
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 
     void setController(MPRController *controller);
+    void notifyMediaState(UInt32 state);
 
     virtual IOReturn doEjectMedia(void) APPLE_KEXT_OVERRIDE;
     virtual IOReturn doFormatMedia(UInt64 byteCapacity) APPLE_KEXT_OVERRIDE;

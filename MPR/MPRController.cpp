@@ -2754,7 +2754,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.12");
+    setProperty("MPRBuild", "0.17.13");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3459,6 +3459,10 @@ MPRController::hotplugThread(void)
         fLastReplyKind = 0;
         fLastReplySmid = 0xFFFF;
         if (!readSasIOUnitPage0() || fAttachedDevHandle == 0) {
+            if (!fDeviceOffline && fBlockDev != NULL) {
+                fBlockDev->notifyMediaState(kIOMediaStateOffline);
+            }
+            fDeviceOffline = true;
             setProperty("MPRHotplugState", "removed");
             setProperty("MPRHotplugResetResult", "waiting");
             setProperty("MPRHotplugBlockDev",
@@ -3482,6 +3486,11 @@ MPRController::hotplugThread(void)
     setProperty("MPRHotplugHandle",
                 (unsigned long long)fAttachedDevHandle, 16);
     if (resetOk) {
+        if (fBlockDev != NULL) {
+            /* Re-accept the media so IOStorageFamily re-reads LBA1 and
+             * re-matches IOGUIDPartitionScheme. */
+            fBlockDev->notifyMediaState(kIOMediaStateOnline);
+        }
         setProperty("MPRHotplugState",
                     fAttachedDevHandle != 0 ? "rebuilt" : "removed");
         fHotplugPending = false;
@@ -3689,8 +3698,7 @@ MPRController::resetAndReinitialize(void)
          * always rebuilds the nub (0.15.10 partition rescan). A cable-swap
          * reset reuses an intact nub, otherwise the asynchronously terminated
          * old media stays registered and a duplicate disk appears. */
-        if (!fHotplugRebuild || fBlockDev == NULL ||
-            !wholeMediaHasPartitions()) {
+        if (!fHotplugRebuild) {
             if (fBlockDev != NULL) {
                 fBlockDev->setController(NULL);
                 fBlockDev->terminate();

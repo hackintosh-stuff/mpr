@@ -1,4 +1,5 @@
 #include <IOKit/IOLib.h>
+#include <IOKit/storage/IOBlockStorageDriver.h>
 #include "MPRBlockDev.h"
 #include "MPRController.h"
 
@@ -13,7 +14,19 @@ MPRBlockDev::init(OSDictionary *properties)
 {
     fController = NULL;
     fLastMediaPresent = false;
+    fForceMediaStateChange = false;
     return super::init(properties);
+}
+
+void
+MPRBlockDev::notifyMediaState(UInt32 state)
+{
+    /* Force reportMediaState() to report a change, even when the cached
+     * present flag already matches. IOBlockStorageDriver only re-probes the
+     * partition table when mediaStateHasChanged() sees a transition. */
+    fForceMediaStateChange = true;
+    messageClients(kIOMessageMediaStateHasChanged,
+                   (void *)(uintptr_t)state);
 }
 
 bool
@@ -143,8 +156,10 @@ MPRBlockDev::reportMediaState(bool *mediaPresent, bool *changedState)
 
     *mediaPresent = present;
     if (changedState != NULL) {
-        *changedState = (present != fLastMediaPresent);
+        *changedState = (present != fLastMediaPresent) ||
+                        fForceMediaStateChange;
     }
+    fForceMediaStateChange = false;
     fLastMediaPresent = present;
     return kIOReturnSuccess;
 }
