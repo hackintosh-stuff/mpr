@@ -406,6 +406,8 @@ private:
     bool   allocateResidentBuffers(void);
     bool   prepareTargetMedia(void);
     bool   publishBlockDevice(void);
+    bool   publishTargets(void);
+    bool   publishTarget(MPRTargetSlot *slot);
 
     /* command submission, auto sense, task management and recovery. */
     void   postDefaultRequest(UInt32 smid);
@@ -454,11 +456,25 @@ public:
     MPRTargetSlot *findTarget(UInt16 handle);
     UInt32 targetCount(void) const { return fTargetCount; }
     bool isTargetReadOnly(void) const { return fTargetReadOnly; }
+    UInt32 getBlockSizeForHandle(UInt16 handle) {
+        MPRTargetSlot *slot = findTarget(handle);
+        return slot != NULL ? slot->blockSize : 0;
+    }
+    UInt64 getCapacityForHandle(UInt16 handle) {
+        MPRTargetSlot *slot = findTarget(handle);
+        return slot != NULL ? slot->capacityBlocks : 0;
+    }
+    bool isMediaPresentForHandle(UInt16 handle) {
+        MPRTargetSlot *slot = findTarget(handle);
+        return slot != NULL && slot->present;
+    }
 
-    /* MPRBlockDev relays every request through these accessors. */
+    /* MPRBlockDev relays every request through these accessors. Each request
+     * carries its own DevHandle so completions stay bound to one target. */
     IOReturn submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
                                UInt64 block, UInt64 nblks, bool fua,
-                               const IOStorageCompletion *completion);
+                               const IOStorageCompletion *completion,
+                               UInt16 devHandle = 0);
     IOReturn readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
                         UInt64 nblks, UInt64 *actualBytes);
     IOReturn transferBlocks(bool write, IOMemoryDescriptor *buffer,

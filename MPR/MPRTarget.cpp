@@ -265,11 +265,10 @@ MPRController::readSasIOUnitPage0(void)
                  (unsigned long long)fTargets[i].sasAddress);
         setProperty(name, address);
     }
-    if (fTargetCount > 1) {
-        /* Publication stays gated until per-target I/O routing and removal
-         * are wired. Never pick an arbitrary disk when a ZFS member is
-         * present: an unidentified target must not become writable. */
-        setProperty("MPRTopologyFailure", "multi-target-isolation-pending");
+    /* Every eligible target stays in the table; publication is per target.
+     * An unmatched identity is read-only, so a ZFS member is never writable. */
+    if (fTargetCount > kMPRMaxTargets) {
+        setProperty("MPRTopologyFailure", "too-many-targets");
         return false;
     }
     if (selected != 0 && !readSasDevicePage0(selected)) return false;

@@ -192,7 +192,7 @@ MPRBlockDev::reportBlockSize(UInt64 *blockSize)
     if (blockSize == NULL) return kIOReturnBadArgument;
     MPRController *controller = copyController();
     if (controller == NULL) return kIOReturnNoMedia;
-    size = controller->getBlockSize();
+    size = controller->getBlockSizeForHandle(fDevHandle);
     controller->release();
     if (size == 0) {
         return kIOReturnNoMedia;
@@ -219,7 +219,7 @@ MPRBlockDev::reportMaxValidBlock(UInt64 *maxBlock)
     if (maxBlock == NULL) return kIOReturnBadArgument;
     MPRController *controller = copyController();
     if (controller == NULL) return kIOReturnNoMedia;
-    blocks = controller->getCapacityBlocks();
+    blocks = controller->getCapacityForHandle(fDevHandle);
     controller->release();
     if (blocks == 0) {
         return kIOReturnNoMedia;
@@ -235,7 +235,8 @@ MPRBlockDev::reportMediaState(bool *mediaPresent, bool *changedState)
         return kIOReturnBadArgument;
     }
     MPRController *controller = copyController();
-    bool present = controller != NULL && controller->isMediaPresent();
+    bool present = controller != NULL &&
+                   controller->isMediaPresentForHandle(fDevHandle);
     if (controller != NULL) controller->release();
 
     *mediaPresent = present;
@@ -304,7 +305,7 @@ MPRBlockDev::doAsyncReadWrite(IOMemoryDescriptor *buffer,
      * different requests share the bounded pool; callback runs outside locks
      * in a separate context, permitting reentrant reads or cache fences. */
     status = controller->submitAsyncBlocks(write, buffer, block, nblks,
-                                           fua, completion);
+                                           fua, completion, fDevHandle);
     controller->release();
     return status;
 }

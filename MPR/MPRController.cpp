@@ -2726,6 +2726,108 @@ MPRController::publishBlockDevice(void)
 }
 
 bool
+MPRController::publishTarget(MPRTargetSlot *slot)
+{
+    if (slot == NULL || slot->handle == 0 || slot->nub != NULL ||
+        slot->blockSize == 0 || slot->capacityBlocks == 0 ||
+        fIOLock == NULL || fPageBuffer == NULL || fDataBuffer == NULL ||
+        fPagePhys == 0 || fDataPhys == 0 || fDataBytes == 0) return false;
+    MPRBlockDev *nub = new MPRBlockDev;
+    if (nub == NULL) return false;
+    if (!nub->init(NULL)) {
+        nub->release();
+        return false;
+    }
+    nub->setController(this, slot->handle, slot->readOnly);
+    if (!nub->attach(this)) {
+        nub->release();
+        return false;
+    }
+    if (!nub->start(this)) {
+        nub->detach(this);
+        nub->release();
+        return false;
+    }
+    slot->nub = nub;
+    if (fBlockDev == NULL) fBlockDev = nub; /* legacy single-nub paths */
+    nub->registerService();
+    UInt32 index = (UInt32)(slot - fTargets);
+    char name[40];
+    snprintf(name, sizeof(name), "MPRTarget%uReadOnly", index);
+    setProperty(name, slot->readOnly);
+    snprintf(name, sizeof(name), "MPRTarget%uBlocks", index);
+    setProperty(name, (unsigned long long)slot->capacityBlocks, 64);
+    snprintf(name, sizeof(name), "MPRTarget%uBlockSize", index);
+    setProperty(name, (unsigned long long)slot->blockSize, 32);
+    snprintf(name, sizeof(name), "MPRTarget%uIdentity", index);
+    setProperty(name, slot->identityValid ? slot->identity : "unknown");
+    return true;
+}
+
+bool
+MPRController::publishTargets(void)
+{
+    UInt32 published = 0;
+    UInt16 defaultHandle = 0;
+    for (UInt32 i = 0; i < fTargetCount && i < kMPRMaxTargets; i++) {
+        MPRTargetSlot *slot = &fTargets[i];
+        if (slot->handle == 0) continue;
+        /* The existing probe chain is read-only (TUR, INQUIRY, VPD, READ
+         * CAPACITY, MODE SENSE, READ). Its controller-level state is serialised
+         * by fIOLock and copied into the slot before the next target. */
+        fAttachedDevHandle = slot->handle;
+        fRequireSameIdentity = false;
+        fTargetIdentityValid = false;
+        fCapacityBlocks = 0;
+        fBlockSize = 0;
+        if (!readSasDevicePage0(slot->handle) || !probeScsiIdentity() ||
+            !probeCapacity() || !probeBlockRead() || !prepareTargetMedia()) {
+            char name[40];
+            snprintf(name, sizeof(name), "MPRTarget%uProbe", i);
+            setProperty(name, "failed");
+            continue;
+        }
+        slot->capacityBlocks = fCapacityBlocks;
+        slot->blockSize = fBlockSize;
+        slot->identityValid = fTargetIdentityValid;
+        strlcpy(slot->identity, fTargetIdentity, sizeof(slot->identity));
+        strlcpy(slot->model, fTargetModel, sizeof(slot->model));
+        strlcpy(slot->serial, fTargetSerial, sizeof(slot->serial));
+        slot->readOnly = !isWritableIdentity(slot->model, slot->serial);
+        slot->generation = ++fMediaGeneration;
+        slot->present = true;
+        if (!publishTarget(slot)) {
+            slot->present = false;
+            continue;
+        }
+        published++;
+        if (!slot->readOnly && defaultHandle == 0) defaultHandle = slot->handle;
+    }
+    if (defaultHandle == 0) {
+        for (UInt32 i = 0; i < fTargetCount && i < kMPRMaxTargets; i++)
+            if (fTargets[i].nub != NULL) { defaultHandle = fTargets[i].handle; break; }
+    }
+    /* Synchronous cache/UNMAP helpers still use the controller default; point
+     * it at a writable target when one exists, otherwise the first target. */
+    fAttachedDevHandle = defaultHandle;
+    fMediaPresent = published != 0;
+    setProperty("MPRMediaPresent", fMediaPresent);
+    setProperty("MPRPublishedTargetCount", published, 32);
+    if (published != 0) {
+        for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+            MPRTargetSlot *first = &fTargets[i];
+            if (first->nub == NULL) continue;
+            setProperty("MPRMediaBlocks", first->capacityBlocks, 64);
+            setProperty("MPRMediaBlockSize", (unsigned long long)first->blockSize, 32);
+            fCapacityBlocks = first->capacityBlocks;
+            fBlockSize = first->blockSize;
+            break;
+        }
+    }
+    return published != 0;
+}
+
+bool
 MPRController::probeCapacity(void)
 {
     bool ownPage = (fPageBuffer == NULL);
@@ -3201,18 +3303,8 @@ MPRController::start(IOService *provider)
          * cannot support idle hotplug. IRQ, subscription and PortEnable
          * success are mandatory before publishing a media object. */
         loadWritePolicy();
-        if (eventsReady && discoverTopology() && fAttachedDevHandle != 0 &&
-            probeScsiIdentity() && probeCapacity() && probeBlockRead() &&
-            prepareTargetMedia()) {
-            /* Fail-closed: only a target whose identity matches an explicit
-             * MPRWritableDevices rule is published writable. */
-            fTargetReadOnly = !isWritableIdentity(fTargetModel, fTargetSerial);
-            setProperty("MPRTargetReadOnly", fTargetReadOnly);
-            setProperty("MPRTargetModel", fTargetModel);
-            setProperty("MPRTargetSerial", fTargetSerial);
-            fMediaPresent = true;
-            fMediaGeneration++;
-            if (!publishBlockDevice()) fMediaPresent = false;
+        if (eventsReady && discoverTopology() && fTargetCount != 0) {
+            if (!publishTargets()) fMediaPresent = false;
         }
     } else {
         setProperty("MPRConfigPageState", "skipped-earlier-stage-failed");
@@ -3279,6 +3371,13 @@ MPRController::stop(IOService *provider)
     fBlockDev = NULL;
     if (nub != NULL) {
         nub->setController(NULL);
+    }
+    for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+        if (fTargets[i].nub != NULL) {
+            fTargets[i].nub->setController(NULL);
+            fTargets[i].nub = NULL;
+        }
+        fTargets[i].present = false;
     }
 
     /* No command submitter remains. Stop the reply consumer and the IOC

@@ -107,9 +107,14 @@ different disk.
 
 Every eligible handle from GET_NEXT_HANDLE is recorded in a bounded target
 table (`MPRTargetSlot`) and published as `MPRTargetCount` plus per-target
-`MPRTargetNHandle`, `MPRTargetNDeviceInfo` and `MPRTargetNSasAddress`
-properties. Publication is still gated to one nub: a topology with more than
-one disk is refused rather than choosing an arbitrary target.
+`MPRTargetNHandle`, `MPRTargetNDeviceInfo`, `MPRTargetNSasAddress`,
+`MPRTargetNReadOnly`, `MPRTargetNBlocks` and `MPRTargetNBlockSize` properties.
+Each target is probed through the read-only management chain and gets its own
+`MPRBlockDev` nub; `MPRPublishedTargetCount` counts successful publications.
+An async request carries the originating DevHandle, and the worker resolves
+geometry, admission and fast-path capability from that target's slot. The
+request frame supplies the DevHandle that `postOwnedRequestLocked()` records,
+so completions stay bound to the owning target.
 
 Access is fail-closed. `MPRWritableDevices` in the kext personality is an array
 of Model/Serial rules; only a disk whose ATA model and serial match a rule with

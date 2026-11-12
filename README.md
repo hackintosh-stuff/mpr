@@ -22,13 +22,14 @@ ABORT_TASK, LUN RESET, TARGET RESET and controller reset; sleep/wake; and
 shutdown.
 
 Multi-target discovery records every eligible device in a bounded target table
-and publishes per-device handles, device info and SAS addresses in the
-IORegistry. A topology with more than one disk is not published yet, so no
-arbitrary disk is chosen. Access is fail-closed: a nub is read-only unless an
-explicit `MPRWritableDevices` rule in the kext personality matches the disk's
-model and serial; an unidentified disk therefore cannot receive a write.
+and publishes one nub per target, each with its own geometry, identity and
+completion ownership; block I/O is routed by DevHandle. Access is fail-closed:
+a nub is read-only unless an explicit `MPRWritableDevices` rule in the kext
+personality matches the disk's model and serial, so a disk from an unknown
+array cannot receive a write. Per-target TARGET_RESET/REMOVE_DEVICE and
+hotplug/power management isolation are still being added.
 
-Not covered: more than one target, SAS/SSP drives, multipath, multiple LUNs,
+Not covered: per-target removal and recovery, SAS/SSP write paths, multipath, multiple LUNs,
 enclosure services, physical unplug/replug and power management behind the
 expander, long duration or concurrent stress, and throughput tuning.
 Wire-format and large-LBA cases are checked on the host, not on this hardware.

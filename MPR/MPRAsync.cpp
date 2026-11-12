@@ -21,7 +21,8 @@ struct MPRAsyncRequest {
     IOMemoryDescriptor *buffer;
     IOStorageCompletion completion;
     UInt64 sequence, turn, block, blocks, total, issued, completed;
-    UInt32 generation, inFlight;
+    UInt32 generation, inFlight, blockSize;
+    UInt16 devHandle;
     IOReturn status;
     bool occupied, initialized, prepared, finished, write, fua;
 };
@@ -201,7 +202,8 @@ MPRController::setAsyncAcceptance(bool enabled)
 IOReturn
 MPRController::submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
                                  UInt64 block, UInt64 nblks, bool fua,
-                                 const IOStorageCompletion *completion)
+                                 const IOStorageCompletion *completion,
+                                 UInt16 devHandle)
 {
     if (!buffer || !completion || !completion->action) return kIOReturnBadArgument;
     MPRAsyncState *state = fAsync;
@@ -227,6 +229,7 @@ MPRController::submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
     job->generation = generation;
     job->write = write;
     job->fua = fua;
+    job->devHandle = devHandle;
     job->occupied = true;
     job->status = kIOReturnSuccess;
     job->sequence = ++state->sequence;
@@ -347,22 +350,26 @@ MPRController::asyncWorker(void)
             if (job) job->turn = ++state->turn;
             IOLockUnlock(state->lock);
             if (!job) continue;
+            MPRTargetSlot *slot = findTarget(job->devHandle);
+            const UInt32 blockSize = slot != NULL ? slot->blockSize : 0;
+            const UInt64 capacityBlocks = slot != NULL ? slot->capacityBlocks : 0;
             if (fStopping || fSuspended || fDeviceOffline || fReinitInProgress ||
-                fProtocolRecoveryPending || !fMediaPresent ||
-                job->generation != fMediaGeneration || mediaRemovalPending()) {
+                fProtocolRecoveryPending || !fMediaPresent || slot == NULL ||
+                !slot->present || job->generation != fMediaGeneration ||
+                mediaRemovalPending()) {
                 job->status = kIOReturnNoMedia;
                 continue;
             }
             if (!job->initialized) {
                 job->initialized = true;
-                if (!fBlockSize || !fCapacityBlocks ||
-                    job->blocks > UINT64_MAX / fBlockSize ||
-                    (job->blocks && (job->block >= fCapacityBlocks ||
-                     job->blocks > fCapacityBlocks - job->block))) {
+                if (!blockSize || !capacityBlocks ||
+                    job->blocks > UINT64_MAX / blockSize ||
+                    (job->blocks && (job->block >= capacityBlocks ||
+                     job->blocks > capacityBlocks - job->block))) {
                     job->status = kIOReturnBadArgument;
                     continue;
                 }
-                job->total = job->blocks * fBlockSize;
+                job->total = job->blocks * blockSize;
                 if (job->buffer->getLength() < job->total) {
                     job->status = kIOReturnBadArgument;
                     continue;
@@ -371,15 +378,16 @@ MPRController::asyncWorker(void)
                 job->status = job->buffer->prepare();
                 if (job->status != kIOReturnSuccess) continue;
                 job->prepared = true;
+                job->blockSize = blockSize;
             }
             UInt64 remaining = job->total - job->issued;
             UInt32 blocks = (UInt32)((remaining < kMPRAsyncBytes ?
-                                     remaining : kMPRAsyncBytes) / fBlockSize);
+                                     remaining : kMPRAsyncBytes) / blockSize);
             if (!blocks || !fDataBuffer || !fRequestBuffer) {
                 job->status = kIOReturnNotReady;
                 continue;
             }
-            const UInt32 bytes = blocks * fBlockSize;
+            const UInt32 bytes = blocks * blockSize;
             window.offset = job->issued;
             window.bytes = bytes;
             window.mapped = false;
@@ -407,20 +415,20 @@ MPRController::asyncWorker(void)
             MPRScsiIoRequest *request = (MPRScsiIoRequest *)frame;
             UInt8 cdb[16];
             UInt32 cdbLength = mprBuildReadWriteCdb(cdb, job->write,
-                job->block + window.offset / fBlockSize, blocks,
+                job->block + window.offset / blockSize, blocks,
                 job->fua && isNativeFuaSupported());
             if (!cdbLength) {
                 cancelUnpostedCommand(smid);
                 job->status = kIOReturnBadArgument;
                 continue;
             }
-            request->DevHandle = (UInt16)fAttachedDevHandle;
+            request->DevHandle = job->devHandle;
             request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
             request->SenseBufferLowAddress = (UInt32)senseAddress(smid);
             request->SenseBufferLength = 96;
             request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
             request->DataLength = bytes;
-            request->IoFlags = (UInt16)(cdbLength | (fFastPathEnabled ?
+            request->IoFlags = (UInt16)(cdbLength | (slot->fastPath ?
                                            MPI25_SCSIIO_IOFLAGS_FAST_PATH : 0));
             request->Control = job->write ? MPI2_SCSIIO_CONTROL_WRITE :
                                             MPI2_SCSIIO_CONTROL_READ;
@@ -522,7 +530,8 @@ MPRController::asyncWorker(void)
             if (complete && job->write) {
                 ++fWriteCount;
                 fWriteBytes += window.bytes;
-                fLastWriteLba = job->block + window.offset / fBlockSize;
+                fLastWriteLba = job->block + window.offset /
+                    (job->blockSize != 0 ? job->blockSize : fBlockSize);
                 fLastWriteSmid = kMPRRuntimeSmid + index;
             }
             --job->inFlight;
