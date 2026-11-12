@@ -1233,11 +1233,29 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
      * SCSI command as if its reply were lost. It must land after bring-up:
      * a timeout while fStarting escalates to the bounded reset by design and
      * would consume the injection without exercising the TMF cascade. */
-    if (fInjectTimeout && !fStarting && smid >= 10 && smid <= 25) {
-        fInjectTimeout = false;
-        setProperty("MPRInjectTimeout", 0ULL, 8);
-        fTimedOutSmid = (UInt16)smid;
-        return false;
+    if (!fStarting && smid >= 10 && smid <= 25 &&
+        (fInjectTimeout || fInjectEvery != 0)) {
+        bool inject = false;
+
+        IOSimpleLockLock(fReplyLock);
+        if (fInjectTimeout) {
+            fInjectTimeout = false;
+            inject = true;
+        } else if (fInjectEvery != 0) {
+            if (++fInjectCounter >= fInjectEvery) {
+                fInjectCounter = 0;
+                inject = true;
+            }
+        }
+        if (inject) fInjectCount++;
+        IOSimpleLockUnlock(fReplyLock);
+
+        if (inject) {
+            setProperty("MPRInjectTimeout", 0ULL, 8);
+            setProperty("MPRInjectCount", (unsigned long long)fInjectCount, 32);
+            fTimedOutSmid = (UInt16)smid;
+            return false;
+        }
     }
     /* Only the slot owned by this SMID can satisfy the wait; a late reply for
      * another command is published to that command's slot instead. */
@@ -3345,6 +3363,9 @@ MPRController::start(IOService *provider)
     fHotplugCooldown = 0;
     fInjectTimeout = false;
     fInjectTmfFail = 0;
+    fInjectEvery = 0;
+    fInjectCounter = 0;
+    fInjectCount = 0;
     fFastPathEnabled = false;
     fSuspended = false;
     fHighPriorityCredit = 0;
@@ -3394,7 +3415,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.24");
+    setProperty("MPRBuild", "0.17.25");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
@@ -3410,10 +3431,17 @@ MPRController::start(IOService *provider)
             tmfFail > 0) {
             fInjectTmfFail = (UInt32)tmfFail;
         }
+        /* Repeatable variant for a soak: every Nth runtime command loses its
+         * reply, which drives the timeout -> TMF -> reset chain over and over. */
+        if (PE_parse_boot_argn("mpr_timeout_every", &tmfFail, sizeof(tmfFail)) &&
+            tmfFail > 1) {
+            fInjectEvery = (UInt32)tmfFail;
+        }
         setProperty("MPRInjectTimeout",
                     (unsigned long long)(fInjectTimeout ? 1 : 0), 8);
         setProperty("MPRInjectTmfFail",
                     (unsigned long long)fInjectTmfFail, 8);
+        setProperty("MPRInjectEvery", (unsigned long long)fInjectEvery, 32);
     }
 
     /* Failures during bring-up are recorded in IORegistry and never panic

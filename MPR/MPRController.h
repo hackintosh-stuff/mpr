@@ -171,6 +171,11 @@ private:
     bool                       fStopping;
     bool                       fInjectTimeout;   /* mpr_timeout_test boot-arg */
     UInt32                     fInjectTmfFail;   /* mpr_tmf_fail boot-arg */
+    /* mpr_timeout_every=N injects a lost reply every Nth runtime command, so
+     * a soak can drive the timeout/TMF/reset chain repeatedly instead of once. */
+    UInt32                     fInjectEvery;
+    UInt32                     fInjectCounter;
+    UInt32                     fInjectCount;
     bool                       fFastPathEnabled; /* SAS Device Page0 flags */
     bool                       fSuspended;       /* PM sleep in progress */
     volatile bool              fTopologyChanged; /* SAS discovery event seen */
