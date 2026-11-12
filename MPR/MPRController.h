@@ -125,6 +125,12 @@ private:
      * A link without an attached target means the IOC has not rediscovered,
      * which is a different state from an empty fabric. */
     UInt32                     fLinkUpPhys;
+    /* Write accounting: the medium is published writable, so every completed
+     * write has to be attributable to an LBA and a SMID. */
+    volatile UInt32            fWriteCount;
+    volatile UInt64            fWriteBytes;
+    volatile UInt64            fLastWriteLba;
+    volatile UInt32            fLastWriteSmid;
     /* SAS Device Page0 denied the attached handle (different handle, or a
      * non-zero access status). That is a target that needs rediscovery, not a
      * missing disk, and it must not leave the driver retrying forever. */

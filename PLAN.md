@@ -407,7 +407,25 @@ CAM SIM/XPT/CCB、bus_dma/bus_space、newbus/device_t、`taskqueue`/`callout`/`m
 并交给 worker 的受限复位，这条路径同样以媒体可读结束。因此注入钩子改为仅
 在启动完成后生效，否则会被启动期 I/O 消耗而测不到 TMF 级联（0.17.19）。
 
-### 10.4 仍然不覆盖的范围
+### 10.4 写路径受控验证（2026-11-12）
+
+介质以 `Writable = Yes` 发布，macOS 会挂载 exFAT 卷并写入，因此在
+0.17.20 增加写计数（`MPRWriteCount` / `MPRWriteBytes` / `MPRLastWriteLba` /
+`MPRLastWriteSmid`），并按"保存 → 写 → 回读 → 还原 → 回读"在
+**分区 1（Microsoft Reserved，无文件系统）** 的 8 MiB 窗口内验证写路径：
+
+| 尺寸 | 结果 |
+|---|---|
+| 512 B / 4 KiB / 64 KiB / 1 MiB / 4 MiB / 8 MiB | 写入落地、回读与写入内容逐字节一致、还原后与原文逐字节一致 |
+| 容量边界写（LBA 468862128） | 被拒绝（`EIO`），区域无变化 |
+
+计数与实际流量精确吻合：测试操作 34 次 / 2,098,176 B，末尾整窗还原
+128 次 / 8,388,608 B，合计 `MPRWriteCount=162`、`MPRWriteBytes=10,486,784`，
+`MPRLastWriteLba` 等于最后一块 64 KiB 的起始 LBA。计数只统计已经送达设备的
+64 KiB 暂存块，且记录任何来源的写——这也解释了此前"首个 64 MiB 每次启动都变"：
+macOS 通过 FSKit 挂载卷后会写元数据。
+
+### 10.5 仍然不覆盖的范围
 
 单目标、直连 SATA 原型：没有多目标隔离，没有逐目标 TARGET_RESET /
 REMOVE_DEVICE 协议，没有 SAS expander 或 RAID 卷；仍是单一暂存缓冲 + `fIOLock`

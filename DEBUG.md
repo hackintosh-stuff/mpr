@@ -79,6 +79,16 @@ Published by the controller: `MPRBuild`, `MPRIntState`, `MPREventState`,
 I/O counters `MPRBlockIOCount`, `MPRBlockIODoneBytes`, `MPRBlockIOFailure`,
 `MPRBlockIOFailureLba`/`Smid`, `MPRBlockIORetryCount`, `MPRBlockRejectReason`.
 
+Write accounting: `MPRWriteCount`, `MPRWriteBytes`, `MPRLastWriteLba`,
+`MPRLastWriteSmid`. These count completed 64 KiB staging chunks, so a write is
+visible only after its data reached the device. They record writes from any
+source, which is the point: while the medium is published writable, macOS
+mounts the volume and writes to it, and those writes must be attributable.
+A bounded verification on unallocated disk space (see section 9) showed the
+counters matching the issued traffic exactly — 34 writes / 2,098,176 bytes for
+the test operations plus 128 writes / 8,388,608 bytes for the final window
+restore — with `MPRLastWriteLba` equal to the start LBA of the last chunk.
+
 Property values are diagnostics, never acceptance criteria: a state string of
 `online` is compatible with a medium the storage stack has already dropped, and
 a medium that is present but not readable is not "recovered". Acceptance is a
@@ -186,3 +196,17 @@ byte count and SHA-256, plus a fixed-offset 64 MiB reference range that must
 hash identically before and after the cycle. In-flight cycles run continuous
 256 MiB reads so the unplug lands inside one of them; that read must terminate
 with an error rather than a timeout hang.
+
+Write verification uses a region with no filesystem of its own — partition 1,
+the Microsoft Reserved area — so no file data is at risk, and it runs as
+save → write → readback → restore → readback: the restored bytes must hash
+identically to the saved copy, and the region's fingerprint must match before
+and after. Sizes 512 B, 4 KiB, 64 KiB, 1 MiB, 4 MiB and 8 MiB all round-trip
+byte-exactly; a write at the capacity boundary is rejected with `EIO` and the
+region is unchanged. Open the raw node once with `O_RDWR | O_EXCL` for the
+whole test: a mounted volume makes every later write-open fail with `EBUSY`,
+which is the operating system protecting a filesystem it believes it owns.
+
+Offsets in `dd` are in `bs` units, so `bs=1m seek=34` is byte 34 MiB, not LBA
+34. Use `oflag=seek_bytes`/`iflag=skip_bytes`, or byte offsets through
+`pread`/`pwrite`, whenever the target is an LBA.

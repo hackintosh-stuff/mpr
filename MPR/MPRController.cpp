@@ -283,6 +283,10 @@ MPRController::serviceProtocolState(void)
     setProperty("MPRBadReplyFunction", (unsigned long long)fBadReplyFunction, 8);
     setProperty("MPRBadReplyMsgLen", (unsigned long long)fBadReplyMsgLen, 8);
     setProperty("MPRBadReplyWord", (unsigned long long)fBadReplyWord, 32);
+    setProperty("MPRWriteCount", (unsigned long long)fWriteCount, 32);
+    setProperty("MPRWriteBytes", (unsigned long long)fWriteBytes, 64);
+    setProperty("MPRLastWriteLba", (unsigned long long)fLastWriteLba, 64);
+    setProperty("MPRLastWriteSmid", (unsigned long long)fLastWriteSmid, 16);
 }
 
 void
@@ -2592,6 +2596,12 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
             }
         } else {
             done += (UInt64)chunkBytes;
+            /* A completed write is the only observable evidence that the
+             * writable medium was modified; record what and where. */
+            fWriteCount++;
+            fWriteBytes += (UInt64)chunkBytes;
+            fLastWriteLba = lba;
+            fLastWriteSmid = smid;
         }
     }
 out:
@@ -3099,6 +3109,10 @@ MPRController::start(IOService *provider)
     fBadReplySite = fBadReplyValue = fBadReplySmid = fBadReplyCount = 0;
     fBadReplyFunction = fBadReplyMsgLen = fBadReplyWord = 0;
     fLinkUpPhys = 0;
+    fWriteCount = 0;
+    fWriteBytes = 0;
+    fLastWriteLba = 0;
+    fLastWriteSmid = 0;
     fSasDeviceMismatch = false;
     fIdentityLostCount = 0;
     fTopologyGeneration = 0;
@@ -3186,7 +3200,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.19");
+    setProperty("MPRBuild", "0.17.20");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
