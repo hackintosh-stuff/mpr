@@ -7,10 +7,10 @@ MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 disk through `IOBlockStorageDriver` as a whole-disk `IOMedia`.
 
 This source version implements the disk path and controller mechanisms listed
-below. Host-side protocol checks and Darwin-target object compilation have
-passed; it has not been loaded or qualified on the test machine. The available
-acceptance hardware is one backplane and one SATA disk. Source support for discovering
-a disk behind an expander is not evidence of expander hardware qualification.
+below. It is built, loaded and qualified on the test machine (macOS 26.7.2).
+Acceptance hardware is one Adaptec AEC-82885T expander, one backplane and one
+SATA disk: a single terminal disk behind the expander is published as a
+whole-disk `IOMedia` and passes bounded read/write/flush/UNMAP checks.
 
 ## Implemented capabilities
 

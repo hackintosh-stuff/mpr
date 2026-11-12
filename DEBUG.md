@@ -87,6 +87,12 @@ Discovery combines SAS IO Unit Page 0 with SAS Device Page 0 GET_NEXT_HANDLE.
 The latter reaches a terminal disk behind an expander backplane. It does not
 create a multi-target storage stack. Multiple eligible disks are refused.
 
+GET_NEXT_HANDLE also returns SCSI Enclosure Processor (SEP/SES) devices attached
+to an expander. They carry SSP end-device bits but are not block disks, so
+candidates with `MPI2_SAS_DEVICE_INFO_SEP` are excluded from both the disk
+count and the standalone-target count. Without this exclusion the single-target
+guard counts an enclosure processor as a second disk and refuses publication.
+
 On IR-capable firmware, RAID Configuration Page 0 is enumerated to exclude
 volumes, member disks, hot spares and expansion members. Configuration
 transport failures or malformed pages fail closed. IR change events retire

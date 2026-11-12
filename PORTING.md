@@ -107,15 +107,15 @@ compatibility with those untested devices.
 | Check | Result |
 |---|---|
 | Host protocol helpers with AddressSanitizer and UndefinedBehaviorSanitizer | Passed: 136,593 assertions and 2,000 deterministic SGL cases; generated cases include intentional rejection cases |
-| Build inputs and whitespace | Passed: all four translation units included, version 0.18.0 consistent, LF text and clean diff whitespace |
-| Darwin-target object compilation | Passed: clang 19.1.5, project MacKernelSDK, `x86_64-apple-macos11.0`; four Mach-O x86_64 objects, no compiler diagnostics |
-| Driver-internal cross-translation-unit symbols | No unresolved driver-internal symbols in the four objects; kernel linking is a separate check |
-| Compiled snapshot versus delivered source | All 12 driver source/header/plist files matched by SHA-256 |
-| Native macOS kext link, sign and load | Not run: the known test-machine SSH endpoints were unreachable |
-| DMA/IRQ, disk I/O, hotplug, timeout recovery, sleep/wake and shutdown | Not run on hardware for this source version |
+| Build inputs and whitespace | Passed: all four translation units included, LF text and clean diff whitespace |
+| Darwin-target object compilation | Passed: macOS Command Line Tools clang with the project MacKernelSDK; four objects, no diagnostics under `-Wall -Wextra -Werror` |
+| Driver-internal cross-translation-unit symbols | No unresolved driver-internal symbols; ad-hoc signed kext links with `_kmod_info`, `_start` and `_stop` |
+| Native macOS kext link, sign and load | Passed: loaded from the internal ESP; version confirmed with `kmutil showloaded` and `MPRBuild` |
+| Expander discovery and media publication | Passed: one SATA disk behind an Adaptec AEC-82885T expander/backplane; SEP/SES enclosure devices excluded from standalone targets |
+| Bounded disk I/O behind an expander | Passed: two identical streamed reads, concurrent reads, WRITE -> flush -> readback and UNMAP, with all written ranges restored |
+| Physical hotplug, timeout/TMF injection, sleep/wake and shutdown | Qualified on the directly attached configuration; not repeated behind an expander |
 
-This version has not been installed, booted, stress-tested, physically
-hotplug-tested or power-cycle-tested on the target. Prior version results
-are historical evidence only and do not qualify the changed DMA, async,
-identity, topology or PM paths. No deployment, restart or disk write was
-performed during this work.
+Expander qualification covers one terminal disk. High-LBA, malformed pages and
+alternate descriptor shapes remain host-side protocol cases. Long-duration
+stress and physical unplug/replug behind an expander are outside the current
+evidence.
