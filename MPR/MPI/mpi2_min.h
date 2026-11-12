@@ -502,6 +502,10 @@ static_assert(sizeof(MPREventDataSasDiscovery) == 0x08, "SAS discovery data layo
 #define MPI2_SAS_DEVICE_INFO_SATA_DEVICE           0x00000080
 #define MPI2_SAS_DEVICE_INFO_END_DEVICE            0x00000001
 #define MPI2_SAS_DEVICE_INFO_DIRECT_ATTACH         0x00000800
+/* SCSI Enclosure Processor (SEP/SES/vSES): mpi2_sas.h:103. Such a device is
+ * an SSP end device but not a block disk; without this bit it is counted as
+ * a standalone target whenever an expander is present. */
+#define MPI2_SAS_DEVICE_INFO_SEP                   0x00004000
 /* SAS Device Page0 Flags (mpi2_cnfg.h:2762-2763). Fast-path descriptors and
  * IoFlags are only valid when both bits are set. */
 #define MPI25_SAS_DEVICE0_FLAGS_FAST_PATH_CAPABLE  0x2000

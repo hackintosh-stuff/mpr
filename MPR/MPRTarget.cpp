@@ -209,15 +209,19 @@ MPRController::readSasIOUnitPage0(void)
         UInt32 info = mprReadLe32(page + 0x1C);
         UInt16 flags = mprReadLe16(page + 0x20);
         if ((info & 7) == 2 || (info & 7) == 3) expander = true;
+        /* SES/vSEP enclosure processors behind an expander are SSP end
+         * devices too, but not block disks. Counting them as standalone
+         * targets makes the single-target guard refuse the real disk. */
         if ((info & 7) == MPI2_SAS_DEVICE_INFO_END_DEVICE &&
             (info & (MPI2_SAS_DEVICE_INFO_SATA_DEVICE | MPI2_SAS_DEVICE_INFO_STP_TARGET |
                      MPI2_SAS_DEVICE_INFO_SSP_TARGET)) != 0 &&
-            (info & MPI2_SAS_DEVICE_INFO_ATAPI_DEVICE) == 0 &&
+            (info & (MPI2_SAS_DEVICE_INFO_ATAPI_DEVICE | MPI2_SAS_DEVICE_INFO_SEP)) == 0 &&
             (flags & MPI2_SAS_DEVICE0_FLAGS_DEVICE_PRESENT) != 0) disks++;
         if ((info & 7) != MPI2_SAS_DEVICE_INFO_END_DEVICE ||
             (info & (MPI2_SAS_DEVICE_INFO_SATA_DEVICE | MPI2_SAS_DEVICE_INFO_STP_TARGET |
                      MPI2_SAS_DEVICE_INFO_SSP_TARGET)) == 0 ||
-            (info & MPI2_SAS_DEVICE_INFO_ATAPI_DEVICE) != 0 || page[0x17] != 0 ||
+            (info & (MPI2_SAS_DEVICE_INFO_ATAPI_DEVICE | MPI2_SAS_DEVICE_INFO_SEP)) != 0 ||
+            page[0x17] != 0 ||
             (flags & MPI2_SAS_DEVICE0_FLAGS_DEVICE_PRESENT) == 0 ||
             (flags & (MPI2_SAS_DEVICE0_FLAGS_UNSUPPORTED_DEVICE |
                       MPI2_SAS_DEVICE0_FLAGS_UNAUTHORIZED_DEVICE)) != 0) continue;

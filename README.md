@@ -1,6 +1,6 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-12. Driver version: 0.18.0.
+Date: 2026-11-13. Driver version: 0.18.1.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes one independent

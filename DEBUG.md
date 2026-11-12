@@ -1,6 +1,6 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-12. Driver version: 0.18.0.
+Date: 2026-11-13. Driver version: 0.18.1.
 
 This document describes source behavior and diagnostics. It does not claim
 that the current source has passed runtime acceptance. See [PORTING.md](PORTING.md)
