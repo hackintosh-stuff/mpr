@@ -519,7 +519,25 @@ macOS 通过 FSKit 挂载卷后会写元数据。
 
 越界请求的读/写分类（上一轮遗留的模糊观测）由此闭环：越界**读**不报错（EOF），越界**写**无一例外被容量门拒绝。
 
-### 10.10 仍然不覆盖的范围
+### 10.10 故障注入长跑（2026-11-12，两次短程，均未跑满）
+
+`mpr_timeout_every=N` 下做了两轮 30 分钟长跑（N=20000 与 N=200000），**两轮都没有跑满，也没有写出 `SOAK-DONE.json`**。原因是测试脚本：目标机上部署的仍是旧版 `soak.py`，参考区 `digest()` 在介质重建窗口里 `os.pread` 抛异常，异常越过 `finally` 后直接终止进程。修复版（异常可容错、标记必落盘）写完并验证后**漏了 scp 部署**，现已部署并校验语法。这是操作疏漏，不是驱动缺陷；完成标记缺失本身正确反映了"运行未结束"。
+
+两轮在退出前都只消费了 **1 次注入**（`MPRInjectCount=1`），且驱动行为完全一致、可复现：
+
+| 步骤 | 证据 |
+|---|---|
+| 回复丢失 | `MPRLastIOFailure=reply-timeout`（等满 15 秒） |
+| TMF | `MPRTmfTaskType=1`（ABORT_TASK）、`MPRTmfState=ok`、`MPRRecoveryState=ok` |
+| 媒体仍下线 | `invalidateMedia()`：`MPRMediaOfflineCause=device-offline`，generation 1→3 |
+| 复位 | `MPRResetCount=1`、`MPRResetInitiator=hotplug`、`HotplugResetResult=ok` |
+| 结果 | 媒体重新发布并可读，`MPRStickyFaultCode=0`，无 panic |
+
+根因在 `recoverTimedOutCommand()`：`recovered` 虽为真，但 `removed = fRemovalPending` 被一条**没有物理拔插**的 `PHY_CHANGED` 锁存，于是走 `invalidateMedia()`。这正是 0.17.21「附着 phy 的任何变化即视为移除」规则的已知代价；该规则保证 2 秒快速拔插必定下线旧媒体，用户决定保留它，接受注入超时附带一次确定性重建。
+
+两轮结束后环境均已复原：MSR 窗口 `4fc4669e12c460f2`、`fsck_exfat -n` OK、`config.plist` 回到基线 `71b96d2b…857954f`、重启后 `MPRInjectEvery=0`。**完整的 30 分钟注入长跑仍待重跑**（脚本已修并部署）。
+
+### 10.11 仍然不覆盖的范围
 
 单目标、直连 SATA 原型：没有多目标隔离，没有逐目标 TARGET_RESET /
 REMOVE_DEVICE 协议，没有 SAS expander 或 RAID 卷；仍是单一暂存缓冲 + `fIOLock`
