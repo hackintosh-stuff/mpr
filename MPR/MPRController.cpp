@@ -2195,8 +2195,9 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
         UInt64 lba;
         bool ok = false;
         IOReturn ioStatus = kIOReturnSuccess;
-        /* A write whose result is unknown must not be replayed blindly. */
-        UInt32 maxAttempts = write ? 1 : 3;
+        /* A write whose result is unknown must not be replayed blindly.
+         * Reads tolerate the UNIT ATTENTION a SATA link raises after reset. */
+        UInt32 maxAttempts = write ? 1 : 5;
 
         remaining = byteCount - done;
         want = remaining / fBlockSize;
@@ -2232,7 +2233,13 @@ MPRController::transferBlocks(bool write, IOMemoryDescriptor *buffer,
                                smid, false, fua, &ioStatus);
             if (!ok) {
                 fIoRetryCount++;
-                IOSleep(10);
+                if (ioStatus == kIOReturnNotReady) {
+                    /* UNIT ATTENTION: clear it with TUR before retrying. */
+                    scsiTur();
+                    IOSleep(50);
+                } else {
+                    IOSleep(10);
+                }
             }
         }
         if (!ok) {
@@ -2746,7 +2753,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.17.9");
+    setProperty("MPRBuild", "0.17.10");
     setProperty("MPRFeatures",
                 "write10,synchronize-cache10,unmap,auto-sense,tmf,diag-reset");
     {
