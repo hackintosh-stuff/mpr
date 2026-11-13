@@ -1,6 +1,6 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.20.8.
+Date: 2026-11-13. Driver version: 0.20.9.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
@@ -124,7 +124,8 @@ table (`MPRTargetSlot`) and published as `MPRTargetCount` plus per-target
 `MPRTargetNReadOnly`, `MPRTargetNBlocks`, `MPRTargetNBlockSize`,
 `MPRTargetNIdentity`, `MPRTargetNModel`, `MPRTargetNSerial`,
 `MPRTargetNRemovalState`, `MPRTargetNGeneration`,
-`MPRTargetNWriteCount` and `MPRTargetNFailureCount` properties.
+`MPRTargetNProbeState`, `MPRTargetNProbeRetries`, `MPRTargetNWriteCount` and
+`MPRTargetNFailureCount` properties.
 Each target is probed through the read-only management chain and gets its own
 `MPRBlockDev` nub; `MPRPublishedTargetCount` counts successful publications.
 An async request carries the originating DevHandle, and the worker resolves
@@ -186,13 +187,33 @@ the same BSD disk number is republished. A retired slot whose disk does not
 return is released once a fresh medium is published, so repeated replugs do not
 exhaust the target table.
 
-A target that is present but not yet published is probed in place. Probing is
-bounded per target: after three failed attempts the disk is left offline until
-it is physically reinserted, and the remaining targets keep their media. A
-repeated probe failure or a removal that cannot be proved escalates to the
-bounded IOC reset, capped at three per insertion. An empty fabric, including an
-expander with no eligible terminal disk, is polled without an endless reset
-loop.
+A present target that has not been published yet is probed in place through the
+read-only chain (TUR, INQUIRY, VPD, READ CAPACITY, MODE SENSE, READ). Every
+pass is classified from the decoded SCSI status: `ok`, `not-ready` (sense 0x02,
+UNIT ATTENTION, BUSY) or `failed` (illegal request, media or hardware error,
+timeout, malformed or short reply). `validateScsiCompletion()` publishes its
+decoded result into one word protected by `fIOLock`, so the chain needs no
+allocation and no per-helper out-parameters; each stage starts with a clean
+status, so an expected fallback such as RC16 -> RC10 behind a SATA bridge
+cannot decide a later stage. `MPRTargetNProbeState` and
+`MPRTargetNProbeStatus` report the last classification and its raw status.
+
+A `not-ready` pass only asks the worker for another scan at its one-second
+cooldown: it does not count as a failure and does not set `probeFailed`. One
+per-target counter, `MPRTargetNProbeRetries` (summed in `MPRProbeRetries`),
+bounds both a slow spin-up and a broken disk at 60 unsuccessful passes and
+replaces the earlier separate failure/give-up limits. A definite failure
+escalates to the bounded IOC reset after three passes, capped at three resets
+per insertion; a device that never becomes ready is treated as failed when its
+budget runs out and is then left offline. `prepareTargetMedia()` issues one read
+per pass, so the same target never has two retry budgets, and no sleep is taken
+under `fIOLock`. An empty fabric, including an expander with no eligible
+terminal disk, is polled without an endless reset loop.
+
+A config-page management timeout is a different condition: the IOC may still
+own the timed-out request frame, so `finishManagementRequest()` quarantines it
+and records a protocol fault that the worker recovers with one bounded IOC
+reset. That recovery is not a probe failure and is deliberately retained.
 
 Timeout recovery attempts ABORT TASK, LUN RESET and TARGET RESET, each naming
 the handle recorded for the failed SMID, subject to available TMF credit and
@@ -227,15 +248,21 @@ after DMA stop is proved.
 Wake restores PCI access, rebuilds queues/events/topology, re-enumerates and
 re-probes every present target, then reopens acceptance; each medium takes
 OFFLINE -> ONLINE around that rebuild. The fabric needs a moment to settle, so
-the wake path waits 1.5 s after the IOC reset before probing, tolerates three
-probe failures in place, and ignores a non-operational doorbell for four
-watchdog ticks, because after wake the IOC can report standby while it comes up.
-A disk that is still spinning up can outlast that budget; the bounded reset then
-runs and the media come back through it. When recovery completes the worker sets
-`MPRPowerState` to `on`, so a wake that needed it does not keep reporting
-`wake-recovery-pending`. `systemWillShutdown` follows the same quiesce path.
-Sleep/wake and shutdown are qualified on the directly attached disk and with two
-targets behind the expander.
+the wake path waits 1.5 s after the IOC reset before probing and ignores a
+non-operational doorbell for four watchdog ticks, because after wake the IOC
+can report standby while it comes up. `fResumeGraceTicks` and that 1.5 s delay
+are retained.
+
+A target that answers NOT READY at the wake probe is left to the hotplug
+worker: `resumePower()` records `MPRWakeNotReadyCount` but does not invalidate
+every medium or force an extra IOC reset on that account. The worker owns the
+single retry budget and sets `MPRPowerState` to `on` when media recover, so a
+wake that needed recovery does not keep reporting `wake-recovery-pending`. A
+config-page management timeout during settling is still a protocol fault and
+still needs one bounded controller rebuild, as described in section 4; that is
+why a wake still increments `MPRResetCount` once. `systemWillShutdown` follows
+the same quiesce path. Sleep/wake and shutdown are qualified on the directly
+attached disk and with two targets behind the expander.
 
 Stop waits for the I/O and completion workers outside the transport lock,
 then tears down DMA. Scheduler/transport locks remain alive until final
@@ -245,15 +272,15 @@ service release so callers retained before stop can unwind safely.
 
 | Area | Useful IORegistry properties |
 |---|---|
-| Build and media | `MPRBuild`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady`, `MPRPublishedTargetCount` |
-| Targets | `MPRTargetCount`, `MPRTargetNHandle`, `MPRTargetNSasAddress`, `MPRTargetNPresent`, `MPRTargetNProbed`, `MPRTargetNOnline`, `MPRTargetNRemovalState`, `MPRTargetNMediaStatus`, `MPRTargetNGeneration` |
+| Build and media | `MPRBuild`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady`, `MPRMediaReadyStatus`, `MPRPublishedTargetCount` |
+| Targets | `MPRTargetCount`, `MPRTargetNHandle`, `MPRTargetNSasAddress`, `MPRTargetNPresent`, `MPRTargetNProbed`, `MPRTargetNProbeState`, `MPRTargetNProbeStatus`, `MPRTargetNProbeRetries`, `MPRTargetNOnline`, `MPRTargetNRemovalState`, `MPRTargetNMediaStatus`, `MPRTargetNGeneration` |
 | Discovery and removal | `MPRScanCount`, `MPRRemovedMediaCount`, `MPRRemovalFailures`, `MPRRemovalStage`, `MPRRetiredSlotsReleased`, `MPRRediscoveryResets`, `MPRRediscoveryState`, `MPRFaultRecoveries`, `MPRFaultRecoveryState` |
 | Async and DMA | `MPRAsyncRequestLimit`, `MPRAsyncCommandLimit`, `MPRAsyncPeakRequests`, `MPRMappedCommands`, `MPRChainedCommands`, `MPRBounceCommands` |
 | Identity/filter | `MPRStableIdentityValid`, `MPRStableIdentity`, `MPRIdentityState`, `MPRRaidFilterState`, `MPRStandaloneTargetCount`, `MPRSasDevicePageState` |
 | Capabilities | `MPRNativeFuaSupported`, `MPRFuaPolicy`, `MPRUnmapEnabled`, `MPRUnmapMaxLbaCount`, `MPRUnmapMaxDescriptors`, `MPRUnmapReadsZero` |
-| Recovery | `MPRHotplugState`, `MPRResetCount`, `MPRReinitState`, `MPRRecoveryState`, `MPRDeviceOffline`, `MPRTmfHandle`, `MPRTmfResetStatus` |
+| Recovery | `MPRHotplugState`, `MPRProbeRetries`, `MPRResetCount`, `MPRResetInitiator`, `MPRReinitState`, `MPRRecoveryState`, `MPRFaultRecoveries`, `MPRFaultRecoveryState`, `MPRDeviceOffline`, `MPRTmfHandle`, `MPRTmfResetStatus` |
 | Protocol | `MPRProtocolRecoveryPending`, `MPRProtocolFaultCode`, `MPRStickyFaultCount`, `MPRBadReplySite`, `MPREventAckQueued`, `MPREventAckFailed` |
-| Power | `MPRPowerState`, `MPRPowerFlushStatus`, `MPRPowerFlushCount`, `MPRStopDMAState`, `MPRWatchdogIOCState` |
+| Power | `MPRPowerState`, `MPRPowerFlushStatus`, `MPRPowerFlushCount`, `MPRStopDMAState`, `MPRWatchdogIOCState`, `MPRWakeNotReadyCount` |
 | Writes | `MPRWriteCount`, `MPRWriteBytes`, `MPRLastWriteLba`, `MPRLastWriteSmid`, `MPRTargetNWriteCount`, `MPRTargetNFailureCount` |
 
 A property saying "online" is not data-integrity evidence. Always pair it with

@@ -53,6 +53,22 @@ struct MPRCommandOwner {
     UInt32 epoch;
 };
 
+/* A probe pass ends in one of three states. A device that is still becoming
+ * ready after a wake is retried; only a definite failure consumes the bounded
+ * recovery budget. */
+enum MPRProbeResult {
+    kMPRProbeOk = 0,
+    kMPRProbeNotReady,
+    kMPRProbeFailed
+};
+/* One per-target budget covers both a slow spin-up and a broken disk: the
+ * worker probes at a one-second cooldown, so 60 unsuccessful passes is also
+ * roughly 60 seconds before the target converges to offline. */
+enum { kMPRMaxProbeRetries = 60 };
+/* A definite failure escalates to the bounded IOC reset after this many
+ * unsuccessful passes. */
+enum { kMPRProbeResetThreshold = 3 };
+
 /* Per-target state for multi-target isolation. A DevHandle is a firmware
  * address, not a disk: it can name a different device after a replug, so each
  * slot also carries the SAS address, stable identity and medium generation it
@@ -91,7 +107,11 @@ struct MPRTargetSlot
      * to the step that produced it instead of being flattened to "requested". */
     char   removalState[24];
     UInt32 scanToken;       /* last topology scan that listed this handle */
-    UInt32 probeFailures;   /* bounded read-only probe retries for this device */
+    /* A single budget for consecutive unsuccessful probe passes, whether the
+     * device was not ready or genuinely failed. Cleared by a successful probe
+     * and by a fresh insertion. */
+    UInt32 probeRetries;
+    MPRProbeResult probeState; /* ok / not-ready / failed, last pass */
     UInt32 failureCount;
     UInt32 writeCount;
     bool   unmapEnabled;
@@ -280,6 +300,11 @@ private:
     UInt32                     fNextIoSmid;
     volatile UInt32            fIoCount;
     volatile UInt32            fIoRetryCount;
+    /* The probe chain is serialized by fIOLock, so it can publish the decoded
+     * status of its last command in one word instead of allocating or taking
+     * another lock while classification travels up to probeTarget(). */
+    IOReturn                   fLastProbeStatus;
+    bool                       fProbeInProgress;
 
     /* recovery, sense decoding and the write/UNMAP feature gates. */
     UInt16                     fFrozenSmid;      /* held until TMF completes */
@@ -442,7 +467,10 @@ private:
     bool   prepareTargetMedia(void);
     bool   ensureTargetsPublished(void);
     bool   publishTarget(MPRTargetSlot *slot);
-    bool   probeTarget(MPRTargetSlot *slot);
+    MPRProbeResult probeTarget(MPRTargetSlot *slot);
+    void   beginProbeStage(void);
+    void   noteProbeStatus(IOReturn status);
+    void   recordProbeResult(MPRTargetSlot *slot, MPRProbeResult result);
     bool   selectTarget(UInt16 handle);
     MPRTargetSlot *allocTargetSlot(void);
     void   requestTargetRemoval(MPRTargetSlot *slot);

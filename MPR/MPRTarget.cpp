@@ -336,7 +336,8 @@ MPRController::readSasIOUnitPage0(void)
              * probe budget starts over. */
             slot->present = true;
             slot->removalRequested = false;
-            slot->probeFailures = 0;
+            slot->probeRetries = 0;
+            slot->probeState = kMPRProbeOk;
             if (!slot->probeValid) slot->generation++;
             if (slot->nub != NULL) slot->onlinePending = false;
         }
@@ -684,17 +685,15 @@ MPRController::prepareTargetMedia(void)
     }
     UInt32 blocks = fCapacityBlocks < 8 ? (UInt32)fCapacityBlocks : 8;
     if (blocks > fDataBytes / fBlockSize) blocks = fDataBytes / fBlockSize;
-    bool ready = false;
-    for (UInt32 attempt = 0; attempt < 5 && blocks != 0; attempt++) {
-        if (fStopping || fProtocolRecoveryPending) break;
-        (void)scsiTur();
-        IOReturn status = kIOReturnNotReady;
-        if (scsiReadWrite(false, 0, blocks, fBlockSize, 9, false, false, &status)) {
-            ready = true; break;
-        }
-        if (status != kIOReturnNotReady && status != kIOReturnBusy) break;
-        IOSleep(100);
-    }
+    /* One read per probe pass. A device that is still spinning up answers
+     * NOT READY or BUSY, and the hotplug worker owns the single per-target
+     * retry budget at its one-second cooldown. Retrying here too would create
+     * a second budget for the same target and sleep under fIOLock. */
+    (void)scsiTur();
+    IOReturn status = kIOReturnIOError;
+    bool ready = blocks != 0 &&
+        scsiReadWrite(false, 0, blocks, fBlockSize, 9, false, false, &status);
+    setProperty("MPRMediaReadyStatus", (unsigned long long)(UInt32)status, 32);
     ready = ready && !fProtocolRecoveryPending && fPageBuffer != NULL &&
             fDataBuffer != NULL && fDataBytes != 0;
     setProperty("MPRMediaReady", ready);
@@ -909,6 +908,12 @@ MPRController::publishTargetProperties(void)
         setProperty(name, slot->present);
         snprintf(name, sizeof(name), "MPRTarget%uProbed", (unsigned)i);
         setProperty(name, slot->probeValid);
+        snprintf(name, sizeof(name), "MPRTarget%uProbeState", (unsigned)i);
+        setProperty(name, slot->probeState == kMPRProbeOk ? "ok" :
+                          slot->probeState == kMPRProbeNotReady ?
+                          "not-ready" : "failed");
+        snprintf(name, sizeof(name), "MPRTarget%uProbeRetries", (unsigned)i);
+        setProperty(name, (unsigned long long)slot->probeRetries, 32);
         snprintf(name, sizeof(name), "MPRTarget%uOnline", (unsigned)i);
         setProperty(name, slot->online);
         snprintf(name, sizeof(name), "MPRTarget%uReadOnly", (unsigned)i);
@@ -944,6 +949,10 @@ MPRController::publishTargetCounters(void)
     setProperty("MPRRediscoveryResets", (unsigned long long)fRediscoveryResets, 32);
     /* Called from the watchdog: the counters move without a topology event, so
      * they are republished periodically instead of only on publication. */
+    UInt32 probeRetries = 0;
+    for (UInt32 i = 0; i < kMPRMaxTargets; i++)
+        probeRetries += fTargets[i].probeRetries;
+    setProperty("MPRProbeRetries", (unsigned long long)probeRetries, 32);
     for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
         MPRTargetSlot *slot = &fTargets[i];
         if (slot->handle == 0 && slot->nub == NULL) continue;
@@ -952,6 +961,12 @@ MPRController::publishTargetCounters(void)
         setProperty(name, (unsigned long long)slot->writeCount, 32);
         snprintf(name, sizeof(name), "MPRTarget%uFailureCount", (unsigned)i);
         setProperty(name, (unsigned long long)slot->failureCount, 32);
+        snprintf(name, sizeof(name), "MPRTarget%uProbeState", (unsigned)i);
+        setProperty(name, slot->probeState == kMPRProbeOk ? "ok" :
+                          slot->probeState == kMPRProbeNotReady ?
+                          "not-ready" : "failed");
+        snprintf(name, sizeof(name), "MPRTarget%uProbeRetries", (unsigned)i);
+        setProperty(name, (unsigned long long)slot->probeRetries, 32);
         snprintf(name, sizeof(name), "MPRTarget%uOnline", (unsigned)i);
         setProperty(name, slot->online);
     }
@@ -1013,10 +1028,11 @@ MPRController::liveTargetCount(void)
     return live;
 }
 
-bool
+MPRProbeResult
 MPRController::probeTarget(MPRTargetSlot *slot)
 {
-    if (slot == NULL || slot->handle == 0 || !slot->present) return false;
+    if (slot == NULL || slot->handle == 0 || !slot->present)
+        return kMPRProbeFailed;
     /* The shared probe chain is read-only (TUR, INQUIRY, VPD, READ CAPACITY,
      * MODE SENSE, READ) and serialised by fIOLock. Its controller-level state
      * belongs to the slot being probed and is copied back before the next
@@ -1041,16 +1057,45 @@ MPRController::probeTarget(MPRTargetSlot *slot)
     UInt32 index = (UInt32)(slot - fTargets);
     char name[48];
     const char *stage = NULL;
-    if (!probeScsiIdentity()) stage = "scsi-identity";
-    else if (!probeCapacity()) stage = "capacity";
-    else if (!probeBlockRead()) stage = "block-read";
-    else if (!prepareTargetMedia()) stage = "media";
+    IOReturn status = kIOReturnSuccess;
+    /* Each stage starts with a clean classification: an expected fallback
+     * within one stage (RC16 rejected by a SATA bridge, then RC10) must not
+     * decide the outcome of a later stage. */
+    fProbeInProgress = true;
+    beginProbeStage();
+    if (!probeScsiIdentity()) {
+        stage = "scsi-identity";
+    } else {
+        beginProbeStage();
+        if (!probeCapacity()) {
+            stage = "capacity";
+        } else {
+            beginProbeStage();
+            if (!probeBlockRead()) {
+                stage = "block-read";
+            } else {
+                beginProbeStage();
+                if (!prepareTargetMedia()) stage = "media";
+            }
+        }
+    }
+    status = fLastProbeStatus;
+    fProbeInProgress = false;
     if (stage != NULL) {
+        /* Only a decoded NOT READY / UNIT ATTENTION / BUSY means the device is
+         * on the fabric but still becoming ready. A chain that failed without
+         * any decoded status (timeout, missing buffer, malformed reply) or
+         * with a real SCSI error is a definite failure. */
+        MPRProbeResult result =
+            (status == kIOReturnNotReady || status == kIOReturnBusy)
+                ? kMPRProbeNotReady : kMPRProbeFailed;
         snprintf(name, sizeof(name), "MPRTarget%uProbe", index);
-        setProperty(name, "failed");
+        setProperty(name, result == kMPRProbeNotReady ? "not-ready" : "failed");
         snprintf(name, sizeof(name), "MPRTarget%uProbeStage", index);
         setProperty(name, stage);
-        return false;
+        snprintf(name, sizeof(name), "MPRTarget%uProbeStatus", index);
+        setProperty(name, (unsigned long long)(UInt32)status, 32);
+        return result;
     }
     bool changed = slot->probeValid &&
         (strcmp(slot->identity, fTargetIdentity) != 0 ||
@@ -1091,7 +1136,9 @@ MPRController::probeTarget(MPRTargetSlot *slot)
     slot->probeValid = true;
     snprintf(name, sizeof(name), "MPRTarget%uProbe", index);
     setProperty(name, "ok");
-    return true;
+    snprintf(name, sizeof(name), "MPRTarget%uProbeStatus", index);
+    setProperty(name, 0ULL, 32);
+    return kMPRProbeOk;
 }
 
 bool
@@ -1147,10 +1194,17 @@ MPRController::ensureTargetsPublished(void)
     for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
         MPRTargetSlot *slot = &fTargets[i];
         if (slot->handle == 0 || !slot->present) continue;
-        if (!slot->probeValid && !probeTarget(slot)) {
-            slot->failureCount++;
-            allOk = false;
-            continue;
+        if (!slot->probeValid) {
+            MPRProbeResult result = probeTarget(slot);
+            recordProbeResult(slot, result);
+            if (result != kMPRProbeOk) {
+                /* A still-spinning disk is not a failed target; the hotplug
+                 * worker owns its remaining probes. Only a definite failure
+                 * counts against this device. */
+                if (result == kMPRProbeFailed) slot->failureCount++;
+                allOk = false;
+                continue;
+            }
         }
         if (!publishTarget(slot)) {
             slot->failureCount++;

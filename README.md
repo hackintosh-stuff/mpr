@@ -1,6 +1,6 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.20.8.
+Date: 2026-11-13. Driver version: 0.20.9.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes every eligible
@@ -51,7 +51,14 @@ long duration or concurrent stress, and throughput tuning are out of scope.
 Wire-format and large-LBA cases are checked on the host, not on this hardware.
 Sleep and wake with both targets attached was exercised: sleep flushes the
 writable target, and wake brings both media back at their own disk numbers in
-about 20 s, one bounded reset included while the fabric and the disks come up.
+under 25 s with `MPRPowerState` back at `on`; the array member's LBA0 digest is
+unchanged. A disk that is still becoming ready is retried in place instead of
+being counted as a failed probe, so a slow spin-up cannot by itself escalate to
+an IOC reset. A wake still includes one bounded controller rebuild, and
+`MPRResetCount` grows by one: on this machine a config-page management timeout
+while the fabric settles needs that recovery, because the IOC may still own the
+timed-out request frame. Eliminating that last reset is outside the probe
+classification and is not claimed here.
 
 ## Capabilities
 
@@ -73,7 +80,10 @@ about 20 s, one bounded reset included while the fabric and the disks come up.
   completion.
 - Per-target media offline/online lifecycle, guarded TARGET_RESET / drain /
   REMOVE_DEVICE with handle-reuse checks, and bounded full-controller recovery
-  as the fallback when a removal or probe cannot be proved.
+  as the fallback when a removal or a definite probe failure cannot be proved.
+- Three-way probe classification (ok / not-ready / failed) with one bounded
+  per-target retry budget: a device answering NOT READY, UNIT ATTENTION or BUSY
+  is retried without consuming the failure budget or triggering an IOC reset.
 - Registered power states: per-target flush, then DMA stop for sleep and
   shutdown; rebuild and per-target revalidation on wake.
 

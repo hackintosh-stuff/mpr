@@ -2704,6 +2704,10 @@ MPRController::probeCapacity(void)
     if (ok) {
         setProperty("MPRCapacityKind", "rc16");
     } else if (!fProtocolRecoveryPending) {
+        /* A SATA bridge rejects the 16-byte CDB with ILLEGAL REQUEST. That is
+         * an expected fallback, not a failed disk: only the RC10 outcome may
+         * classify this stage, so discard the RC16 status first. */
+        beginProbeStage();
         ok = scsiReadCapacity10();
         if (ok) {
             setProperty("MPRCapacityKind", "rc10");
@@ -3029,6 +3033,8 @@ MPRController::start(IOService *provider)
     fNextIoSmid = 0;
     fIoCount = 0;
     fIoRetryCount = 0;
+    fLastProbeStatus = kIOReturnSuccess;
+    fProbeInProgress = false;
     fFrozenSmid = 0;
     fTimedOutSmid = 0;
     fUnmapEnabled = false;
@@ -3108,7 +3114,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.20.8");
+    setProperty("MPRBuild", "0.20.9");
     setProperty("MPRFeatures",
                 "async-pool,ieee-sgl-chain,read-write16,cache16,unmap-limits,"
                 "stable-identity,raid-filter,auto-sense,tmf,remove-device,pm-quiesce");
@@ -3389,6 +3395,19 @@ MPRController::resumePower(void)
         IOSleep(1500);
         ready = ensureTargetsPublished();
     }
+    /* A slow disk can still be spinning up after that first probe. A not-ready
+     * target is not a failed wake: invalidating every medium here would force
+     * an IOC reset that cannot make the disk spin any faster and would take
+     * the healthy disk offline with it. Leave those probes to the hotplug
+     * worker, which retries them at its own cooldown and reports ONLINE when
+     * the media come back. */
+    UInt32 notReady = 0;
+    for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+        MPRTargetSlot *slot = &fTargets[i];
+        if (slot->handle != 0 && slot->present && !slot->probeValid &&
+            slot->probeState == kMPRProbeNotReady) notReady++;
+    }
+    setProperty("MPRWakeNotReadyCount", notReady, 32);
     /* Every medium that was published before sleep takes OFFLINE -> ONLINE
      * around this rebuild, whatever its identity: a disk inserted while asleep
      * must not be attached to the old medium. */
@@ -3570,6 +3589,47 @@ MPRController::completeEventAckLocked(const UInt8 *reply, UInt32 replyBytes)
     postNextEventAckLocked();
 }
 
+/* The probe chain is a sequence of synchronous SCSI commands, all issued under
+ * fIOLock. validateScsiCompletion() publishes each decoded result here so
+ * probeTarget() can tell a device that is still spinning up from one that
+ * failed, without allocating or adding an out-parameter to every helper. */
+void
+MPRController::beginProbeStage(void)
+{
+    if (fProbeInProgress) fLastProbeStatus = kIOReturnSuccess;
+}
+
+void
+MPRController::noteProbeStatus(IOReturn status)
+{
+    if (!fProbeInProgress || status == kIOReturnSuccess) return;
+    if (status == kIOReturnNotReady || status == kIOReturnBusy) {
+        /* A transient status is remembered only while nothing stronger has
+         * been decoded for this stage. */
+        if (fLastProbeStatus == kIOReturnSuccess ||
+            fLastProbeStatus == kIOReturnNotReady ||
+            fLastProbeStatus == kIOReturnBusy)
+            fLastProbeStatus = status;
+    } else {
+        /* Illegal request, media or hardware error, aborted command, timeout,
+         * malformed or short reply: a definite failure outranks not-ready. */
+        fLastProbeStatus = status;
+    }
+}
+
+void
+MPRController::recordProbeResult(MPRTargetSlot *slot, MPRProbeResult result)
+{
+    if (slot == NULL) return;
+    if (result == kMPRProbeOk) {
+        slot->probeState = kMPRProbeOk;
+        slot->probeRetries = 0;
+        return;
+    }
+    slot->probeState = result;
+    if (slot->probeRetries < kMPRMaxProbeRetries) slot->probeRetries++;
+}
+
 IOReturn
 MPRController::decodeSense(UInt32 smid, UInt32 senseCount, IOReturn fallback,
                             bool *unitAttention)
@@ -3620,9 +3680,13 @@ MPRController::validateScsiCompletion(UInt32 smid, UInt8 kind,
     if (status != NULL) *status = result;
     if (kind == 3) {
         if (status != NULL) *status = kIOReturnAborted;
+        noteProbeStatus(kIOReturnAborted);
         return false;
     }
-    if (smid == 0 || smid >= MPR_REQUEST_FRAMES) return false;
+    if (smid == 0 || smid >= MPR_REQUEST_FRAMES) {
+        noteProbeStatus(result);
+        return false;
+    }
     if (kind == 2) {
         result = kIOReturnSuccess;
         transferred = dataLen;
@@ -3631,6 +3695,7 @@ MPRController::validateScsiCompletion(UInt32 smid, UInt8 kind,
             replyBuf[3] != MPI2_FUNCTION_SCSI_IO_REQUEST ||
             replyBuf[2] * 4U < MPR_SCSIIO_REPLY_MIN_BYTES) {
             recordProtocolFault(kMPRProtocolManagementReply, smid);
+            noteProbeStatus(result);
             return false;
         }
         const MPRScsiIoReply *reply = (const MPRScsiIoReply *)replyBuf;
@@ -3684,6 +3749,7 @@ MPRController::validateScsiCompletion(UInt32 smid, UInt8 kind,
     if (actualBytes != NULL && transferred <= dataLen) *actualBytes = transferred;
     if (status != NULL) *status = result;
     setProperty("MPRLastCommandStatus", (unsigned long long)(UInt32)result, 32);
+    noteProbeStatus(result);
     return result == kIOReturnSuccess;
 }
 
@@ -4151,9 +4217,13 @@ MPRController::hotplugThread(void)
         goto done;
     }
     /* A physical change (or a new insertion outside an IOC reset) restores the
-     * probe and reset budgets, so a disk plugged back in is tried again. */
+     * single probe budget and the reset budget, so a disk plugged back in is
+     * tried again. */
     if (physicalChange || retryRequested) {
-        for (UInt32 i = 0; i < kMPRMaxTargets; i++) fTargets[i].probeFailures = 0;
+        for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+            fTargets[i].probeRetries = 0;
+            fTargets[i].probeState = kMPRProbeOk;
+        }
         fHotplugAttempts = 0;
     }
     /* A TARGET_NOT_RESPONDING event can name a handle that GET_NEXT_HANDLE
@@ -4182,28 +4252,39 @@ MPRController::hotplugThread(void)
         }
     }
 
-    /* 3. Probe and publish every present target that is not ready. Probing is
-     * read-only and bounded per target: a disk that fails three times is left
-     * offline until it is physically reinserted, instead of holding fIOLock
-     * against the healthy targets on every scan. */
+    /* 3. Probe and publish every present target that is not ready. One
+     * per-target budget covers a slow spin-up and a broken disk alike: a
+     * not-ready pass only asks for another scan, while a definite failure (or
+     * a device that never became ready) uses the bounded IOC reset and then
+     * converges to offline. Probing stays serialized by fIOLock, but no sleep
+     * happens under it: the one-second cooldown paces every retry. */
     if (!resetNeeded && !fProtocolRecoveryPending) {
         for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
             MPRTargetSlot *slot = &fTargets[i];
             if (slot->handle == 0 || !slot->present) continue;
             dirty = true;
             if (!slot->probeValid) {
-                if (slot->probeFailures >= 4) continue;
-                if (!probeTarget(slot)) {
-                    slot->probeFailures++;
+                if (slot->probeRetries >= kMPRMaxProbeRetries) continue;
+                MPRProbeResult result = probeTarget(slot);
+                recordProbeResult(slot, result);
+                if (result != kMPRProbeOk) {
+                    if (result == kMPRProbeNotReady &&
+                        slot->probeRetries < kMPRMaxProbeRetries) {
+                        /* The device is on the fabric but still spinning up.
+                         * It is neither a failure nor a reason to reset the
+                         * IOC: retry at the worker's own cadence. */
+                        retry = true;
+                        continue;
+                    }
+                    /* A definite failure, or a not-ready device that used up
+                     * the whole budget, follows the existing bounded policy. */
+                    slot->probeState = kMPRProbeFailed;
                     slot->failureCount++;
-                    /* The first two failures are retried in place; repeated
-                     * failure is what justifies an IOC reset. A wake needs the
-                     * extra attempt because the fabric is still settling. */
-                    if (slot->probeFailures >= 3) probeFailed = true;
+                    if (slot->probeRetries >= kMPRProbeResetThreshold)
+                        probeFailed = true;
                     else retry = true;
                     continue;
                 }
-                slot->probeFailures = 0;
             }
             const bool freshNub = (slot->nub == NULL);
             if (!publishTarget(slot)) {
