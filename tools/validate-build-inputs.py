@@ -18,6 +18,7 @@ def main():
     inputs.update(sources)
     inputs.update((root / "tools").glob("*.sh"))
     inputs.update((root / "tools").glob("*.py"))
+    inputs.update((root / "tools").glob("*.cpp"))
     inputs.add(root / "MPR/Info.plist")
     inputs.add(root / "MPR.xcodeproj/project.pbxproj")
     for path in sorted(inputs):

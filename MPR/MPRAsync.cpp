@@ -5,22 +5,26 @@
 #include <IOKit/storage/IOStorage.h>
 #include <kern/task.h>
 #include <kern/kern_types.h>
+#include <pexpert/pexpert.h>
+#include <string.h>
 #include "MPRController.h"
 #include "MPRScsi.h"
 #include "MPRDmaSgl.h"
 #include "MPI/mpi2_min.h"
 
 enum {
-    kMPRAsyncRequests = 32, kMPRAsyncSlots = 4,
-    kMPRAsyncBytes = 65536, kMPRAsyncSegments = 32,
+    kMPRAsyncRequests = kMPRAsyncRequestCount,
+    kMPRAsyncSlots = kMPRAsyncMaxCommands,
+    kMPRAsyncBytes = kMPRAsyncTransferBytes,
+    kMPRAsyncSegments = 32,
     kMPRChainStorageBytes = 4096, kMPRChainLimit = 4,
-    kMPRRuntimeSmid = 10
+    kMPRRuntimeSmid = kMPRAsyncFirstSmid
 };
 
 struct MPRAsyncRequest {
     IOMemoryDescriptor *buffer;
     IOStorageCompletion completion;
-    UInt64 sequence, turn, block, blocks, total, issued, completed;
+    UInt64 sequence, turn, block, blocks, total, issued, completed, firstErrorOffset;
     UInt32 generation, targetGeneration, inFlight, blockSize;
     UInt16 devHandle;
     IOReturn status;
@@ -28,13 +32,14 @@ struct MPRAsyncRequest {
 };
 
 struct MPRAsyncWindow {
-    IOBufferMemoryDescriptor *buffer, *chains;
-    IODMACommand *dma, *chainDma;
-    UInt64 chainAddress;
+    IOBufferMemoryDescriptor *bounce, *chains;
+    IODMACommand *dma, *bounceDma, *chainDma;
+    UInt64 bounceAddress, chainAddress;
     MPRAsyncRequest *request;
-    UInt64 offset;
+    UInt64 offset, deadlineMs;
     UInt32 bytes;
-    bool posted, mapped;
+    bool posted, direct, prepared, recoveryAttempted;
+    bool bouncePrepared, chainsPrepared;
 };
 
 struct MPRAsyncState {
@@ -43,7 +48,11 @@ struct MPRAsyncState {
     MPRAsyncRequest requests[kMPRAsyncRequests];
     MPRAsyncWindow windows[kMPRAsyncSlots];
     UInt64 sequence, turn, fence;
+    UInt64 directBytes, copiedBytes;
     UInt32 outstanding, peak, mappedCommands, chainedCommands, bounceCommands;
+    UInt32 mapFailures, peakCommands, heldCommands;
+    UInt32 requestedSlots, slotCapacity, slotLimit;
+    bool directEnabled, dmaBlocked;
     bool scheduled, completionsScheduled, accepting, stopping, barrier, released;
 };
 
@@ -70,6 +79,175 @@ mprNextAsync(MPRAsyncState *state)
     return chosen;
 }
 
+/* The caller must prove this window is no longer owned by the IOC. In
+ * particular, retaining a descriptor is not a substitute for its preparation
+ * or for withholding the client's callback while direct DMA is possible. */
+static IOReturn
+mprDetachClient(MPRAsyncWindow &window, bool copyBack)
+{
+    if (!window.dma) return kIOReturnSuccess;
+    IOReturn result = kIOReturnSuccess;
+    if (window.prepared) {
+        result = window.dma->complete(true, copyBack);
+        window.prepared = false;
+    }
+    IOReturn cleared = window.dma->clearMemoryDescriptor(false);
+    window.direct = false;
+    return result == kIOReturnSuccess ? cleared : result;
+}
+
+static void
+mprReleaseWindow(MPRAsyncWindow &window)
+{
+    /* Used only before posting, or after the controller proved DMA stopped. */
+    if (window.dma) {
+        (void)mprDetachClient(window, false);
+        window.dma->release();
+    }
+    if (window.bounceDma) {
+        window.bounceDma->clearMemoryDescriptor();
+        window.bounceDma->release();
+    }
+    if (window.chainDma) {
+        window.chainDma->clearMemoryDescriptor();
+        window.chainDma->release();
+    }
+    if (window.bounce) {
+        if (window.bouncePrepared) window.bounce->complete();
+        window.bounce->release();
+    }
+    if (window.chains) {
+        if (window.chainsPrepared) window.chains->complete();
+        window.chains->release();
+    }
+    bzero(&window, sizeof(window));
+}
+
+static bool
+mprSingleMapping(IODMACommand *dma, UInt32 bytes, UInt64 *address)
+{
+    if (!dma) return false;
+    IODMACommand::Segment64 segment;
+    UInt64 offset = 0;
+    UInt32 count = 1;
+    if (dma->gen64IOVMSegments(&offset, &segment, &count) != kIOReturnSuccess ||
+        count != 1 || offset != bytes || segment.fLength != bytes ||
+        segment.fIOVMAddr > UINT64_C(0x7fffffffffffffff) ||
+        bytes - 1 > UINT64_C(0x7fffffffffffffff) - segment.fIOVMAddr)
+        return false;
+    *address = segment.fIOVMAddr;
+    return true;
+}
+
+static bool
+mprAllocateWindow(MPRAsyncWindow &window, IOMapper *mapper)
+{
+    /* Every window has a device-mapped fallback. It never aliases fDataBuffer
+     * or the synchronous SMIDs, so a completed window may be refilled while
+     * management and other asynchronous commands are still outstanding. */
+    window.bounce = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+        kMPRAsyncBytes, UINT64_C(0x00000000ffffffff));
+    if (!window.bounce || !window.bounce->getBytesNoCopy()) return false;
+    window.bouncePrepared = window.bounce->prepare() == kIOReturnSuccess;
+    if (!window.bouncePrepared) return false;
+    window.bounceDma = IODMACommand::withSpecification(
+        kIODMACommandOutputHost64, 63, kMPRAsyncBytes,
+        IODMACommand::kMapped, kMPRAsyncBytes, 1, mapper);
+    if (!window.bounceDma ||
+        window.bounceDma->setMemoryDescriptor(window.bounce) != kIOReturnSuccess ||
+        !mprSingleMapping(window.bounceDma, kMPRAsyncBytes, &window.bounceAddress))
+        return false;
+
+    /* No whole-descriptor maximum here: prepare(offset,length) below always
+     * bounds the mapping to one chunk, even for multi-megabyte client I/O. */
+    window.dma = IODMACommand::withSpecification(
+        kIODMACommandOutputHost64, 63, kMPRAsyncBytes,
+        IODMACommand::kMapped, 0, 1, mapper);
+    window.chains = IOBufferMemoryDescriptor::inTaskWithOptions(
+        kernel_task, kIODirectionOut | kIOMemoryPhysicallyContiguous,
+        kMPRChainStorageBytes, 4096);
+    if (window.chains)
+        window.chainsPrepared = window.chains->prepare() == kIOReturnSuccess;
+    window.chainDma = IODMACommand::withSpecification(
+        kIODMACommandOutputHost64, 63, kMPRChainStorageBytes,
+        IODMACommand::kMapped, kMPRChainStorageBytes, 16, mapper);
+    bool chainsReady = window.chains && window.chainsPrepared &&
+        window.chains->getBytesNoCopy() && window.chainDma &&
+        window.chainDma->setMemoryDescriptor(window.chains) == kIOReturnSuccess &&
+        mprSingleMapping(window.chainDma, kMPRChainStorageBytes, &window.chainAddress) &&
+        (window.chainAddress & 15) == 0;
+    if (!chainsReady) {
+        if (window.chainDma) {
+            window.chainDma->clearMemoryDescriptor();
+            window.chainDma->release();
+            window.chainDma = NULL;
+        }
+        if (window.chains) {
+            if (window.chainsPrepared) window.chains->complete();
+            window.chains->release();
+            window.chains = NULL;
+        }
+        window.chainsPrepared = false;
+        window.chainAddress = 0;
+        /* Inline direct SGLs and the one-element fallback remain usable. */
+    }
+    return true;
+}
+
+static bool
+mprMapClient(MPRAsyncWindow &window, MPRAsyncRequest &job,
+             UInt8 *frame, UInt32 frameBytes, UInt32 chainFrameBytes,
+             UInt32 maxChainDepth, MPRSglResult *result)
+{
+    if (!window.dma ||
+        window.dma->setMemoryDescriptor(job.buffer, false) != kIOReturnSuccess)
+        return false;
+    IOReturn prepared = window.dma->prepare(window.offset, window.bytes, true,
+                                            job.write);
+    if (prepared != kIOReturnSuccess) {
+        /* Some prepare failures leave a partial active preparation. Suppress
+         * copy-back: no read has been submitted and bounce data is not valid. */
+        (void)window.dma->complete(true, false);
+        (void)window.dma->clearMemoryDescriptor(false);
+        return false;
+    }
+    window.prepared = true;
+    IODMACommand::Segment64 raw[kMPRAsyncSegments];
+    MPRDmaSegment segments[kMPRAsyncSegments];
+    /* SDK: this cursor is relative to the offset passed to prepare(). */
+    UInt64 offset = 0;
+    UInt32 count = kMPRAsyncSegments;
+    bool mapped = window.dma->gen64IOVMSegments(&offset, raw, &count) ==
+                  kIOReturnSuccess && offset == window.bytes && count != 0 &&
+                  count <= kMPRAsyncSegments;
+    if (mapped) {
+        for (UInt32 i = 0; i < count; ++i) {
+            if (!raw[i].fLength || raw[i].fLength > UINT32_MAX) {
+                mapped = false;
+                break;
+            }
+            segments[i].address = raw[i].fIOVMAddr;
+            segments[i].length = (UInt32)raw[i].fLength;
+        }
+    }
+    UInt32 depth = maxChainDepth < kMPRChainLimit ? maxChainDepth : kMPRChainLimit;
+    if (mapped) mapped = mprBuildIeeeSgl(frame, frameBytes,
+        MPR_SCSIIO_SGE_DWORDS * 4, segments, count, window.bytes,
+        window.chains ? (UInt8 *)window.chains->getBytesNoCopy() : NULL,
+        window.chainAddress, chainFrameBytes, depth,
+        kMPRChainStorageBytes, result);
+    if (mapped && result->chainsUsed)
+        mapped = window.chainDma &&
+                 window.chainDma->synchronize(kIODirectionOut) == kIOReturnSuccess;
+    if (!mapped) {
+        (void)mprDetachClient(window, false);
+        return false;
+    }
+    window.direct = true;
+    return true;
+}
+
 bool
 MPRController::initializeAsync(void)
 {
@@ -88,61 +266,44 @@ MPRController::initializeAsync(void)
         destroyAsyncState();
         return false;
     }
-    state->accepting = true;
-    /* The controller never DMA-writes a client's buffer. A failed IOC that
-     * cannot be proven quiescent can retain these bounded resident windows
-     * while every accepted client request still completes exactly once. */
+    int requested = 0, direct = 1;
+    (void)PE_parse_boot_argn("mpr_io_depth", &requested, sizeof(requested));
+    (void)PE_parse_boot_argn("mpr_direct_dma", &direct, sizeof(direct));
+    state->requestedSlots = mprConfiguredCommandDepth(requested);
+    state->directEnabled = direct != 0;
     IOMapper *mapper = IOMapper::copyMapperForDevice(fPCIDevice);
-    for (unsigned i = 0; i < kMPRAsyncSlots; ++i) {
-        MPRAsyncWindow &window = state->windows[i];
-        window.buffer = IOBufferMemoryDescriptor::inTaskWithOptions(
-            kernel_task, kIODirectionInOut, kMPRAsyncBytes, 4096);
-        window.chains = IOBufferMemoryDescriptor::inTaskWithOptions(
-            kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-            kMPRChainStorageBytes, 4096);
-        window.dma = IODMACommand::withSpecification(
-            kIODMACommandOutputHost64, 63, kMPRAsyncBytes,
-            IODMACommand::kMapped, kMPRAsyncBytes, 1, mapper);
-        window.chainDma = IODMACommand::withSpecification(
-            kIODMACommandOutputHost64, 63, kMPRChainStorageBytes,
-            IODMACommand::kMapped, kMPRChainStorageBytes, 16, mapper);
-        bool mapped = window.buffer && window.chains && window.dma &&
-                      window.chainDma &&
-            window.dma->setMemoryDescriptor(window.buffer) == kIOReturnSuccess &&
-            window.chainDma->setMemoryDescriptor(window.chains) == kIOReturnSuccess;
-        if (mapped) {
-            IODMACommand::Segment64 segment;
-            UInt64 offset = 0;
-            UInt32 count = 1;
-            mapped = window.chainDma->gen64IOVMSegments(&offset, &segment,
-                                                       &count) == kIOReturnSuccess &&
-                     count == 1 && offset == kMPRChainStorageBytes &&
-                     segment.fLength == kMPRChainStorageBytes &&
-                     (segment.fIOVMAddr & 15) == 0;
-            if (mapped) window.chainAddress = segment.fIOVMAddr;
+    for (unsigned i = 0; i < state->requestedSlots; ++i) {
+        if (!mprAllocateWindow(state->windows[i], mapper)) {
+            mprReleaseWindow(state->windows[i]);
+            break; /* Resource pressure reduces depth, never removes bounds. */
         }
-        /* Mapped SG is an optimization of the established staging path.
-         * Resource/geometry limits retain a safe, explicit bounce fallback. */
-        if (!mapped) {
-            if (window.dma) {
-                window.dma->clearMemoryDescriptor();
-                window.dma->release();
-                window.dma = NULL;
-            }
-            if (window.chainDma) {
-                window.chainDma->clearMemoryDescriptor();
-                window.chainDma->release();
-                window.chainDma = NULL;
-            }
-            if (window.buffer) { window.buffer->release(); window.buffer = NULL; }
-            if (window.chains) { window.chains->release(); window.chains = NULL; }
-            window.chainAddress = 0;
-        }
+        ++state->slotCapacity;
     }
     if (mapper) mapper->release();
+    if (state->slotCapacity == 0) {
+        releaseAsync(true);
+        destroyAsyncState();
+        return false;
+    }
+    state->accepting = true;
     MPR_DEBUG_PROP("MPRAsyncRequestLimit", (unsigned long long)kMPRAsyncRequests, 32);
-    MPR_DEBUG_PROP("MPRAsyncCommandLimit", (unsigned long long)kMPRAsyncSlots, 32);
+    MPR_DEBUG_PROP("MPRAsyncRequestedDepth", (unsigned long long)state->requestedSlots, 32);
+    MPR_DEBUG_PROP("MPRAsyncAllocatedDepth", (unsigned long long)state->slotCapacity, 32);
+    MPR_DEBUG_PROP("MPRDirectDMAEnabled", state->directEnabled);
+    /* IOC Facts do not exist yet. initializeQueues() sets the effective limit. */
     return true;
+}
+
+bool
+MPRController::configureAsyncLimits(void)
+{
+    MPRAsyncState *state = fAsync;
+    if (!state || state->released) return false;
+    state->slotLimit = mprAsyncCommandLimit(state->slotCapacity, fRequestCount,
+                                           fRequestCredit, fPqDepth, fFqDepth);
+    MPR_DEBUG_PROP("MPRAsyncCommandLimit", (unsigned long long)state->slotLimit, 32);
+    MPR_DEBUG_PROP("MPRAsyncFirstSmid", (unsigned long long)kMPRRuntimeSmid, 32);
+    return state->slotLimit != 0;
 }
 
 void
@@ -160,22 +321,40 @@ MPRController::releaseAsync(bool dmaStopped)
         thread_call_free(state->completionCall);
         state->completionCall = NULL;
     }
-    for (unsigned i = 0; i < kMPRAsyncSlots; ++i) {
-        MPRAsyncWindow &window = state->windows[i];
-        if (!dmaStopped) continue; /* IOC may still own mapped data/chain memory. */
-        if (window.dma) {
-            window.dma->clearMemoryDescriptor();
-            window.dma->release();
+    if (dmaStopped) {
+        /* stopAsync() could not return a direct-DMA buffer before stop()
+         * quiesced PCI. The proof now permits unmapping and exactly one error
+         * completion. This runs outside fIOLock and after IRQ teardown. */
+        for (unsigned i = 0; i < kMPRAsyncSlots; ++i) {
+            MPRAsyncWindow &window = state->windows[i];
+            if (window.posted && window.request) {
+                MPRAsyncRequest *job = window.request;
+                (void)mprDetachClient(window, false);
+                job->status = kIOReturnNoMedia;
+                if (window.offset < job->firstErrorOffset)
+                    job->firstErrorOffset = window.offset;
+                --job->inFlight;
+            }
+            mprReleaseWindow(window);
         }
-        if (window.chainDma) {
-            window.chainDma->clearMemoryDescriptor();
-            window.chainDma->release();
+        if (state->lock) {
+            IOLockLock(state->lock);
+            for (unsigned i = 0; i < kMPRAsyncRequests; ++i) {
+                MPRAsyncRequest &job = state->requests[i];
+                if (job.occupied && !job.finished && !job.inFlight) {
+                    if (job.status == kIOReturnSuccess) job.status = kIOReturnNoMedia;
+                    job.completed = mprCompletedPrefix(job.completed, job.firstErrorOffset);
+                    job.finished = true;
+                }
+            }
+            IOLockWakeup(state->lock, &state->outstanding, false);
+            IOLockUnlock(state->lock);
+            asyncCompletions();
         }
-        if (window.buffer) window.buffer->release();
-        if (window.chains) window.chains->release();
     }
-    /* Keep the state lock until final IOService::free(), as synchronous
-     * storage callers retained before stop may still unwind a fence. */
+    /* On unproved stop, retain resident mappings AND any client preparation,
+     * job, buffer and controller reference. Never "finish" a direct request
+     * while a malfunctioning IOC could still DMA into recycled client pages. */
     state->released = true;
 }
 
@@ -185,9 +364,53 @@ MPRController::destroyAsyncState(void)
     MPRAsyncState *state = fAsync;
     if (!state) return;
     releaseAsync(false);
+    /* Accepted held requests retain the controller, so normally free() cannot
+     * reach this condition. Keep the ownership records even on defensive exit. */
+    if (state->outstanding != 0) return;
     if (state->lock) IOLockFree(state->lock);
     IOFree(state, sizeof(*state));
     fAsync = NULL;
+}
+
+void
+MPRController::kickAsync(void)
+{
+    MPRAsyncState *state = fAsync;
+    if (!state || !state->lock) return;
+    IOLockLock(state->lock);
+    if (state->outstanding && !state->scheduled && !state->stopping &&
+        !state->released && state->call) {
+        state->scheduled = true;
+        thread_call_enter(state->call);
+    }
+    IOLockUnlock(state->lock);
+}
+
+void
+MPRController::publishAsyncStats(void)
+{
+    MPRAsyncState *state = fAsync;
+    if (!state || !state->lock || !fIOLock || !IOLockTryLock(fIOLock)) return;
+    UInt64 directBytes = state->directBytes, copiedBytes = state->copiedBytes;
+    UInt32 peakCommands = state->peakCommands, direct = state->mappedCommands;
+    UInt32 chained = state->chainedCommands, bounce = state->bounceCommands;
+    UInt32 failures = state->mapFailures, held = state->heldCommands;
+    IOLockLock(state->lock);
+    UInt32 peak = state->peak, outstanding = state->outstanding;
+    IOLockUnlock(state->lock);
+    IOLockUnlock(fIOLock);
+    /* Once per watchdog tick, not once per chunk or scheduler sweep. */
+    MPR_DEBUG_PROP("MPRAsyncPeakRequests", (unsigned long long)peak, 32);
+    MPR_DEBUG_PROP("MPRAsyncOutstanding", (unsigned long long)outstanding, 32);
+    MPR_DEBUG_PROP("MPRAsyncPeakCommands", (unsigned long long)peakCommands, 32);
+    MPR_DEBUG_PROP("MPRMappedCommands", (unsigned long long)direct, 32);
+    MPR_DEBUG_PROP("MPRDirectCommands", (unsigned long long)direct, 32);
+    MPR_DEBUG_PROP("MPRDirectBytes", (unsigned long long)directBytes, 64);
+    MPR_DEBUG_PROP("MPRCopiedBytes", (unsigned long long)copiedBytes, 64);
+    MPR_DEBUG_PROP("MPRChainedCommands", (unsigned long long)chained, 32);
+    MPR_DEBUG_PROP("MPRBounceCommands", (unsigned long long)bounce, 32);
+    MPR_DEBUG_PROP("MPRDirectMapFailures", (unsigned long long)failures, 32);
+    MPR_DEBUG_PROP("MPRAsyncHeldDMA", (unsigned long long)held, 32);
 }
 
 void
@@ -195,7 +418,7 @@ MPRController::setAsyncAcceptance(bool enabled)
 {
     if (!fAsync) return;
     IOLockLock(fAsync->lock);
-    fAsync->accepting = enabled && !fAsync->stopping;
+    fAsync->accepting = enabled && !fAsync->stopping && !fAsync->released;
     IOLockUnlock(fAsync->lock);
 }
 
@@ -210,7 +433,7 @@ MPRController::submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
     if (!state) return kIOReturnNotReady;
     const UInt32 generation = fMediaGeneration;
     IOLockLock(state->lock);
-    if (!state->accepting || state->stopping) {
+    if (!state->accepting || state->stopping || state->released) {
         IOLockUnlock(state->lock);
         return kIOReturnNotReady;
     }
@@ -222,6 +445,7 @@ MPRController::submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
         return kIOReturnNoResources;
     }
     bzero(job, sizeof(*job));
+    job->firstErrorOffset = UINT64_MAX;
     job->buffer = buffer;
     job->completion = *completion;
     job->block = block;
@@ -247,6 +471,7 @@ MPRController::submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
         thread_call_enter(state->call);
     }
     IOLockUnlock(state->lock);
+    notifyReplyWaiters();
     return kIOReturnSuccess;
 }
 
@@ -258,7 +483,7 @@ MPRController::beginAsyncBarrier(void)
     IOLockLock(state->lock);
     while (state->barrier && !state->stopping)
         IOLockSleep(state->lock, &state->barrier, THREAD_UNINT);
-    if (state->stopping) {
+    if (state->stopping || state->released || state->dmaBlocked) {
         IOLockUnlock(state->lock);
         return kIOReturnNotReady;
     }
@@ -266,20 +491,21 @@ MPRController::beginAsyncBarrier(void)
     state->fence = state->sequence;
     /* Newer requests remain queued. Only commands accepted before this
      * fence must retire before the ordered cache/UNMAP operation starts. */
-    while (mprFencePending(state) && !state->stopping) {
+    while (mprFencePending(state) && !state->stopping && !state->dmaBlocked) {
         if (!state->scheduled) {
             state->scheduled = true;
             thread_call_enter(state->call);
         }
         IOLockSleep(state->lock, &state->outstanding, THREAD_UNINT);
     }
-    if (state->stopping) {
+    if (state->stopping || state->released || state->dmaBlocked) {
         state->barrier = false;
         IOLockWakeup(state->lock, &state->barrier, false);
         IOLockUnlock(state->lock);
         return kIOReturnNotReady;
     }
     IOLockUnlock(state->lock);
+    notifyReplyWaiters();
     return kIOReturnSuccess;
 }
 
@@ -296,6 +522,7 @@ MPRController::endAsyncBarrier(void)
         thread_call_enter(state->call);
     }
     IOLockUnlock(state->lock);
+    notifyReplyWaiters();
 }
 
 IOReturn
@@ -337,21 +564,122 @@ void
 MPRController::asyncWorker(void)
 {
     MPRAsyncState *state = fAsync;
-    if (!state) return;
-    retain(); /* Last completion may release the last request reference. */
+    if (!state || state->released) return;
+    retain();
     for (;;) {
+        /* Capture before checking completion slots: an interrupt between the
+         * check and the sleep must change this ticket and prevent that sleep. */
+        UInt32 wakeSequence = replyWakeSequence();
+        bool progress = false;
+        bool waiting = false;
+        UInt64 earliest = UINT64_MAX;
+        UInt32 held = 0, active = 0;
         IOLockLock(fIOLock);
-        UInt32 posted = 0;
-        for (unsigned index = 0; index < kMPRAsyncSlots; ++index) {
+        if (!fStopping && !fSuspended && fRegs && !fPowerQuiesced)
+            processReplyQueue();
+
+        /* Reap every ready command, not the first array entry. A slow disk no
+         * longer holds other disks' completed windows until its own timeout. */
+        for (unsigned index = 0; index < state->slotCapacity; ++index) {
             MPRAsyncWindow &window = state->windows[index];
+            if (!window.posted) continue;
+            MPRAsyncRequest *job = window.request;
+            const UInt32 smid = kMPRRuntimeSmid + index;
+            IOSimpleLockLock(fReplyLock);
+            bool ready = fReplySlots[smid].valid != 0;
+            bool safe = fCommandOwners[smid].state != kMPRCommandPosted &&
+                        fCommandOwners[smid].state != kMPRCommandQuarantined;
+            IOSimpleLockUnlock(fReplyLock);
+            const bool expired = uptimeMilliseconds() >= window.deadlineMs;
+            if (!ready && !safe && !fStopping && !fProtocolRecoveryPending &&
+                !expired) continue;
+            if (window.recoveryAttempted && !safe) continue;
+
+            IOReturn result = kIOReturnNoMedia;
+            bool complete = false;
+            if (!fStopping && !fSuspended && !window.recoveryAttempted) {
+                /* Zero additional wait: readiness or the original post-time
+                 * deadline caused this call. Recovery retains its old policy. */
+                complete = scsiWaitChunk(smid, window.bytes, &result, NULL, NULL, 0);
+            } else if (safe) {
+                UInt8 orphan[64], kind = 0;
+                (void)takeReplySlot(smid, orphan, sizeof(orphan), &kind);
+            }
+            if (!commandDmaSafe(smid)) {
+                /* A failed reset must not complete a direct request. Keep it
+                 * attached; the watchdog retries reaping after late replies or
+                 * a subsequent proved controller stop, without reissuing I/O. */
+                window.recoveryAttempted = true;
+                if (job->status == kIOReturnSuccess)
+                    job->status = result == kIOReturnSuccess ? kIOReturnIOError : result;
+                if (window.offset < job->firstErrorOffset)
+                    job->firstErrorOffset = window.offset;
+                if (window.direct) continue;
+                /* Resident fallback DMA cannot touch the client's pages. */
+                complete = false;
+            }
+            MPRTargetSlot *slot = findTarget(job->devHandle);
+            if (complete && (job->generation != fMediaGeneration || !slot ||
+                !slot->present || slot->offlinePending ||
+                job->targetGeneration != slot->generation || mediaRemovalPending())) {
+                complete = false;
+                result = kIOReturnNoMedia;
+            }
+            IOByteCount copied = 0;
+            if (window.direct) {
+                IOReturn unmapped = mprDetachClient(window, complete && !job->write);
+                if (unmapped != kIOReturnSuccess) {
+                    complete = false;
+                    result = unmapped;
+                }
+            } else if (complete && !job->write) {
+                if (window.bounceDma->synchronize(kIODirectionIn) != kIOReturnSuccess) {
+                    complete = false;
+                    result = kIOReturnIOError;
+                } else {
+                    copied = job->buffer->writeBytes((IOByteCount)window.offset,
+                        window.bounce->getBytesNoCopy(), window.bytes);
+                    state->copiedBytes += copied;
+                    if (copied != window.bytes) {
+                        complete = false;
+                        result = copied < window.bytes ? kIOReturnUnderrun : kIOReturnOverrun;
+                    }
+                }
+            }
+            if (!complete) {
+                if (job->status == kIOReturnSuccess) {
+                    job->status = result == kIOReturnSuccess ? kIOReturnIOError : result;
+                    if (slot) ++slot->failureCount;
+                }
+                UInt64 prefix = window.offset;
+                if (!job->write && copied < window.bytes) {
+                    prefix += copied;
+                    job->completed += copied;
+                }
+                if (prefix < job->firstErrorOffset) job->firstErrorOffset = prefix;
+            } else {
+                job->completed += window.bytes;
+                if (job->write) {
+                    ++fWriteCount;
+                    fWriteBytes += window.bytes;
+                    fLastWriteLba = job->block + window.offset / job->blockSize;
+                    fLastWriteSmid = smid;
+                    if (slot) ++slot->writeCount;
+                }
+            }
+            --job->inFlight;
             window.posted = false;
             window.request = NULL;
+            window.recoveryAttempted = false;
+            progress = true;
+        }
+
+        /* Refill only truly free windows. Each has a separate DMA command,
+         * chain area, fallback buffer and runtime SMID. */
+        for (unsigned index = 0; index < state->slotLimit; ++index) {
+            MPRAsyncWindow &window = state->windows[index];
             const UInt32 smid = kMPRRuntimeSmid + index;
-            /* Never repurpose a window still owned by an unconfirmed IOC. */
-            if (!commandDmaSafe(smid)) continue;
-            /* A late legitimate reply can arrive after its failed client was
-             * completed. This window has no waiter now; consume that orphan
-             * before reserving its SMID, never clear a still-owned request. */
+            if (window.posted || !commandDmaSafe(smid)) continue;
             UInt8 orphan[64], orphanKind = 0;
             (void)takeReplySlot(smid, orphan, sizeof(orphan), &orphanKind);
             IOLockLock(state->lock);
@@ -360,67 +688,61 @@ MPRController::asyncWorker(void)
             IOLockUnlock(state->lock);
             if (!job) continue;
             MPRTargetSlot *slot = findTarget(job->devHandle);
-            const UInt32 blockSize = slot != NULL ? slot->blockSize : 0;
-            const UInt64 capacityBlocks = slot != NULL ? slot->capacityBlocks : 0;
-            /* Admission is per target: one target that is being probed, is
-             * offline or has been replaced must not fail the others. */
+            const UInt32 blockSize = slot ? slot->blockSize : 0;
+            const UInt64 capacityBlocks = slot ? slot->capacityBlocks : 0;
             if (fStopping || fSuspended || fDeviceOffline || fProtocolRecoveryPending ||
-                slot == NULL || !slot->present || !slot->probeValid ||
-                slot->offlinePending ||
+                !slot || !slot->present || !slot->probeValid || slot->offlinePending ||
                 job->targetGeneration != slot->generation ||
                 job->generation != fMediaGeneration || mediaRemovalPending()) {
                 job->status = kIOReturnNoMedia;
+                progress = true;
                 continue;
             }
             if (!job->initialized) {
                 job->initialized = true;
-                if (!blockSize || !capacityBlocks ||
+                if (!blockSize || blockSize > kMPRAsyncBytes || !capacityBlocks ||
                     job->blocks > UINT64_MAX / blockSize ||
                     (job->blocks && (job->block >= capacityBlocks ||
                      job->blocks > capacityBlocks - job->block))) {
                     job->status = kIOReturnBadArgument;
+                    progress = true;
                     continue;
                 }
                 job->total = job->blocks * blockSize;
                 if (job->buffer->getLength() < job->total) {
                     job->status = kIOReturnBadArgument;
+                    progress = true;
                     continue;
                 }
-                if (!job->total) continue;
+                if (!job->total) { progress = true; continue; }
                 job->status = job->buffer->prepare();
-                if (job->status != kIOReturnSuccess) continue;
+                if (job->status != kIOReturnSuccess) { progress = true; continue; }
                 job->prepared = true;
                 job->blockSize = blockSize;
+            }
+            /* An in-place re-probe must never change an already accepted
+             * request's geometry, even if a future caller forgets the generation. */
+            if (blockSize != job->blockSize || !capacityBlocks ||
+                job->block >= capacityBlocks ||
+                job->blocks > capacityBlocks - job->block) {
+                job->status = kIOReturnNoMedia;
+                progress = true;
+                continue;
             }
             UInt64 remaining = job->total - job->issued;
             UInt32 blocks = (UInt32)((remaining < kMPRAsyncBytes ?
                                      remaining : kMPRAsyncBytes) / blockSize);
-            if (!blocks || !fDataBuffer || !fRequestBuffer) {
+            if (!blocks || !fRequestBuffer || !fRequestBuffer->getBytesNoCopy() ||
+                fRequestFrameSize < MPR_SCSIIO_SGE_DWORDS * 4 + 16 ||
+                !prepareScsiSense(smid)) {
                 job->status = kIOReturnNotReady;
+                progress = true;
                 continue;
             }
-            const UInt32 bytes = blocks * blockSize;
             window.offset = job->issued;
-            window.bytes = bytes;
-            window.mapped = false;
-            UInt8 *bounce = (UInt8 *)fDataBuffer->getBytesNoCopy();
-            if (!bounce) {
-                job->status = kIOReturnNotReady;
-                continue;
-            }
-            bounce += index * kMPRAsyncBytes;
-            UInt8 *staging = window.buffer ?
-                            (UInt8 *)window.buffer->getBytesNoCopy() : bounce;
-            if (!staging || (job->write &&
-                job->buffer->readBytes((IOByteCount)window.offset,
-                                       staging, bytes) != bytes)) {
-                job->status = kIOReturnUnderrun;
-                continue;
-            }
-            if (!prepareScsiSense(smid)) {
-                job->status = kIOReturnBusy;
-                continue;
-            }
+            window.bytes = blocks * blockSize;
+            window.direct = false;
+            window.recoveryAttempted = false;
             UInt8 *frame = (UInt8 *)fRequestBuffer->getBytesNoCopy() +
                            smid * fRequestFrameSize;
             bzero(frame, fRequestFrameSize);
@@ -432,6 +754,7 @@ MPRController::asyncWorker(void)
             if (!cdbLength) {
                 cancelUnpostedCommand(smid);
                 job->status = kIOReturnBadArgument;
+                progress = true;
                 continue;
             }
             request->DevHandle = job->devHandle;
@@ -439,124 +762,67 @@ MPRController::asyncWorker(void)
             request->SenseBufferLowAddress = (UInt32)senseAddress(smid);
             request->SenseBufferLength = 96;
             request->SGLOffset0 = MPR_SCSIIO_SGE_DWORDS;
-            request->DataLength = bytes;
+            request->DataLength = window.bytes;
             request->IoFlags = (UInt16)(cdbLength | (slot->fastPath ?
                                            MPI25_SCSIIO_IOFLAGS_FAST_PATH : 0));
             request->Control = job->write ? MPI2_SCSIIO_CONTROL_WRITE :
                                             MPI2_SCSIIO_CONTROL_READ;
             memcpy(request->CDB, cdb, cdbLength);
-            if (window.dma && window.chainDma) {
-                IODMACommand::Segment64 raw[kMPRAsyncSegments];
-                MPRDmaSegment segments[kMPRAsyncSegments];
-                UInt64 offset = 0, left = bytes;
-                UInt32 count = kMPRAsyncSegments, used = 0;
-                IOReturn mapped = window.dma->gen64IOVMSegments(&offset, raw, &count);
-                if (mapped == kIOReturnSuccess) {
-                    for (UInt32 i = 0; i < count && left; ++i) {
-                        UInt64 take = raw[i].fLength < left ? raw[i].fLength : left;
-                        if (!take || take > UINT32_MAX) break;
-                        segments[used].address = raw[i].fIOVMAddr;
-                        segments[used++].length = (UInt32)take;
-                        left -= take;
-                    }
-                }
-                MPRSglResult result = {};
-                UInt32 depth = fMaxChainDepth < kMPRChainLimit ?
-                               fMaxChainDepth : kMPRChainLimit;
-                window.mapped = mapped == kIOReturnSuccess && !left &&
-                    mprBuildIeeeSgl(frame, fRequestFrameSize,
-                        MPR_SCSIIO_SGE_DWORDS * 4, segments, used, bytes,
-                        (UInt8 *)window.chains->getBytesNoCopy(),
-                        window.chainAddress, fChainFrameBytes, depth,
-                        kMPRChainStorageBytes, &result);
-                if (window.mapped) {
-                    request->ChainOffset = result.requestChainOffset;
-                    window.mapped =
-                        window.dma->synchronize(kIODirectionOut) == kIOReturnSuccess &&
-                        window.chainDma->synchronize(kIODirectionOut) == kIOReturnSuccess;
-                    if (window.mapped) {
-                        ++state->mappedCommands;
-                        if (result.chainsUsed) ++state->chainedCommands;
-                    }
-                }
-            }
-            if (!window.mapped) {
-                if (job->write && staging != bounce) memcpy(bounce, staging, bytes);
+            MPRSglResult sgl = {};
+            if (state->directEnabled && mprMapClient(window, *job, frame,
+                    fRequestFrameSize, fChainFrameBytes, fMaxChainDepth, &sgl)) {
+                request->ChainOffset = sgl.requestChainOffset;
+            } else {
+                if (state->directEnabled) ++state->mapFailures;
                 request->ChainOffset = 0;
                 mprSglElement(frame + MPR_SCSIIO_SGE_DWORDS * 4,
-                    fDataPhys + (UInt64)index * kMPRAsyncBytes, bytes, 0, 0x40);
-                ++state->bounceCommands;
+                    window.bounceAddress, window.bytes, 0, 0x40);
+                if (job->write) {
+                    IOByteCount copied = job->buffer->readBytes(
+                        (IOByteCount)window.offset, window.bounce->getBytesNoCopy(),
+                        window.bytes);
+                    state->copiedBytes += copied;
+                    if (copied != window.bytes ||
+                        window.bounceDma->synchronize(kIODirectionOut) != kIOReturnSuccess) {
+                        cancelUnpostedCommand(smid);
+                        job->status = copied != window.bytes ?
+                                      kIOReturnUnderrun : kIOReturnIOError;
+                        progress = true;
+                        continue;
+                    }
+                }
             }
+            window.deadlineMs = uptimeMilliseconds() + kMPRAsyncTimeoutMs;
             if (!postScsiIo(smid)) {
+                (void)mprDetachClient(window, false); // never submitted
                 cancelUnpostedCommand(smid);
                 job->status = kIOReturnNoMedia;
+                progress = true;
                 continue;
             }
             window.request = job;
             window.posted = true;
+            if (window.direct) {
+                ++state->mappedCommands;
+                state->directBytes += window.bytes;
+                if (sgl.chainsUsed) ++state->chainedCommands;
+            } else ++state->bounceCommands;
             ++fIoCount;
-            job->issued += bytes;
+            job->issued += window.bytes;
             ++job->inFlight;
-            ++posted;
+            progress = true;
         }
 
-        /* Harvest every posted command, even after a copy/command failure.
-         * Reset synthesizes cancelled completions for siblings, so they do
-         * not start a new timeout for a command the reset has already ended. */
-        for (unsigned index = 0; index < kMPRAsyncSlots; ++index) {
-            MPRAsyncWindow &window = state->windows[index];
+        for (unsigned index = 0; index < state->slotCapacity; ++index) {
+            const MPRAsyncWindow &window = state->windows[index];
             if (!window.posted) continue;
-            MPRAsyncRequest *job = window.request;
-            IOReturn result = kIOReturnIOError;
-            bool complete = scsiWaitChunk(kMPRRuntimeSmid + index,
-                                          window.bytes, &result);
-            MPRTargetSlot *jobSlot = findTarget(job->devHandle);
-            if (complete && (job->generation != fMediaGeneration ||
-                jobSlot == NULL || !jobSlot->present || jobSlot->offlinePending ||
-                job->targetGeneration != jobSlot->generation ||
-                mediaRemovalPending())) {
-                complete = false;
-                result = kIOReturnNoMedia;
-            }
-            if (complete && !job->write) {
-                if (window.mapped &&
-                    window.dma->synchronize(kIODirectionIn) != kIOReturnSuccess) {
-                    complete = false;
-                    result = kIOReturnIOError;
-                } else {
-                    UInt8 *bytes = window.mapped ?
-                        (UInt8 *)window.buffer->getBytesNoCopy() :
-                        (UInt8 *)fDataBuffer->getBytesNoCopy() + index * kMPRAsyncBytes;
-                    IOByteCount copied = job->buffer->writeBytes(
-                        (IOByteCount)window.offset, bytes, window.bytes);
-                    if (copied != window.bytes) {
-                        if (copied < window.bytes && window.offset == job->completed)
-                            job->completed += copied;
-                        complete = false;
-                        result = copied < window.bytes ? kIOReturnUnderrun :
-                                                        kIOReturnOverrun;
-                    }
-                }
-            }
-            if (!complete && job->status == kIOReturnSuccess) {
-                job->status = result == kIOReturnSuccess ? kIOReturnIOError : result;
-                if (jobSlot != NULL) jobSlot->failureCount++;
-            }
-            if (complete && window.offset == job->completed)
-                job->completed += window.bytes;
-            if (complete && job->write) {
-                ++fWriteCount;
-                fWriteBytes += window.bytes;
-                fLastWriteLba = job->block + window.offset /
-                    (job->blockSize != 0 ? job->blockSize : fBlockSize);
-                fLastWriteSmid = kMPRRuntimeSmid + index;
-                /* Write accounting stays attributable to one target. */
-                if (jobSlot != NULL) jobSlot->writeCount++;
-            }
-            --job->inFlight;
-            window.posted = false;
-            window.request = NULL;
+            ++active;
+            if (window.recoveryAttempted) { ++held; continue; }
+            waiting = true;
+            if (window.deadlineMs < earliest) earliest = window.deadlineMs;
         }
+        if (active > state->peakCommands) state->peakCommands = active;
+        state->heldCommands = held;
         for (unsigned i = 0; i < kMPRAsyncRequests; ++i) {
             IOLockLock(state->lock);
             MPRAsyncRequest &job = state->requests[i];
@@ -564,56 +830,58 @@ MPRController::asyncWorker(void)
             bool beforeFence = !state->barrier || job.sequence <= state->fence;
             IOLockUnlock(state->lock);
             if (!eligible) continue;
-            if (!posted && job.status == kIOReturnSuccess &&
-                beforeFence &&
-                (fStopping || fDeviceOffline || fProtocolRecoveryPending)) {
+            if (job.status == kIOReturnSuccess && beforeFence &&
+                (fStopping || fDeviceOffline || fProtocolRecoveryPending ||
+                 fSuspended || !state->slotLimit))
                 job.status = kIOReturnNoMedia;
-            }
             if (job.status != kIOReturnSuccess ||
                 (job.initialized && job.issued == job.total)) {
-                /* FUA fallback is ordered under the transport lock and names
-                 * this request's target; never flush a replacement medium or
-                 * another disk on behalf of this request. */
-                if (job.status == kIOReturnSuccess && job.write && job.fua &&
-                    job.total) {
+                if (job.status == kIOReturnSuccess && job.write && job.fua && job.total) {
                     MPRTargetSlot *flushSlot = findTarget(job.devHandle);
-                    if (flushSlot != NULL && !flushSlot->nativeFua &&
-                        job.generation == fMediaGeneration &&
-                        job.targetGeneration == flushSlot->generation &&
-                        flushSlot->present && flushSlot->probeValid &&
-                        !flushSlot->offlinePending && !mediaRemovalPending() &&
-                        selectTarget(flushSlot->handle)) {
-                        job.status = scsiSynchronizeCache(0, 0, 29, true);
-                    } else {
+                    if (!flushSlot || job.generation != fMediaGeneration ||
+                        job.targetGeneration != flushSlot->generation ||
+                        !flushSlot->present || !flushSlot->probeValid ||
+                        flushSlot->offlinePending || mediaRemovalPending()) {
                         job.status = kIOReturnNoMedia;
-                    }
+                    } else if (!flushSlot->nativeFua) {
+                        job.status = selectTarget(flushSlot->handle) ?
+                            scsiSynchronizeCache(0, 0, 29, true) : kIOReturnNoMedia;
+                    } // Native FUA was already set on each WRITE CDB.
                 }
+                job.completed = mprCompletedPrefix(job.completed, job.firstErrorOffset);
                 IOLockLock(state->lock);
                 job.finished = true;
                 IOLockWakeup(state->lock, &state->outstanding, false);
                 IOLockUnlock(state->lock);
+                progress = true;
             }
         }
         IOLockUnlock(fIOLock);
 
         IOLockLock(state->lock);
+        state->dmaBlocked = held != 0;
         bool completions = false;
         for (unsigned i = 0; i < kMPRAsyncRequests; ++i)
             if (state->requests[i].occupied && state->requests[i].finished)
                 completions = true;
-        if (completions && !state->completionsScheduled) {
+        if (completions && !state->completionsScheduled && state->completionCall) {
             state->completionsScheduled = true;
             thread_call_enter(state->completionCall);
         }
-        bool more = mprNextAsync(state) != NULL;
+        bool queued = mprNextAsync(state) != NULL;
+        /* Held DMA needs an external late reply/reset, not a busy retry loop.
+         * The watchdog kicks us once per second while ownership is retained. */
+        bool more = waiting || queued;
         if (!more) state->scheduled = false;
         IOLockWakeup(state->lock, &state->outstanding, false);
         IOLockUnlock(state->lock);
-        MPR_DEBUG_PROP("MPRAsyncPeakRequests", (unsigned long long)state->peak, 32);
-        MPR_DEBUG_PROP("MPRMappedCommands", (unsigned long long)state->mappedCommands, 32);
-        MPR_DEBUG_PROP("MPRChainedCommands", (unsigned long long)state->chainedCommands, 32);
-        MPR_DEBUG_PROP("MPRBounceCommands", (unsigned long long)state->bounceCommands, 32);
         if (!more) break;
+        if (!progress) {
+            UInt64 now = uptimeMilliseconds();
+            UInt32 sleepMs = earliest <= now ? 0 :
+                (UInt32)(earliest - now < 20 ? earliest - now : 20);
+            waitForReplyActivity(wakeSequence, sleepMs);
+        }
     }
     release();
 }
@@ -664,7 +932,7 @@ void
 MPRController::stopAsync(void)
 {
     MPRAsyncState *state = fAsync;
-    if (!state) return;
+    if (!state || state->released) return;
     IOLockLock(state->lock);
     state->accepting = false;
     state->stopping = true;
@@ -674,8 +942,8 @@ MPRController::stopAsync(void)
     IOLockUnlock(state->lock);
     /* Caller has already closed fStopping. Waiting takes no transport lock.
      * A cancelled queued call still leaves accepted requests to finish. */
-    thread_call_cancel_wait(state->call);
+    if (state->call) thread_call_cancel_wait(state->call);
     asyncWorker();
-    thread_call_cancel_wait(state->completionCall);
+    if (state->completionCall) thread_call_cancel_wait(state->completionCall);
     asyncCompletions();
 }

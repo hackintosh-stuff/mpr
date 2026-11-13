@@ -1,6 +1,6 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.20.13.
+Date: 2026-11-13. Driver version: 0.21.0.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes every eligible
@@ -9,12 +9,23 @@ independent disk through `IOBlockStorageDriver` as its own whole-disk
 
 ## Status
 
-Built, linked, signed ad hoc and loaded from the internal ESP on the test machine
-(macOS 26.7.2); the running version is confirmed with `kmutil showloaded`.
+The current source implements client-buffer DMA, a credit-bounded command pool,
+ready-first completion/refill and batched reply retirement with event wakeups.
+It has not yet been compiled, linked, signed, deployed or hardware-qualified.
+Source-input checks do not establish either data integrity or a throughput gain.
+The build and hardware acceptance handoff is [PERFORMANCE_TEST_PROMPT.md](PERFORMANCE_TEST_PROMPT.md).
+
+### Qualification baseline, not qualification of the current source
+
+The preceding implementation was built, linked, signed ad hoc and loaded from
+the internal ESP on the test machine (macOS 26.7.2). The retained observations
+below define regression coverage; they must be repeated for changed DMA,
+scheduling, timeout, removal and PM behavior. They are not results for the
+current source. Confirm the actually loaded version with `kmutil showloaded`.
 `MPRBuild` and every other IORegistry property are published only when
 `mpr_debug=1` is present in boot-args; kernel log lines follow the same switch.
 
-The driver is qualified in two configurations: the test SATA disk attached
+The preceding implementation was qualified in two configurations: the test SATA disk attached
 directly to the SAS3008, and the same disk as the terminal disk behind an
 Adaptec AEC-82885T expander and one backplane. Both publish one whole-disk
 `IOMedia` and pass bounded read, write, flush and UNMAP with byte-exact
@@ -42,7 +53,7 @@ to re-run fabric discovery; each takes seconds to about 25 s, during which the o
 targets are briefly offline. The exFAT volume that was being written verified clean
 after the pull.
 
-Sleep and wake with both targets attached is exercised. Sleep flushes each
+Sleep and wake with both targets attached was exercised on that baseline. Sleep flushes each
 published target; wake brings both media back at their own disk numbers in under
 25 s with byte-exact readback on both. A disk that is
 still becoming ready is retried in place instead of being counted as a failed
@@ -54,7 +65,7 @@ fault counters behind these claims are listed in [DEBUG.md](DEBUG.md).
 
 Not covered: SAS/SSP write paths are not verified on hardware; multipath,
 multiple LUNs, enclosure services, long duration or concurrent stress, and
-throughput tuning are out of scope.
+quantified throughput comparisons were not covered by that baseline.
 The long-run result recorded in [PLAN.md](PLAN.md) belongs to an earlier
 serial-command prototype, not to the current asynchronous scheduler.
 Wire-format and large-LBA cases are checked on the host, not on this hardware.
@@ -63,11 +74,16 @@ Wire-format and large-LBA cases are checked on the host, not on this hardware.
 
 - IOC initialization and IOC-Facts-constrained queues; interrupt-driven replies
   with a bounded polling fallback; event subscription and EVENT_ACK.
-- Asynchronous request scheduling over four command windows shared by
-  concurrent requests, with client completions delivered from a separate
-  serialized context.
-- Device-visible scatter/gather and bounded IEEE chains, with resident
-  contiguous staging when a mapping cannot be represented.
+- A bounded asynchronous queue with a configurable command depth, constrained
+  by IOC Facts and allocated resources. Ready commands retire and free windows
+  are refilled without waiting for an earlier array entry. Client completions
+  use a separate serialized context.
+- Direct client-buffer mappings through IODMACommand, device-visible IEEE
+  scatter/gather and bounded chains. A private resident staging buffer is used
+  only when direct mapping is disabled or cannot be represented.
+- Batched single-ring reply retirement and sequence-based completion wakeups,
+  with bounded polling when an interrupt is missing. Hardware multi-queue/MSI-X
+  scaling is not implemented.
 - READ/WRITE(10)/(16), READ CAPACITY(10)/(16), TEST UNIT READY, INQUIRY,
   SYNCHRONIZE CACHE(10)/(16), and FUA with an ordered cache-flush fallback.
 - UNMAP after Block Limits and Logical Block Provisioning verification, split to
@@ -106,11 +122,27 @@ the same disk.
 
 IR RAID volumes, multipath, multi-LUN devices, SES/SMP management,
 NVMe/Tri-Mode, firmware flashing and FreeBSD user ioctl compatibility are
-outside this driver. Client buffers are copied through bounded resident DMA
-windows; direct zero-copy client DMA and multiple hardware reply queues are not
-implemented.
+outside this driver. The ordinary asynchronous path maps client buffers rather
+than forcing a driver staging copy. IOKit may still use internal bounce memory;
+this is not a guarantee that every platform performs zero copies. The legacy
+synchronous bulk/probe path retains staging. There remains one hardware reply
+queue and one serialized I/O scheduler.
 
 These limits are not additional hardware requirements.
+
+## Performance configuration
+
+The defaults enable direct client DMA and request up to 32 concurrent commands.
+`mpr_io_depth=N` selects 1-32 requested slots; a missing or non-positive value
+uses 32, and larger values are clamped. The effective limit can be lower because
+of IOC credits, reply/request capacity or allocation pressure. `mpr_direct_dma=0`
+forces the staging path for comparison. These settings take effect at driver
+initialization, not through a live IORegistry write.
+
+Use `mpr_debug=1` for diagnostic runs; keep it off for production throughput
+measurements and keep serial logging off. `mpr_direct_dma=0 mpr_io_depth=4`
+is an in-version control, not a reproduction of the old scheduler. Counter
+semantics and unproved-DMA-stop behavior are documented in [DEBUG.md](DEBUG.md).
 
 ## Build and local checks
 

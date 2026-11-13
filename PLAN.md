@@ -1,6 +1,6 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：源码 0.20.13（2026-11-13）。已在内部 SATA 盘的 ESP 部署并经 OpenCore 注入加载，单盘读写、热插拔、超时/TMF/复位恢复与睡眠/唤醒均已实机验证；多目标场景下两块盘各自发布、按 DevHandle 路由、写入按目标归因，读在途与写在途拔盘后的逐目标移除与句柄重绑，以及双目标短睡/长睡唤醒，均已实机验证。当前源码行为与诊断见 [DEBUG.md](DEBUG.md)，对外能力与验证边界见 [README.md](README.md)。
+状态：源码 0.21.0（2026-11-13）。客户端 DMA、信用约束命令池、完成即回收/补发、单环批量回复与事件唤醒已写入源码；尚未编译、链接、签名、部署或进行实机验证。此前的单/双目标读写、移除、恢复和睡眠/唤醒证据仅作为旧数据路径的回归基线，不是当前版本的通过证明。编译与实机验收入口见 [PERFORMANCE_TEST_PROMPT.md](PERFORMANCE_TEST_PROMPT.md)，源码行为见 [DEBUG.md](DEBUG.md)。
 
 ## 1. 目标与范围
 
@@ -26,7 +26,7 @@
 - IR/RAID 逻辑卷及其成员管理、SES 机箱管理、SMP passthrough、固件升级、启动盘引导。
 - 多 LUN、多路径、SAS/SSP 盘写入的实机验证。
 - NVMe/PCIe/Tri-Mode、SAS2（`mps`/`0x0072`）、GEN35/SEA 分支。
-- Apple Silicon、dext/DriverKit、多队列与性能调优、FreeBSD user ioctl 兼容层。
+- Apple Silicon、dext/DriverKit、多硬件回复队列/MSI-X 扩展、FreeBSD user ioctl 兼容层。
 - 继承 `IOSCSIParallelInterfaceController`（§3 路线 B），仅保留为后续评估。
 
 ## 2. 基线（可复现）
@@ -71,11 +71,13 @@ mpr/
 
 ## 4. 能力与边界
 
+下表既有“已验证”项仅表示旧数据路径已有实机证据。当前 DMA、异步调度、超时恢复和 PM 改动涉及这些路径，必须重新验收，不能继承通过状态。
+
 | 能力 | 状态 | 边界 |
 |---|---|---|
-| IOC 初始化、Facts 约束队列、中断回复、事件订阅/ACK | 已验证 | 单中断源；回复由单一上下文消费 |
-| 异步请求调度（4 个共享命令窗口） | 已验证 | 吞吐受窗口数与单一回复消费者限制 |
-| SGL/chain 与常驻暂存回退 | 已验证 | 客户端数据经常驻窗口拷贝，无零拷贝直映 |
+| IOC 初始化、Facts 约束队列、中断回复、事件订阅/ACK | 基线已验证；新回复路径待验收 | 单硬件回复环；32 描述符锁粒度批处理、非空才发布索引、中断唤醒及有界轮询 |
+| 异步请求调度 | 源码已实现，待编译/实测 | 64 请求记录，最多 32 命令窗口；按 IOC 信用及池容量降级，SMID 32–63；先回收就绪命令再补发，按原提交时刻计超时 |
+| 客户端 DMA、SGL/chain 与暂存回退 | 源码已实现，待编译/实测 | 正常路径映射客户端子范围，失败或关闭直映时才拷贝；未证明 DMA 停止则保留直接映射及客户端完成责任，不回调/不复用 |
 | 块 I/O 与缓存命令 | 已验证 | READ/WRITE(10)/(16)、RC10/16、TUR、INQUIRY、SYNC(10)/(16)、FUA 回退 |
 | UNMAP | 已验证 | 探测 B0/B2 后启用，按上报限制拆分，不外扩调用者范围 |
 | 发现与身份 | 已验证（双目标） | 每个合格目标进入目标表并独立 probe/nub；handle 只作固件地址，复用按 SAS 地址与稳定身份判定 |
@@ -97,22 +99,23 @@ mpr/
 | M4 读写与恢复 | WRITE、缓存同步/FUA、UNMAP、sense、超时/TMF/复位 | 完成；带故障注入的长跑只完成多轮短程（无注入的串行命令原型另有 90 分钟/约 345 万条命令记录，见 §7） |
 | M5 拓扑、热插拔与 PM | nub 增删、handle 复用隔离、安全 stop、睡眠/唤醒 | 完成（直连与双目标背板，含在途 I/O 拔盘） |
 | M6 诊断工具（可选） | 独立 `IOUserClient`/工具、统计导出 | 未实施；现用 IORegistry 属性与 boot-args |
-| M7 后续 | IR 卷、SES、多队列、启动盘、签名发布；路线 B / dext 评估 | 不在当前范围 |
+| 性能数据路径 | 客户端 DMA、有界命令池、就绪回收与补发、单环批量回复/唤醒 | 源码完成；编译、正确性回归和 A/B 性能数据待验收 |
+| M7 后续 | IR 卷、SES、多硬件队列、启动盘、签名发布；路线 B / dext 评估 | 不在当前范围 |
 
 ## 6. 尚未完成
 
 - 「一次唤醒零复位」尚未做到：S3 后 IOC 必须经 diag reset 与 IOC Init 才能回到 operational，因此每次唤醒仍有一次计划内重建，`MPRResetCount` +1。该复位发生在工作线程读取拓扑之前，不再由配置页超时或起转探测触发；`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending` 在唤醒前后保持不变。
 - 复位末段失败的诊断与重试：PortEnable/初始化一类失败目前只记为笼统的 `MPRReinitState=failed`，靠协议故障兜底再复位才恢复，缺少逐阶段的失败点与就地重试。
 - 故障注入长跑未跑满：需夹具在媒体重建后按新 BSD 号重开设备，并把预期内复位与短时错误纳入判据。
-- 性能未调优：仍为常驻窗口拷贝、4 个命令窗口、单一回复消费者。
+- 性能源码尚未验收：需验证客户端 DMA 的子范围、链表、映射失败回退、并发及 DMA 停止证明；完成旧版/强制拷贝/不同深度的正确性与吞吐、尾延迟、CPU 对照。单硬件回复环、单调度工作线程与旧同步暂存路径仍保留；多队列/MSI-X 扩展未实现。
 - 换盘到不同容量设备、跨 macOS 版本回归、正式签名与发布流程。
 - 路线 B 的最小子类链接/加载验证（仅在决定改走该路线时开展）。
 
 ## 7. 验证方式
 
-- 主机侧：`tools/test_protocol.cpp` 用独立基准字节与独立 chain 解码器验证协议层（136,593 条断言、2,000 个确定性 SGL 用例，含故意拒绝用例），启用 ASan/UBSan；`tools/validate-build-inputs.py` 校验 LF 行尾、bundle 与运行版本一致、所有编译单元均纳入 Xcode 工程。
+- 主机侧：`tools/test_protocol.cpp` 用独立基准字节与独立 chain 解码器验证协议层（含 2,000 个确定性 SGL 用例、信用/SMID 边界及乱序完成前缀用例；更新后尚未编译运行，不沿用旧断言通过计数），启用 ASan/UBSan；`tools/validate-build-inputs.py` 校验 LF 行尾、bundle 与运行版本一致、所有编译单元均纳入 Xcode 工程。
 - 构建/加载：`tools/build-noxcode.sh` 产出 `MPR.kext`，校验 kmod 入口、bundle 类型、驱动内部符号与 plist 后 ad hoc 签名；注入内部 ESP 后核对 ESP 上 `Info.plist` 与 `kmutil showloaded` 的版本；`MPRBuild` 只在 boot-args 带 `mpr_debug=1` 时发布，用它核对前须先开启诊断开关。交叉编译的 Mach-O 目标不等于链接、签名、可加载。
-- 实机：所有依赖 IORegistry 属性或内核日志的判据都要求 boot-args 带 `mpr_debug=1`；默认静默时属性不存在属预期，不得据此判定加载失败。单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。双目标时另验证两盘 LBA0 与高 LBA 读一致性、可写盘写后回读、以及 `MPRTargetNWriteCount` 按目标归因。睡眠/唤醒必须有旧版与当前版的 `MPRResetCount` 前后对照，并同时核对 `MPRResetInitiator`、`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending`、`MPRWakeRebuildState`、`MPRProbeRetries` 与两盘 online 时间；短睡与长睡都要测，单看「online」或单看一次复位都不能判定唤醒路径是否改善。物理拔盘与在途 I/O 已有双目标实机结论，仅当改动触及移除、句柄重绑或媒体生命周期路径时才需重跑；只改电源或探测链时以既有证据为准，不要求重复现场拔盘。
+- 实机：所有依赖 IORegistry 属性或内核日志的判据都要求 boot-args 带 `mpr_debug=1`；默认静默时属性不存在属预期，不得据此判定加载失败。单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。双目标时另验证两盘 LBA0 与高 LBA 读一致性、可写盘写后回读、以及 `MPRTargetNWriteCount` 按目标归因。睡眠/唤醒必须有旧版与当前版的 `MPRResetCount` 前后对照，并同时核对 `MPRResetInitiator`、`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending`、`MPRWakeRebuildState`、`MPRProbeRetries` 与两盘 online 时间；短睡与长睡都要测，单看「online」或单看一次复位都不能判定唤醒路径是否改善。当前性能改动触及 DMA 生命周期、在途命令、超时恢复与 PM，旧双目标拔盘证据不能替代新回归；仅在取得测试介质和拔盘授权后复测，未授权项明确标为未测试。
 - 长跑：以命令数预算代替墙钟时间，关注按操作次数累积的驱动问题（回复帧、SMID、事件 ACK、属性字典、恢复循环退化），不是介质耐久性。串行命令原型曾以约 345 万条命令、90 分钟通过（p99 无漂移、`MPRResetCount` 不增长、属性数量稳定、参考区哈希不变）；当前异步调度版本尚未重跑。
 - 破坏性写仅限现场重新核对身份的测试盘，写窗口事后逐字节还原；`IORegistry` 的"在线"属性不能替代字节数与回读内容。
 
@@ -124,7 +127,7 @@ mpr/
 | R2 | 多目标覆盖限于同一背板上的两块终端盘，且为单盘依次拔插、单路在途 I/O | 移除/热插拔/PM 已在双目标下复测（含在途读/写在途拔盘、短睡与长睡唤醒）；不外推到其它 expander、多盘并发拔插或长时间压力 |
 | R3 | 固件带 IR 能力，过滤规则覆盖有限 | 无法确认独立盘身份时不发布；不把单盘结果推广到全部 IR 配置 |
 | R4 | expander 覆盖为同一背板上的两块终端盘（一块 SATA、一块 SSP），插回依赖 PortEnable 重发现与两次有界 IOC 复位 | 该组合下拔插、PM 与在途 I/O 均已实测；记录复位期间另一目标短暂下线，不把单一组合的结果外推为通用 expander 支持 |
-| R5 | 性能原型的窗口拷贝与单一回复消费者 | 先保证正确性；调优时再评估直映与多队列 |
+| R5 | 新客户端 DMA/流水调度尚未编译或实机验收，单回复环仍限制扩展 | DMA 未停止则不解映射/不回调；旧版及强制回退对照，先验证数据与恢复，再确认吞吐收益；多硬件队列单独评估 |
 | R6 | 路线 B 的 SPI KPI 已废弃 | 维持路线 A；改走 B 前单独完成构建与加载验证 |
 | R7 | ESP 有文件但实际未加载或仍运行旧版 | ESP-only 部署；重启后独立核对运行版本；config 变更前备份并校验 |
 

@@ -11,6 +11,7 @@
 #include "../MPR/MPRScsi.h"
 #include "../MPR/MPRCompletion.h"
 #include "../MPR/MPRDmaSgl.h"
+#include "../MPR/MPRPerformance.h"
 
 #include <algorithm>
 #include <array>
@@ -363,8 +364,84 @@ static void sglRoundTrips()
     }
 }
 
+
+static void performanceLimitTests()
+{
+    CHECK(mprConfiguredCommandDepth(0) == 32);
+    CHECK(mprConfiguredCommandDepth(-1) == 32);
+    CHECK(mprConfiguredCommandDepth(1) == 1);
+    CHECK(mprConfiguredCommandDepth(4) == 4);
+    CHECK(mprConfiguredCommandDepth(32) == 32);
+    CHECK(mprConfiguredCommandDepth(33) == 32);
+    CHECK(mprConfiguredCommandDepth(2147483647) == 32);
+    CHECK(!mprIsAsyncSmid(0));
+    CHECK(!mprIsAsyncSmid(31));
+    CHECK(mprIsAsyncSmid(32));
+    CHECK(mprIsAsyncSmid(63));
+    CHECK(!mprIsAsyncSmid(64));
+    CHECK(!mprIsAsyncSmid(UINT32_MAX));
+    CHECK(mprAsyncCommandLimit(32, 128, 128, 144, 144) == 32);
+    CHECK(mprAsyncCommandLimit(32, 33, 128, 144, 144) == 1);
+    CHECK(mprAsyncCommandLimit(32, 128, 128, 10, 144) == 1);
+    CHECK(mprAsyncCommandLimit(32, 128, 128, 144, 9) == 0);
+
+    // Signed wide arithmetic is an independent oracle: narrow unsigned
+    // subtraction in the production helper must not wrap below a reservation.
+    const uint32_t allocations[] = {0, 1, 4, 32, UINT32_MAX};
+    const uint32_t requests[] = {0, 31, 32, 33, 64, 128, UINT32_MAX};
+    const uint32_t replies[] = {0, 9, 10, 40, 144, UINT32_MAX};
+    for (uint32_t allocated : allocations)
+      for (uint32_t frames : requests)
+        for (uint32_t credit : requests)
+          for (uint32_t post : replies)
+            for (uint32_t free : replies) {
+                int64_t expected = 32;
+                const int64_t bounds[] = {
+                    allocated, (int64_t)frames - 32, (int64_t)credit - 32,
+                    (int64_t)post - 9, (int64_t)free - 9, 96
+                };
+                for (int64_t bound : bounds) expected = std::min(expected, bound);
+                expected = std::max(INT64_C(0), expected);
+                const uint32_t actual = mprAsyncCommandLimit(
+                    allocated, frames, credit, post, free);
+                CHECK(actual == (uint32_t)expected);
+                CHECK(actual <= allocated && actual <= 32);
+                if (actual) {
+                    CHECK(32 + actual <= frames && 32 + actual <= credit);
+                    CHECK(actual + 9 <= post && actual + 9 <= free);
+                    CHECK(mprIsAsyncSmid(32 + actual - 1));
+                    CHECK(32 + actual - 1 < 128);
+                }
+            }
+
+    // Completion order must not turn successful chunks beyond a hole into
+    // reportable bytes. Include a partially copied first failing read chunk.
+    for (unsigned failed = 0; failed < 4; ++failed) {
+        const uint64_t partials[] = {0, 1, 65535};
+        for (uint64_t partial : partials) {
+            std::array<unsigned, 4> order{{0, 1, 2, 3}};
+            do {
+                uint64_t sum = 0, firstError = UINT64_MAX;
+                for (unsigned index : order) {
+                    if (index == failed) {
+                        sum += partial;
+                        firstError = (uint64_t)index * 65536 + partial;
+                    } else sum += 65536;
+                }
+                CHECK(mprCompletedPrefix(sum, firstError) ==
+                      (uint64_t)failed * 65536 + partial);
+            } while (std::next_permutation(order.begin(), order.end()));
+        }
+    }
+    CHECK(mprCompletedPrefix(0, UINT64_MAX) == 0);
+    CHECK(mprCompletedPrefix(UINT64_C(4) * 65536, UINT64_MAX) == 262144);
+    CHECK(mprCompletedPrefix(65536, 131072) == 65536);
+    CHECK(mprCompletedPrefix(UINT64_MAX, UINT64_MAX) == UINT64_MAX);
+}
+
 int main()
 {
+    performanceLimitTests();
     cdbTests();
     vpdAndRaidTests();
     senseTests();

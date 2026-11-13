@@ -6,6 +6,7 @@
 #include <IOKit/storage/IOMedia.h>
 #include <libkern/OSByteOrder.h>
 #include <kern/task.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
 #include "MPRController.h"
@@ -428,7 +429,8 @@ MPRController::resetProtocolState(void)
     memset(fTmfBusy, 0, sizeof(fTmfBusy));
     ++fTransportEpoch;
     for (UInt32 smid = 0; smid < MPR_REQUEST_FRAMES; ++smid) {
-        bool runtime = (smid >= 10 && smid <= 25) || smid == 29 || smid == 30;
+        bool runtime = (smid >= 10 && smid <= 25) || mprIsAsyncSmid(smid) ||
+                       smid == 29 || smid == 30;
         bool occupied = fCommandOwners[smid].state != kMPRCommandFree;
         memset(&fReplySlots[smid], 0, sizeof(fReplySlots[smid]));
         if (runtime && occupied) {
@@ -449,6 +451,7 @@ MPRController::resetProtocolState(void)
     fProtocolFaultCode = fProtocolFaultSmid = 0;
     fPendingRemovalHandle = 0;
     IOSimpleLockUnlock(fReplyLock);
+    notifyReplyWaiters();
 }
 
 void
@@ -1196,6 +1199,10 @@ MPRController::initializeQueues(void)
         MPR_DEBUG_PROP("MPRQueueInitState", "failed-alloc");
         return false;
     }
+    if (!configureAsyncLimits()) {
+        MPR_DEBUG_PROP("MPRQueueInitState", "insufficient-async-credits");
+        return false;
+    }
     if (!sendIOCInit()) {
         MPR_DEBUG_PROP("MPRQueueInitState", "failed-iocinit");
         return false;
@@ -1349,121 +1356,185 @@ MPRController::processReplyQueue(void)
     UInt8 *post = queue + fFqDepth * 4;
     UInt32 replyBytes = fReplyFrameSize * fFqDepth;
 
-    /* One consumer owns descriptor retirement, reply slots, and event ACKs. */
-    IOSimpleLockLock(fReplyLock);
-    for (UInt32 i = 0; i < fPqDepth; i++) {
-        UInt64 entry;
-        memcpy(&entry, post + fReplyPostIndex * 8, sizeof(entry));
-        UInt8 flags = (UInt8)(entry & MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK);
-        if (flags == MPI2_RPY_DESCRIPT_FLAGS_UNUSED ||
-            ((entry >> 32) & 0xFFFFFFFFULL) == 0xFFFFFFFFULL) {
-            break;
-        }
-        UInt16 smid = (UInt16)((entry >> 16) & 0xFFFF);
-        UInt32 baddr = (UInt32)(entry >> 32);
-        UInt64 clear = 0xFFFFFFFFFFFFFFFFULL;
-        memcpy(post + fReplyPostIndex * 8, &clear, sizeof(clear));
-        fReplyPostIndex = (fReplyPostIndex + 1) % fPqDepth;
-        if (flags == MPI2_RPY_DESCRIPT_FLAGS_ADDRESS_REPLY &&
-            baddr >= (UInt32)fReplyPhys &&
-            baddr - (UInt32)fReplyPhys < replyBytes &&
-            ((baddr - (UInt32)fReplyPhys) % fReplyFrameSize) == 0) {
-            UInt8 *reply = replyBase + (baddr - (UInt32)fReplyPhys);
-            UInt32 bytes = (UInt32)reply[2] * 4;
-            if (bytes < 4 || bytes > fReplyFrameSize) {
-                recordProtocolFaultLocked(kMPRProtocolManagementReply, smid);
-            } else if (smid == MPR_SM_EVENT_ACK) {
-                /* ACK completion never satisfies a config/SCSI waiter. */
-                completeEventAckLocked(reply, bytes);
-            } else if (reply[3] == MPI2_FUNCTION_EVENT_NOTIFICATION) {
-                if (bytes < sizeof(MPREventNotifyReply)) {
-                    recordProtocolFaultLocked(kMPRProtocolEventLength, smid);
-                } else {
-                    const MPREventNotifyReply *event =
-                        (const MPREventNotifyReply *)reply;
-                    UInt32 eventBytes = (UInt32)event->EventDataLength * 4;
-                    memset(fLastEventData, 0, sizeof(fLastEventData));
-                    memcpy(fLastEventData, reply,
-                           bytes < sizeof(fLastEventData) ? bytes : sizeof(fLastEventData));
-                    fLastEvent = event->Event;
-                    fLastEventDataLength = event->EventDataLength;
-                    fLastEventAckRequired = event->AckRequired;
-                    fLastEventContext = event->EventContext;
-                    if (event->Event < 128) {
-                        fEventSeen[event->Event / 32] |= 1U << (event->Event % 32);
-                    }
-                    fEventCount++;
-                    fEventReplyCount++;
-                    if (smid == 2 && fManagementBusy[2]) {
-                        /* Only the subscription's own SMID completes it. */
-                        storeCommandReplyLocked(2, 1, reply, bytes);
-                    } else if (smid != 0) {
-                        recordProtocolFaultLocked(kMPRProtocolUnexpectedCompletion, smid);
-                    }
-                    if (eventBytes > bytes - sizeof(MPREventNotifyReply)) {
+    /* Like the reference reply-queue threshold, publish progress in bounded
+     * batches. There is still exactly one consumer per hardware ring; this
+     * does not claim MSI-X/multiple reply queues. Release the ownership lock
+     * between batches so submitters and completion readers can run. */
+    UInt32 remaining = fPqDepth;
+    bool any = false;
+    while (remaining != 0) {
+        UInt32 consumed = 0;
+        const UInt32 budget = remaining < kMPRReplyBatchBudget ?
+                              remaining : kMPRReplyBatchBudget;
+        IOSimpleLockLock(fReplyLock);
+        for (UInt32 i = 0; i < budget; i++) {
+            UInt64 entry;
+            memcpy(&entry, post + fReplyPostIndex * 8, sizeof(entry));
+            UInt8 flags = (UInt8)(entry & MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK);
+            if (flags == MPI2_RPY_DESCRIPT_FLAGS_UNUSED ||
+                ((entry >> 32) & 0xFFFFFFFFULL) == 0xFFFFFFFFULL) {
+                break;
+            }
+            UInt16 smid = (UInt16)((entry >> 16) & 0xFFFF);
+            UInt32 baddr = (UInt32)(entry >> 32);
+            UInt64 clear = 0xFFFFFFFFFFFFFFFFULL;
+            memcpy(post + fReplyPostIndex * 8, &clear, sizeof(clear));
+            fReplyPostIndex = (fReplyPostIndex + 1 == fPqDepth) ? 0 : fReplyPostIndex + 1;
+            ++consumed;
+            if (flags == MPI2_RPY_DESCRIPT_FLAGS_ADDRESS_REPLY &&
+                baddr >= (UInt32)fReplyPhys &&
+                baddr - (UInt32)fReplyPhys < replyBytes &&
+                ((baddr - (UInt32)fReplyPhys) % fReplyFrameSize) == 0) {
+                UInt8 *reply = replyBase + (baddr - (UInt32)fReplyPhys);
+                UInt32 bytes = (UInt32)reply[2] * 4;
+                if (bytes < 4 || bytes > fReplyFrameSize) {
+                    recordProtocolFaultLocked(kMPRProtocolManagementReply, smid);
+                } else if (smid == MPR_SM_EVENT_ACK) {
+                    /* ACK completion never satisfies a config/SCSI waiter. */
+                    completeEventAckLocked(reply, bytes);
+                } else if (reply[3] == MPI2_FUNCTION_EVENT_NOTIFICATION) {
+                    if (bytes < sizeof(MPREventNotifyReply)) {
                         recordProtocolFaultLocked(kMPRProtocolEventLength, smid);
-                    } else if (event->Event == MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST &&
-                               (event->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS) {
-                        recordTopologyEventLocked(reply + sizeof(MPREventNotifyReply),
-                                                  eventBytes);
-                    } else if ((event->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS &&
-                               (event->Event == MPI2_EVENT_IR_CONFIGURATION_CHANGE_LIST ||
-                                event->Event == MPI2_EVENT_IR_PHYSICAL_DISK ||
-                                event->Event == MPI2_EVENT_IR_VOLUME)) {
-                        /* Membership can change without a physical hotplug.
-                         * Freeze publication until the complete config is read. */
-                        if (fMediaPresent) fRemovalPending = true;
-                        fPendingRemovalHandle = 0;
-                        fTopologyGeneration++;
-                        fTopologyChanged = true;
-                        fHotplugPending = true;
+                    } else {
+                        const MPREventNotifyReply *event =
+                            (const MPREventNotifyReply *)reply;
+                        UInt32 eventBytes = (UInt32)event->EventDataLength * 4;
+                        memset(fLastEventData, 0, sizeof(fLastEventData));
+                        memcpy(fLastEventData, reply,
+                               bytes < sizeof(fLastEventData) ? bytes : sizeof(fLastEventData));
+                        fLastEvent = event->Event;
+                        fLastEventDataLength = event->EventDataLength;
+                        fLastEventAckRequired = event->AckRequired;
+                        fLastEventContext = event->EventContext;
+                        if (event->Event < 128) {
+                            fEventSeen[event->Event / 32] |= 1U << (event->Event % 32);
+                        }
+                        fEventCount++;
+                        fEventReplyCount++;
+                        if (smid == 2 && fManagementBusy[2]) {
+                            /* Only the subscription's own SMID completes it. */
+                            storeCommandReplyLocked(2, 1, reply, bytes);
+                        } else if (smid != 0) {
+                            recordProtocolFaultLocked(kMPRProtocolUnexpectedCompletion, smid);
+                        }
+                        if (eventBytes > bytes - sizeof(MPREventNotifyReply)) {
+                            recordProtocolFaultLocked(kMPRProtocolEventLength, smid);
+                        } else if (event->Event == MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST &&
+                                   (event->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS) {
+                            recordTopologyEventLocked(reply + sizeof(MPREventNotifyReply),
+                                                      eventBytes);
+                        } else if ((event->IOCStatus & MPI2_IOCSTATUS_MASK) == MPI2_IOCSTATUS_SUCCESS &&
+                                   (event->Event == MPI2_EVENT_IR_CONFIGURATION_CHANGE_LIST ||
+                                    event->Event == MPI2_EVENT_IR_PHYSICAL_DISK ||
+                                    event->Event == MPI2_EVENT_IR_VOLUME)) {
+                            /* Membership can change without a physical hotplug.
+                             * Freeze publication until the complete config is read. */
+                            if (fMediaPresent) fRemovalPending = true;
+                            fPendingRemovalHandle = 0;
+                            fTopologyGeneration++;
+                            fTopologyChanged = true;
+                            fHotplugPending = true;
+                        }
+                        /* DEVICE_STATUS_CHANGE also reports internal reset/TMF
+                         * completion and SMART. It is not a device add/remove. */
+                        if (event->AckRequired == MPI2_EVENT_NOTIFICATION_ACK_REQUIRED) {
+                            sendEventAck(event->Event, event->EventContext);
+                        }
                     }
-                    /* DEVICE_STATUS_CHANGE also reports internal reset/TMF
-                     * completion and SMART. It is not a device add/remove. */
-                    if (event->AckRequired == MPI2_EVENT_NOTIFICATION_ACK_REQUIRED) {
-                        sendEventAck(event->Event, event->EventContext);
-                    }
+                } else {
+                    storeCommandReplyLocked(smid, 1, reply, bytes);
+                    memset(fLastReply, 0, sizeof(fLastReply));
+                    memcpy(fLastReply, reply,
+                           bytes < sizeof(fLastReply) ? bytes : sizeof(fLastReply));
+                    fLastReplySmid = smid;
+                    fLastReplyKind = 1;
+                    fReplyCount++;
+                }
+                releaseReplyFrame(baddr);
+            } else if (flags == MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS ||
+                       flags == MPI25_RPY_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO_SUCCESS) {
+                if (smid == MPR_SM_EVENT_ACK) {
+                    recordProtocolFaultLocked(kMPRProtocolAckReply, smid);
+                    fEventAckFailed++;
+                } else {
+                    storeCommandReplyLocked(smid, 2, NULL, 0);
+                    fLastReplySmid = smid;
+                    fLastReplyKind = 2;
+                    memset(fLastReply, 0, sizeof(fLastReply));
+                    fScsiSuccess++;
+                    fReplyCount++;
                 }
             } else {
-                storeCommandReplyLocked(smid, 1, reply, bytes);
-                memset(fLastReply, 0, sizeof(fLastReply));
-                memcpy(fLastReply, reply,
-                       bytes < sizeof(fLastReply) ? bytes : sizeof(fLastReply));
-                fLastReplySmid = smid;
-                fLastReplyKind = 1;
-                fReplyCount++;
+                noteBadReply(1, (UInt32)flags, smid, NULL, 0);
+                recordProtocolFaultLocked(kMPRProtocolManagementReply, smid);
             }
-            releaseReplyFrame(baddr);
-        } else if (flags == MPI2_RPY_DESCRIPT_FLAGS_SCSI_IO_SUCCESS ||
-                   flags == MPI25_RPY_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO_SUCCESS) {
-            if (smid == MPR_SM_EVENT_ACK) {
-                recordProtocolFaultLocked(kMPRProtocolAckReply, smid);
-                fEventAckFailed++;
-            } else {
-                storeCommandReplyLocked(smid, 2, NULL, 0);
-                fLastReplySmid = smid;
-                fLastReplyKind = 2;
-                memset(fLastReply, 0, sizeof(fLastReply));
-                fScsiSuccess++;
-                fReplyCount++;
-            }
-        } else {
-            noteBadReply(1, (UInt32)flags, smid, NULL, 0);
-            recordProtocolFaultLocked(kMPRProtocolManagementReply, smid);
         }
+        /* The index and its MMIO publication share the same owner, preventing
+         * an older index from being published after another consumer advances. */
+        if (consumed != 0) {
+            writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, fReplyPostIndex);
+            ++fReplyIndexWrites;
+            ++fReplyBatches;
+            fReplyDescriptors += consumed;
+            if (consumed > fReplyMaxBatch) fReplyMaxBatch = consumed;
+            any = true;
+        }
+        IOSimpleLockUnlock(fReplyLock);
+        remaining -= consumed;
+        if (consumed < budget) break;
     }
-    /* Publish the index while still owning it; another consumer must not
-     * publish an older index after we have advanced the ring again. */
-    writeReg(MPI2_REPLY_POST_HOST_INDEX_OFFSET, fReplyPostIndex);
-    IOSimpleLockUnlock(fReplyLock);
+    if (any) notifyReplyWaiters();
 }
 
 
 
+UInt64
+MPRController::uptimeMilliseconds(void)
+{
+    AbsoluteTime uptime;
+    UInt64 nanoseconds = 0;
+    clock_get_uptime(&uptime);
+    absolutetime_to_nanoseconds(uptime, &nanoseconds);
+    return nanoseconds / 1000000ULL;
+}
+
+UInt32
+MPRController::replyWakeSequence(void)
+{
+    if (fReplyWaitLock == NULL) return 0;
+    IOLockLock(fReplyWaitLock);
+    UInt32 sequence = fReplyWakeSequence;
+    IOLockUnlock(fReplyWaitLock);
+    return sequence;
+}
+
+void
+MPRController::notifyReplyWaiters(void)
+{
+    /* Called only after releasing every simple lock, never in the filter. */
+    if (fReplyWaitLock == NULL) return;
+    IOLockLock(fReplyWaitLock);
+    ++fReplyWakeSequence;
+    IOLockWakeup(fReplyWaitLock, &fReplyWakeSequence, false);
+    IOLockUnlock(fReplyWaitLock);
+}
+
+void
+MPRController::waitForReplyActivity(UInt32 sequence, UInt32 timeoutMs)
+{
+    if (fReplyWaitLock == NULL || timeoutMs == 0) return;
+    AbsoluteTime deadline;
+    clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
+    IOLockLock(fReplyWaitLock);
+    if (sequence == fReplyWakeSequence && !fStopping)
+        IOLockSleepDeadline(fReplyWaitLock, &fReplyWakeSequence,
+                            deadline, THREAD_UNINT);
+    IOLockUnlock(fReplyWaitLock);
+}
+
 bool
 MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
 {
-    UInt32 i;
     bool ready;
 
     fTimedOutSmid = 0;
@@ -1474,7 +1545,7 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
      * SCSI command as if its reply were lost. It must land after bring-up:
      * a timeout while fStarting escalates to the bounded reset by design and
      * would consume the injection without exercising the TMF cascade. */
-    if (!fStarting && smid >= 10 && smid <= 25 &&
+    if (!fStarting && ((smid >= 10 && smid <= 25) || mprIsAsyncSmid(smid)) &&
         (fInjectTimeout || fInjectEvery != 0)) {
         bool inject = false;
 
@@ -1501,47 +1572,28 @@ MPRController::waitForSmid(UInt32 timeoutMs, UInt32 smid)
             return false;
         }
     }
-    /* Only the slot owned by this SMID can satisfy the wait; a late reply for
-     * another command is published to that command's slot instead. */
-    for (i = 0; i < timeoutMs; i++) {
-        if (fStopping) {
-            fTimedOutSmid = (UInt16)smid;
-            return false;
-        }
+    const UInt64 deadline = uptimeMilliseconds() + timeoutMs;
+    for (;;) {
+        const UInt32 sequence = replyWakeSequence();
+        /* A missing interrupt must not strand management replies or ACKs.
+         * Empty drains no longer write the reply-post MMIO register. */
+        processReplyQueue();
         IOSimpleLockLock(fReplyLock);
         ready = (fReplySlots[smid].valid != 0);
         bool inactive = fCommandOwners[smid].state == kMPRCommandFree ||
                         fCommandOwners[smid].state == kMPRCommandReserved;
         bool protocolFault = fProtocolRecoveryPending;
         IOSimpleLockUnlock(fReplyLock);
-        if (ready) {
-            if (i >= 1000) {
-                MPR_DEBUG_PROP("MPRLongReplyWaitMs", (unsigned long long)i, 32);
-                MPR_DEBUG_PROP("MPRLongReplyWaitSmid", (unsigned long long)smid, 16);
-            }
-            return true;
-        }
-        if (inactive || protocolFault) {
+        if (ready) return true;
+        if (fStopping || inactive || protocolFault) {
             fTimedOutSmid = inactive ? 0 : (UInt16)smid;
             return false;
         }
-        /* A long wait (PORT_ENABLE) must not stop the consumer: replies that
-         * land in the queue while this thread sleeps still have to reach
-         * their slots, and queued event ACKs have to be posted. */
-        if ((i % 20) == 19) {
-            processReplyQueue();
-        }
-        IOSleep(1);
+        const UInt64 now = uptimeMilliseconds();
+        if (now >= deadline) break;
+        const UInt64 remaining = deadline - now;
+        waitForReplyActivity(sequence, (UInt32)(remaining < 20 ? remaining : 20));
     }
-    processReplyQueue();
-    IOSimpleLockLock(fReplyLock);
-    ready = (fReplySlots[smid].valid != 0);
-    IOSimpleLockUnlock(fReplyLock);
-    if (ready) {
-        return true;
-    }
-    /* A real timeout needs task management; a SCSI status error needs
-     * sense decoding instead. */
     fTimedOutSmid = (UInt16)smid;
     return false;
 }
@@ -1791,7 +1843,7 @@ MPRController::postScsiIo(UInt32 smid)
                        ? MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO
                        : MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO;
     IOSimpleLockLock(fReplyLock);
-    bool runtime = smid >= 10 && smid <= 30;
+    bool runtime = (smid >= 10 && smid <= 30) || mprIsAsyncSmid(smid);
     if (fStopping || fProtocolRecoveryPending ||
         (runtime && (fRemovalPending || !fMediaPresent || fDeviceOffline ||
                      fReinitInProgress)) || fFrozenSmid == smid) {
@@ -2422,7 +2474,8 @@ MPRController::scsiPostIo(bool write, UInt64 lba, UInt32 blocks,
 
 bool
 MPRController::scsiWaitChunk(UInt32 smid, UInt32 dataLen, IOReturn *outStatus,
-                             UInt32 *actualBytes, bool *unitAttention)
+                             UInt32 *actualBytes, bool *unitAttention,
+                             UInt32 timeoutMs)
 {
     UInt8 replyBuf[64], replyKind = 0;
     if (outStatus != NULL) *outStatus = kIOReturnIOError;
@@ -2433,7 +2486,7 @@ MPRController::scsiWaitChunk(UInt32 smid, UInt32 dataLen, IOReturn *outStatus,
         if (outStatus != NULL) *outStatus = kIOReturnBadArgument;
         return false;
     }
-    if (!waitForSmid(15000, smid)) {
+    if (!waitForSmid(timeoutMs, smid)) {
         if (outStatus != NULL) *outStatus = kIOReturnTimeout;
         MPR_DEBUG_PROP("MPRLastIOFailure", "reply-timeout");
         MPR_DEBUG_PROP("MPRLastIOSmid", (unsigned long long)smid, 16);
@@ -2936,6 +2989,9 @@ MPRController::init(OSDictionary *properties)
     fPowerQuiesced = false;
     fIOLock = NULL;
     fReplyLock = NULL;
+    fReplyWaitLock = NULL;
+    fReplyWakeSequence = 0;
+    fReplyBatches = fReplyDescriptors = fReplyMaxBatch = fReplyIndexWrites = 0;
     fPostLock = NULL;
     fIocCapabilities = fMaxDeviceHandle = fTargetDeviceInfo = 0;
     fTargetDeviceFlags = 0;
@@ -2964,6 +3020,10 @@ MPRController::free(void)
     if (fReplyLock != NULL) {
         IOSimpleLockFree(fReplyLock);
         fReplyLock = NULL;
+    }
+    if (fReplyWaitLock != NULL) {
+        IOLockFree(fReplyWaitLock);
+        fReplyWaitLock = NULL;
     }
     if (fPostLock != NULL) {
         IOSimpleLockFree(fPostLock);
@@ -3018,6 +3078,7 @@ MPRController::start(IOService *provider)
     fScsiSuccess = 0;
     fIOLock = IOLockAlloc();
     fReplyLock = IOSimpleLockAlloc();
+    fReplyWaitLock = IOLockAlloc();
     fPostLock = IOSimpleLockAlloc();
     memset(fManagementBusy, 0, sizeof(fManagementBusy));
     memset(fTmfBusy, 0, sizeof(fTmfBusy));
@@ -3108,10 +3169,13 @@ MPRController::start(IOService *provider)
     memset(fLastReply, 0, sizeof(fLastReply));
     memset(fLastEventData, 0, sizeof(fLastEventData));
 
-    if (fIOLock == NULL || fReplyLock == NULL || fPostLock == NULL) {
+    if (fIOLock == NULL || fReplyLock == NULL || fPostLock == NULL ||
+        fReplyWaitLock == NULL) {
         if (fIOLock != NULL) IOLockFree(fIOLock);
         if (fReplyLock != NULL) IOSimpleLockFree(fReplyLock);
         if (fPostLock != NULL) IOSimpleLockFree(fPostLock);
+        if (fReplyWaitLock != NULL) IOLockFree(fReplyWaitLock);
+        fReplyWaitLock = NULL;
         fIOLock = NULL;
         fReplyLock = fPostLock = NULL;
         super::stop(provider);
@@ -3145,9 +3209,10 @@ MPRController::start(IOService *provider)
     MPR_DEBUG_PROP("MPRMMIOLength", (unsigned long long)length, 64);
     MPR_DEBUG_PROP("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     MPR_DEBUG_PROP("MPRStage", "read-write");
-    MPR_DEBUG_PROP("MPRBuild", "0.20.13");
+    MPR_DEBUG_PROP("MPRBuild", "0.21.0");
     MPR_DEBUG_PROP("MPRFeatures",
-                "async-pool,ieee-sgl-chain,read-write16,cache16,unmap-limits,"
+                "async-direct-dma,credit-depth,ready-refill,reply-batch-wakeup,"
+                "ieee-sgl-chain,read-write16,cache16,unmap-limits,"
                 "stable-identity,raid-filter,auto-sense,tmf,remove-device,pm-quiesce");
     {
         /* Opt-in fault injection for the timeout/TMF path. The kernel ignores
@@ -3254,6 +3319,7 @@ MPRController::stop(IOService *provider)
     bool dmaStopped = false;
 
     fStopping = true;
+    notifyReplyWaiters();
     stopAsync();
     if (fWatchdogTimer != NULL) {
         fWatchdogTimer->cancelTimeout();
@@ -3367,14 +3433,14 @@ MPRController::quiescePower(void)
     if (fSuspended) return fPowerQuiesced;
     setAsyncAcceptance(false);
     IOReturn fence = beginAsyncBarrier();
-    if (fence != kIOReturnSuccess) return false;
     IOLockLock(fIOLock);
     /* Flush every target that this driver can write to. Each flush names its
      * own handle: a flush must leave one disk's cache ordered with that disk,
      * never with whichever target was published last. */
-    IOReturn flush = kIOReturnSuccess;
+    IOReturn flush = fence;
     UInt32 flushed = 0;
-    if (!fDeviceOffline && !fProtocolRecoveryPending && !mediaRemovalPending()) {
+    if (fence == kIOReturnSuccess && !fDeviceOffline &&
+        !fProtocolRecoveryPending && !mediaRemovalPending()) {
         for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
             MPRTargetSlot *slot = &fTargets[i];
             if (slot->handle == 0 || !slot->present || !slot->probeValid ||
@@ -3406,7 +3472,8 @@ MPRController::quiescePower(void)
     fPowerQuiesced = stopped;
     MPR_DEBUG_PROP("MPRPowerState", stopped ? "quiesced" : "quiesce-failed");
     IOLockUnlock(fIOLock);
-    endAsyncBarrier();
+    if (fence == kIOReturnSuccess) endAsyncBarrier();
+    kickAsync(); // Reap cancelled held mappings only after the DMA-stop proof.
     return stopped;
 }
 
@@ -3506,7 +3573,8 @@ MPRController::systemWillShutdown(IOOptionBits specifier)
 /* ------------------------------------------------------------------------ */
 /* write, SYNCHRONIZE CACHE, UNMAP, auto sense, TMF and diag reset.      */
 /* SMID map: 1..4 config/events, 5..9 startup probes, 10..25 runtime IO,    */
-/* 26..28 task management, 29 sync cache, 30 UNMAP.                         */
+/* 26..28 task management, 29 sync cache, 30 UNMAP, 31 event ACK;            */
+/* 32..63 asynchronous I/O (independent mappings and fallback buffers).     */
 
 #define MPR_SM_TMF_BASE         26
 #define MPR_SM_SYNC_CACHE       29
@@ -4133,6 +4201,12 @@ void
 MPRController::watchdogTimeout(IOTimerEventSource *sender)
 {
     if (fStopping) return;
+    /* Startup can still be constructing or unwinding fAsync while this
+     * timer is armed. Runtime ownership begins only after bring-up finishes. */
+    if (!fStarting) {
+        kickAsync(); /* Reap held maps after a late reply or a proved reset. */
+        publishAsyncStats();
+    }
     if (fResumeGraceTicks != 0) fResumeGraceTicks--;
     /* The window must stay open for the whole wake rebuild: a long discovery
      * can hold one PortEnable request for tens of seconds. It only starts
@@ -4148,6 +4222,18 @@ MPRController::watchdogTimeout(IOTimerEventSource *sender)
             recordProtocolFault(kMPRProtocolIocNotOperational, 0);
     }
     serviceProtocolState();
+    UInt32 batches, descriptors, maxBatch, indexWrites;
+    IOSimpleLockLock(fReplyLock);
+    batches = fReplyBatches;
+    descriptors = fReplyDescriptors;
+    maxBatch = fReplyMaxBatch;
+    indexWrites = fReplyIndexWrites;
+    IOSimpleLockUnlock(fReplyLock);
+    MPR_DEBUG_PROP("MPRReplyBatches", (unsigned long long)batches, 32);
+    MPR_DEBUG_PROP("MPRReplyDescriptors", (unsigned long long)descriptors, 32);
+    MPR_DEBUG_PROP("MPRReplyMaxBatch", (unsigned long long)maxBatch, 32);
+    MPR_DEBUG_PROP("MPRReplyIndexWrites", (unsigned long long)indexWrites, 32);
+    MPR_DEBUG_PROP("MPRHardwareReplyQueues", 1ULL, 32);
     bool schedule = false;
     if (fReplyLock != NULL) {
         IOSimpleLockLock(fReplyLock);

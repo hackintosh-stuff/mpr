@@ -12,6 +12,7 @@
 #include <kern/thread_call.h>
 #include <libkern/c++/OSMetaClass.h>
 #include "MPRScsi.h"
+#include "MPRPerformance.h"
 
 class IOPCIDevice;
 class MPRBlockDev;
@@ -151,13 +152,16 @@ class MPRController : public IOService
 
 private:
     enum { kMPRTargetMalformedReply = 0x100, kMPRTargetRemovalUncertain };
-    /* Bounded asynchronous request scheduler; its resident DMA windows are
-     * separate from the synchronous management/probe staging area. */
+    /* Bounded asynchronous scheduler. Client DMA, fallback buffers and SMIDs
+     * are independent of the synchronous management/probe staging area. */
     MPRAsyncState    *fAsync;
     UInt32           fMaxChainDepth;
     UInt32           fChainFrameBytes;
     bool             fPowerQuiesced;
     bool   initializeAsync(void);
+    bool   configureAsyncLimits(void);
+    void   kickAsync(void);
+    void   publishAsyncStats(void);
     void   stopAsync(void);
     void   releaseAsync(bool dmaStopped);
     void   destroyAsyncState(void);
@@ -209,6 +213,12 @@ private:
     UInt8                      fLastReply[64];
     MPRReplySlot               fReplySlots[128];
     IOSimpleLock              *fReplyLock;
+    /* Never acquire this mutex while holding fReplyLock. A waiter samples
+     * the sequence before checking its slot, then sleeps atomically. */
+    IOLock                    *fReplyWaitLock;
+    UInt32                     fReplyWakeSequence;
+    UInt32                     fReplyBatches, fReplyDescriptors, fReplyMaxBatch;
+    UInt32                     fReplyIndexWrites;
     /* Lock order is reply -> post. Never wait or take reply under post. */
     IOSimpleLock              *fPostLock;
     bool                       fManagementBusy[10];
@@ -420,6 +430,10 @@ private:
     static void interruptAction(OSObject *owner, IOInterruptEventSource *sender,
                                 int index);
     void   processReplyQueue(void);
+    static UInt64 uptimeMilliseconds(void);
+    UInt32 replyWakeSequence(void);
+    void   notifyReplyWaiters(void);
+    void   waitForReplyActivity(UInt32 sequence, UInt32 timeoutMs);
     void   watchdogTimeout(IOTimerEventSource *sender);
     void   hotplugThread(void);
     bool   mediaRemovalPending(void);
@@ -485,7 +499,8 @@ private:
                       IOReturn *status);
     bool   scsiWaitChunk(UInt32 smid, UInt32 dataLen, IOReturn *status,
                          UInt32 *actualBytes = NULL,
-                         bool *unitAttention = NULL);
+                         bool *unitAttention = NULL,
+                         UInt32 timeoutMs = kMPRAsyncTimeoutMs);
     bool   probeBlockRead(void);
 
     bool   allocatePageBuffer(void);

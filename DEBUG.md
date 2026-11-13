@@ -1,11 +1,13 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.20.13.
+Date: 2026-11-13. Driver version: 0.21.0.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
 remaining work are in [PLAN.md](PLAN.md). Diagnostic output is opt-in; see
-section 7.
+section 7. The current data path is source-only: native build, sanitizer
+tests and hardware qualification remain pending. Earlier hardware observations
+in this document are a regression baseline, not proof for the current source.
 
 ## 1. Concurrency and ordering
 
@@ -14,11 +16,19 @@ through `submitAsyncBlocks`. A successful return means the bounded queue has
 accepted responsibility for exactly one completion. A rejected request gets
 an error return and no callback.
 
-The scheduler has 32 request records and four 64 KiB command windows. It
-rotates among requests, can issue several chunks of one request when others
-are absent, and harvests every posted window even if a sibling fails.
-Queue exhaustion is reported as `kIOReturnNoResources`; it is not silently
-accepted or allowed to grow without a bound.
+The scheduler has 64 request records and at most 32 independent 64 KiB command
+windows. It rotates among eligible requests, harvests every ready window and
+refills free windows without an array-order wait or a whole-batch drain.
+Request admission and completion remain bounded. Queue exhaustion returns
+`kIOReturnNoResources`, with no callback for the rejected request.
+
+Each command keeps its original 15-second post-time deadline. A sequence ticket
+sampled before inspecting replies prevents a completion between the inspection
+and sleep from being lost. Interrupts wake the worker; a 20 ms maximum wait
+also polls when an interrupt is lost. No fixed 1 ms sleep is charged to each
+completion. The transport mutex is released between scheduler sweeps and before
+this wait. Out-of-order successes beyond a failed chunk are not reported as a
+contiguous successful prefix.
 
 The I/O worker and client-completion worker are distinct, serialized
 `thread_call` objects at kernel priority. Completion delivery holds neither
@@ -35,21 +45,45 @@ Lock roles:
 | Lock | Protected state |
 |---|---|
 | Scheduler IOLock | Request acceptance, sequence/fence state, completion records |
-| `fIOLock` | Hardware batches, management staging, discovery, recovery and PM |
+| `fIOLock` | Scheduler sweeps and mapping ownership, management staging, discovery, recovery and PM |
 | `fReplyLock` | Command ownership, reply slots, event queue and topology latches |
 | `fPostLock` | The two halves of an MMIO request descriptor |
+| `fReplyWaitLock` | Reply activity sequence and atomic sleep/wakeup |
 
 The permitted inner lock order is reply then post. No wait or allocation
 occurs under either simple lock. No client notification is issued while
-holding the transport lock.
+holding the transport lock. Reply activity is notified only after dropping the
+simple locks; the wait mutex is never acquired under a simple lock. Diagnostic
+snapshots use a transport try-lock so the reply workloop cannot block behind a
+worker that is waiting for that same workloop.
+
+One hardware reply ring remains. Its consumer retires at most 32 descriptors
+per ownership-lock acquisition, publishes the current host index under that
+same lock, then drops the lock between batches. An empty drain does not write
+the host-index register. A call can continue for up to one ring depth so a
+budget boundary does not strand already-posted replies. There are no parallel
+consumers of the same descriptor and no claim of hardware multi-queue support.
 
 ## 2. DMA, SGL and ownership
 
-Each asynchronous window has its own resident data buffer, `IODMACommand`
-mapping and bounded chain storage. The mapper belongs to the PCI provider
-when available. Data addresses are restricted to 63 bits. The SGL encoder
-checks the complete address range, total length, request-frame geometry,
-chain depth and storage capacity before writing a list.
+Each asynchronous window owns a client `IODMACommand`, an independently mapped
+64 KiB resident fallback and optional 4 KiB chain storage. The mapper belongs
+to the PCI provider when available. Client pages are prepared once per accepted
+request, and each command attaches that descriptor with automatic preparation
+disabled, then prepares only its own offset/length. Segment generation starts
+at zero relative to that prepared subrange, including for multi-megabyte client
+requests. The DMA command has no whole-descriptor transfer cap; the scheduler
+still limits each posted command to 64 KiB.
+
+Data addresses are restricted to 63 bits. The SGL encoder checks the complete
+address range, exact total length, request-frame geometry, chain depth and
+storage capacity before writing a list. Each command has independent mapping
+and chain lifetime. A mapping or representability failure before posting
+falls back to its private mapped staging buffer; no partial SGL is submitted.
+A failed pre-submit read mapping is detached without copying invalid bounce
+data back. Successful read DMA is synchronized before the client is completed.
+IODMACommand may itself bounce on some platforms; direct mode removes the
+mandatory driver copy, not every possible IOKit copy.
 
 IEEE request ChainOffset and NextChainOffset are in 16-byte elements.
 Only the final data element has END_OF_LIST. A chain's length describes the
@@ -57,8 +91,18 @@ actual target elements, including its next chain element when present.
 
 The implementation caps chains at four frames per window and caps each
 frame at 1024 bytes while honoring lower IOC limits. An unrepresentable
-mapping uses the established contiguous resident staging window. This is
-scatter/gather support with copies, not direct DMA into a client's buffer.
+mapping uses the private contiguous resident staging window. At maximum depth,
+the fallback payload pool is 2 MiB and chain storage is at most 128 KiB, plus
+mapping/request metadata and the unchanged synchronous/probe pools. These
+buffers are allocated during initialization, not on the completion hot path.
+
+Asynchronous commands use SMIDs 32-63. SMIDs 1-9 remain management/probes,
+10-25 retain the synchronous bulk path, 26-28 are TMF, 29 is flush, 30 is
+UNMAP, and 31 is EVENT_ACK. The effective asynchronous count is the minimum of
+allocated slots, 32, available request frames/credits above 32, and each reply
+queue depth minus one unused entry and eight reserved entries. Sense/owner
+arrays have 128 entries. Every IOC reinitialization recomputes this bound;
+a zero result fails queue initialization rather than overlapping reservations.
 
 SMIDs have explicit free, reserved, posted, completed, quarantined and
 cancelled ownership states. A completion must match the outstanding function
@@ -77,10 +121,18 @@ Queue depths are constrained by IOC Facts, and TMFs obey the reported
 high-priority credit. A reset synthesizes cancelled completions for affected
 runtime commands instead of making each waiter time out again.
 
-If hardware cannot be proven quiescent, DMA-visible resident resources remain
-retained. Client buffers are never the target of that DMA, so failed client
-requests can still complete. Such a state requires controlled recovery and is
-not a reason to reuse the quarantined window.
+If hardware cannot be proven quiescent, resident resources and active client
+mappings remain retained. A direct request keeps its prepared descriptor,
+request record, buffer/controller references and pending callback until a late
+completion or a proved DMA stop makes it safe. A barrier returns NotReady when
+this held state blocks it; PM still attempts hardware quiescence instead of
+waiting indefinitely for an unsafe callback. The watchdog can reap a held
+request after a later proof. Stop releases and error-completes it only after
+quiescence; an unproved final stop deliberately retains it instead of risking
+DMA into recycled client pages. This can leave an I/O unresolved and requires
+controlled recovery. The resident-only fallback may error-complete its client
+while retaining the quarantined private buffer, because that DMA cannot reach
+the client's pages. No timed-out write is replayed.
 
 ## 3. Disk discovery and identity
 
@@ -222,8 +274,10 @@ classifies as a definite failure.
 Timeout recovery attempts ABORT TASK, LUN RESET and TARGET RESET, each naming
 the handle recorded for the failed SMID, subject to available TMF credit and
 terminated-command evidence, then a bounded IOC reset. Writes with uncertain
-completion are not replayed. A read whose whole batch failed with a decoded
-UNIT ATTENTION is retried once, after all DMA for that batch has ended.
+completion are not replayed. The legacy synchronous bulk helper retains its
+one-time read retry for a whole batch that failed with UNIT ATTENTION after
+DMA ended. The asynchronous scheduler returns decoded command errors; it does
+not restart a partially completed multi-command request.
 
 ## 5. Cache, FUA and UNMAP
 
@@ -280,11 +334,13 @@ One planned rebuild per wake is mandatory after S3, so `MPRResetCount` grows by
 one; the control for "no extra reset" is that `MPRStickyFaultCount`,
 `MPRFaultRecoveries` and `MPRProtocolRecoveryPending` stay unchanged.
 `systemWillShutdown` follows the same quiesce path. Sleep/wake and shutdown are
-qualified on the directly attached disk and with two targets behind the
-expander.
+part of the earlier qualification baseline on the directly attached disk and
+with two targets behind the expander. Changed DMA ownership and PM failure
+paths require new qualification.
 
-Stop waits for the I/O and completion workers outside the transport lock,
-then tears down DMA. Scheduler/transport locks remain alive until final
+Stop drains the I/O and completion workers outside the transport lock, proves
+hardware DMA stop, then detaches any held client maps and completes them with
+an error. Without that proof, active direct requests are not completed or freed. Scheduler/transport locks remain alive until final
 service release so callers retained before stop can unwind safely.
 
 ## 7. Diagnostics
@@ -302,13 +358,30 @@ that is absent on a normal boot is expected, not a failed load.
 | Build and media | `MPRBuild`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady`, `MPRMediaReadyStatus`, `MPRPublishedTargetCount` |
 | Targets | `MPRTargetCount`, `MPRTargetNHandle`, `MPRTargetNSasAddress`, `MPRTargetNPresent`, `MPRTargetNProbed`, `MPRTargetNProbeState`, `MPRTargetNProbeStatus`, `MPRTargetNProbeRetries`, `MPRTargetNOnline`, `MPRTargetNRemovalState`, `MPRTargetNMediaStatus`, `MPRTargetNGeneration` |
 | Discovery and removal | `MPRScanCount`, `MPRRemovedMediaCount`, `MPRRemovalFailures`, `MPRRemovalStage`, `MPRRetiredSlotsReleased`, `MPRRediscoveryResets`, `MPRRediscoveryState` |
-| Async and DMA | `MPRAsyncRequestLimit`, `MPRAsyncCommandLimit`, `MPRAsyncPeakRequests`, `MPRMappedCommands`, `MPRChainedCommands`, `MPRBounceCommands` |
+| Async limits | `MPRAsyncRequestLimit`, `MPRAsyncRequestedDepth`, `MPRAsyncAllocatedDepth`, `MPRAsyncCommandLimit`, `MPRAsyncFirstSmid`, `MPRAsyncPeakRequests`, `MPRAsyncOutstanding`, `MPRAsyncPeakCommands` |
+| Client DMA | `MPRDirectDMAEnabled`, `MPRDirectCommands`, `MPRMappedCommands`, `MPRDirectBytes`, `MPRCopiedBytes`, `MPRChainedCommands`, `MPRBounceCommands`, `MPRDirectMapFailures`, `MPRAsyncHeldDMA` |
+| Reply retirement | `MPRHardwareReplyQueues`, `MPRReplyBatches`, `MPRReplyDescriptors`, `MPRReplyMaxBatch`, `MPRReplyIndexWrites` |
 | Identity/filter | `MPRStableIdentityValid`, `MPRStableIdentity`, `MPRIdentityState`, `MPRRaidFilterState`, `MPRStandaloneTargetCount`, `MPRSasDevicePageState` |
 | Capabilities | `MPRNativeFuaSupported`, `MPRFuaPolicy`, `MPRUnmapEnabled`, `MPRUnmapMaxLbaCount`, `MPRUnmapMaxDescriptors`, `MPRUnmapReadsZero` |
 | Recovery | `MPRHotplugState`, `MPRProbeRetries`, `MPRResetCount`, `MPRResetInitiator`, `MPRReinitState`, `MPRRecoveryState`, `MPRFaultRecoveries`, `MPRFaultRecoveryState`, `MPRDeviceOffline`, `MPRTmfHandle`, `MPRTmfResetStatus` |
 | Protocol | `MPRProtocolRecoveryPending`, `MPRProtocolFaultCode`, `MPRProtocolFaultSmid`, `MPRStickyFaultCode`, `MPRStickyFaultSmid`, `MPRStickyFaultCount`, `MPRBadReplySite`, `MPREventAckQueued`, `MPREventAckFailed` |
 | Power | `MPRPowerState`, `MPRPowerFlushStatus`, `MPRPowerFlushCount`, `MPRStopDMAState`, `MPRWatchdogIOCState`, `MPRWakeNotReadyCount`, `MPRWakeQuiesced`, `MPRWakeMemoryEnabled`, `MPRWakeBusMasterEnabled`, `MPRWakeRebuildState`, `MPRWakeSettleTicks` |
 | Writes | `MPRWriteCount`, `MPRWriteBytes`, `MPRLastWriteLba`, `MPRLastWriteSmid`, `MPRTargetNWriteCount`, `MPRTargetNFailureCount` |
+
+`mpr_io_depth=N` requests 1-32 command slots; absent/non-positive means 32 and
+larger values clamp to 32. `mpr_direct_dma` defaults to 1; zero forces fallback.
+The runtime limit may be lower than requested. No live tuning property exists.
+
+`MPRDirectCommands` and its compatibility alias `MPRMappedCommands` count posted
+client-mapped commands, not old resident mappings. `MPRDirectBytes` counts their
+submitted bytes, not verified successful bytes. `MPRCopiedBytes` counts explicit
+driver copies to/from client memory, including copies before a later failure;
+it excludes IOKit internal bounce copies. Forced fallback does not count as a
+mapping failure. `MPRAsyncHeldDMA` counts direct commands retained after recovery
+could not prove DMA safety; zero is required after a normal drained run.
+Snapshots occur once per watchdog tick when the transport try-lock succeeds.
+Reply counters are 32-bit and may wrap in very long runs. The hardware queue
+count remains one. Use deltas and actual client results, not counters alone.
 
 A property saying "online" is not data-integrity evidence. Always pair it with
 the active IOMedia count, actual byte count and readback content.
@@ -329,8 +402,8 @@ names are not macOS requirements.
 | Mechanism | FreeBSD reference | Implementation |
 |---|---|---|
 | Request ownership and completion | `mpr_command`, `mpr_complete_command`, `mpr_intr_locked` | Per-SMID ownership states, checked replies, independent sense, quarantined timeouts and cancelled reset completions |
-| Asynchronous dispatch | CAM submission and command callbacks | Request queue, four shared command windows, separate completion context, sequence fences |
-| DMA, scatter/gather and chain | `mpr_add_chain`, `mpr_push_ieee_sge`, IOC Facts | Device-visible resident mappings, bounded IEEE chains, explicit contiguous fallback |
+| Asynchronous dispatch | CAM submission and command callbacks | 64 request records, up to 32 credit-bounded independent windows, ready-first harvest/refill, separate completion context and fences |
+| DMA, scatter/gather and chain | `mpr_map_command`, `mpr_add_chain`, `mpr_push_ieee_sge`, IOC Facts | Client-buffer DMA mappings, bounded IEEE chains and explicit private staging fallback |
 | Queue resources | `mpr_resize_queues`, high-priority command pool | Facts-constrained geometry, reserved management/TMF/ACK resources |
 | SCSI data contract | `mprsas_action_scsiio` plus CAM disk policy | READ/WRITE(10)/(16), exact block transfers, bounded sense, SYNC(10)/(16), FUA fallback |
 | Thin provisioning | CAM disk and UNMAP policy | B0/B2 capability probe, input validation, bounded descriptor and block batching |
@@ -342,31 +415,34 @@ names are not macOS requirements.
 | Sleep and shutdown | FreeBSD suspend/resume return EINVAL; separate shutdown path | Native IOKit PM with per-target flush and wake revalidation |
 | Builds | OS-specific build system | All driver translation units in the CLI and Xcode builds |
 
-Sleep and wake, physical pull and pulls with I/O in flight are qualified with
-two targets behind this expander, as are short and long sleeps. Outside that
-configuration, and not silently treated as implemented: more than two targets,
+Sleep and wake, physical pull and pulls with I/O in flight have earlier
+qualification evidence with two targets behind this expander. The current
+source needs these regressions repeated. Outside the qualification baseline: more than two targets,
 a different expander or backplane, and concurrent multi-disk pulls; multiple
 LUNs and general SCSI passthrough; DPM persistent numbering and multipath; IR
 logical volumes and RAID management; SES/enclosure control, SMP passthrough,
 firmware update and user-space tools; NVMe/PCIe/Tri-Mode, SAS2 and GEN35
-hardware; direct DMA into client buffers, multi-queue/MSI-X scaling and tuning.
+hardware. Hardware multi-queue/MSI-X scaling remains unimplemented. Direct
+client DMA and ready-first refill are implemented in source but unqualified.
+The batching/empty-drain policy also uses the local Linux
+`mpt3sas_base.c::_base_process_reply_queue` as a behavior reference; the Linux
+implementation is not copied into the kext. Its per-vector queues are not
+simulated by multiple threads competing for this driver's one ring.
 
 ## 9. Host-side checks
 
-`tools/test_protocol.cpp` exercises the shared wire-format helpers against
-independent golden bytes and a separate chain decoder: 10- and 16-byte CDB
-boundaries, high LBAs, arithmetic overflow, legal and truncated VPD, RAID page
-layouts and membership, bounded fixed and descriptor sense, chain
-depth/address/length rejection, sentinel protection and randomized SGL
-reconstruction. AddressSanitizer and UndefinedBehaviorSanitizer are used when
-available: 136,593 assertions and 2,000 deterministic SGL cases pass, including
-the intentional rejection cases.
+`tools/test_protocol.cpp` contains golden CDB/VPD/sense tests and an independent
+IEEE chain decoder with 2,000 deterministic SGL cases. The performance helper
+coverage includes requested-depth clamping, insufficient credits/queue entries,
+SMID separation and reset-time lower limits, signed wide-arithmetic resource
+oracles, and all completion permutations for a partially failing four-chunk
+request. These updated C++ tests have not been compiled or run for this source.
+They do not simulate IOKit mapping, IRQ interleaving or real DMA-stop evidence.
 
-`tools/validate-build-inputs.py` checks LF text, bundle and runtime version
-consistency, and inclusion of every driver translation unit in the Xcode
-project; the CLI build compiles every source file. Against MacKernelSDK with a
-Darwin target, compilation verifies C++/IOKit declarations and produces Mach-O
-objects with no diagnostics under `-Wall -Wextra -Werror`, and the driver has no
-unresolved driver-internal symbols. Linking, ad hoc signing and loading are
-separate checks that require macOS; all three pass on the test machine.
-
+`tools/validate-build-inputs.py` checks LF text, plist/runtime/CLI/Xcode version
+consistency and inclusion of all four driver translation units in the Xcode
+project. It also checks host-test source line endings. Its successful result is
+not a C++ compilation or a kernel ABI/link validation. Native compilation,
+ASan/UBSan, linking, signing, deployment, hardware correctness and performance
+comparisons are separate pending steps in
+[PERFORMANCE_TEST_PROMPT.md](PERFORMANCE_TEST_PROMPT.md).
