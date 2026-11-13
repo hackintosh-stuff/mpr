@@ -1,10 +1,11 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.20.12.
+Date: 2026-11-13. Driver version: 0.20.13.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
-remaining work are in [PLAN.md](PLAN.md).
+remaining work are in [PLAN.md](PLAN.md). Diagnostic output is opt-in; see
+section 7.
 
 ## 1. Concurrency and ordering
 
@@ -288,6 +289,14 @@ service release so callers retained before stop can unwind safely.
 
 ## 7. Diagnostics
 
+All diagnostic output is silent by default: neither kernel log lines nor any
+IORegistry property below is produced unless `mpr_debug=1` is present in
+boot-args. The flag is parsed from the earliest IOKit entry points
+(`init`, `probe`, `start`), so bring-up logging is covered too. Every
+`setProperty` / `removeProperty` call and every `IOLog` call goes through the
+same gate (`MPR_DEBUG_PROP`, `MPR_DEBUG_REMOVE`, `MPR_DEBUG_LOG`). A property
+that is absent on a normal boot is expected, not a failed load.
+
 | Area | Useful IORegistry properties |
 |---|---|
 | Build and media | `MPRBuild`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady`, `MPRMediaReadyStatus`, `MPRPublishedTargetCount` |
@@ -304,9 +313,10 @@ service release so callers retained before stop can unwind safely.
 A property saying "online" is not data-integrity evidence. Always pair it with
 the active IOMedia count, actual byte count and readback content.
 
-Opt-in boot arguments `mpr_timeout_test=1`, `mpr_tmf_fail=N` and
-`mpr_timeout_every=N` exercise recovery; none is set by default. Serial kernel
-logging remains off by default under the workspace rules.
+`mpr_debug=1` enables the kernel log and every IORegistry property listed
+above. `mpr_timeout_test=1`, `mpr_tmf_fail=N` and `mpr_timeout_every=N`
+exercise recovery; none of these boot arguments is set by default. Serial
+kernel logging remains off by default under the workspace rules.
 
 ## 8. Coverage against the FreeBSD driver
 

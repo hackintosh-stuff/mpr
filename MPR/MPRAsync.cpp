@@ -140,8 +140,8 @@ MPRController::initializeAsync(void)
         }
     }
     if (mapper) mapper->release();
-    setProperty("MPRAsyncRequestLimit", (unsigned long long)kMPRAsyncRequests, 32);
-    setProperty("MPRAsyncCommandLimit", (unsigned long long)kMPRAsyncSlots, 32);
+    MPR_DEBUG_PROP("MPRAsyncRequestLimit", (unsigned long long)kMPRAsyncRequests, 32);
+    MPR_DEBUG_PROP("MPRAsyncCommandLimit", (unsigned long long)kMPRAsyncSlots, 32);
     return true;
 }
 
@@ -609,10 +609,10 @@ MPRController::asyncWorker(void)
         if (!more) state->scheduled = false;
         IOLockWakeup(state->lock, &state->outstanding, false);
         IOLockUnlock(state->lock);
-        setProperty("MPRAsyncPeakRequests", (unsigned long long)state->peak, 32);
-        setProperty("MPRMappedCommands", (unsigned long long)state->mappedCommands, 32);
-        setProperty("MPRChainedCommands", (unsigned long long)state->chainedCommands, 32);
-        setProperty("MPRBounceCommands", (unsigned long long)state->bounceCommands, 32);
+        MPR_DEBUG_PROP("MPRAsyncPeakRequests", (unsigned long long)state->peak, 32);
+        MPR_DEBUG_PROP("MPRMappedCommands", (unsigned long long)state->mappedCommands, 32);
+        MPR_DEBUG_PROP("MPRChainedCommands", (unsigned long long)state->chainedCommands, 32);
+        MPR_DEBUG_PROP("MPRBounceCommands", (unsigned long long)state->bounceCommands, 32);
         if (!more) break;
     }
     release();

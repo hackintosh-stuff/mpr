@@ -113,12 +113,12 @@ MPRController::readRaidMembership(UInt16 handle, bool *member)
              * never a generic permission to expose a disk after an error. */
             if (status == MPI2_IOCSTATUS_CONFIG_INVALID_PAGE &&
                 !fProtocolRecoveryPending) return true;
-            setProperty("MPRRaidFilterState", "configuration-unavailable");
+            MPR_DEBUG_PROP("MPRRaidFilterState", "configuration-unavailable");
             return false;
         }
         bool contains = false;
         if (!mprRaidConfigContains(page, actual, handle, &contains)) {
-            setProperty("MPRRaidFilterState", "malformed-configuration");
+            MPR_DEBUG_PROP("MPRRaidFilterState", "malformed-configuration");
             return false;
         }
         UInt8 number = page[0x0B];
@@ -127,7 +127,7 @@ MPRController::readRaidMembership(UInt16 handle, bool *member)
         cursor = number;
         if (contains) { *member = true; return true; }
     }
-    setProperty("MPRRaidFilterState", "configuration-enumeration-limit");
+    MPR_DEBUG_PROP("MPRRaidFilterState", "configuration-enumeration-limit");
     return false;
 }
 
@@ -157,15 +157,15 @@ MPRController::readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo)
                       (flags & MPI25_SAS_DEVICE0_FLAGS_ENABLED_FAST_PATH) != 0;
     char address[24];
     snprintf(address, sizeof(address), "%016llx", (unsigned long long)fTargetSasAddress);
-    setProperty("MPRSasDeviceSasAddress", address);
-    setProperty("MPRSasDeviceHandle", (unsigned long long)devHandle, 16);
-    setProperty("MPRSasDeviceInfo", (unsigned long long)info, 32);
-    setProperty("MPRSasDeviceFlags", (unsigned long long)flags, 16);
-    setProperty("MPRSasDeviceParent", (unsigned long long)mprReadLe16(page + 0x14), 16);
-    setProperty("MPRSasDeviceSlot", (unsigned long long)mprReadLe16(page + 0x08), 16);
-    setProperty("MPRSasDeviceEnclosure", (unsigned long long)mprReadLe16(page + 0x0A), 16);
-    setProperty("MPRSasDevicePhyNum", (unsigned long long)page[0x16], 8);
-    setProperty("MPRFastPathEnabled", fFastPathEnabled);
+    MPR_DEBUG_PROP("MPRSasDeviceSasAddress", address);
+    MPR_DEBUG_PROP("MPRSasDeviceHandle", (unsigned long long)devHandle, 16);
+    MPR_DEBUG_PROP("MPRSasDeviceInfo", (unsigned long long)info, 32);
+    MPR_DEBUG_PROP("MPRSasDeviceFlags", (unsigned long long)flags, 16);
+    MPR_DEBUG_PROP("MPRSasDeviceParent", (unsigned long long)mprReadLe16(page + 0x14), 16);
+    MPR_DEBUG_PROP("MPRSasDeviceSlot", (unsigned long long)mprReadLe16(page + 0x08), 16);
+    MPR_DEBUG_PROP("MPRSasDeviceEnclosure", (unsigned long long)mprReadLe16(page + 0x0A), 16);
+    MPR_DEBUG_PROP("MPRSasDevicePhyNum", (unsigned long long)page[0x16], 8);
+    MPR_DEBUG_PROP("MPRFastPathEnabled", fFastPathEnabled);
     return true;
 }
 
@@ -185,11 +185,11 @@ MPRController::readSasIOUnitPage0(void)
         if ((phy[3] & 0x0F) >= 8) links++;
         char name[32];
         snprintf(name, sizeof(name), "MPRPhy%uDevHandle", (unsigned)i);
-        setProperty(name, (unsigned long long)mprReadLe16(phy + 8), 16);
+        MPR_DEBUG_PROP(name, (unsigned long long)mprReadLe16(phy + 8), 16);
         snprintf(name, sizeof(name), "MPRPhy%uLinkRate", (unsigned)i);
-        setProperty(name, (unsigned long long)(phy[3] & 0x0F), 8);
+        MPR_DEBUG_PROP(name, (unsigned long long)(phy[3] & 0x0F), 8);
     }
-    setProperty("MPRNumPhys", (unsigned long long)phys, 8);
+    MPR_DEBUG_PROP("MPRNumPhys", (unsigned long long)phys, 8);
     fSasDeviceMismatch = false;
 
     /* GET_NEXT_HANDLE reaches the terminal disk behind a backplane/expander.
@@ -236,7 +236,7 @@ MPRController::readSasIOUnitPage0(void)
         bool raid = false;
         if (!readRaidMembership(handle, &raid)) return false;
         if (raid) {
-            setProperty("MPRRaidExcludedHandle", (unsigned long long)handle, 16);
+            MPR_DEBUG_PROP("MPRRaidExcludedHandle", (unsigned long long)handle, 16);
             continue;
         }
         const UInt64 address = mprReadLe64(page + 0x0C);
@@ -255,7 +255,7 @@ MPRController::readSasIOUnitPage0(void)
             /* The same device is listed twice in one snapshot, which a reset
              * can leave behind. Adopt it once instead of creating a second
              * medium for one disk. */
-            setProperty("MPRTopologyDuplicate", "same-sas-address");
+            MPR_DEBUG_PROP("MPRTopologyDuplicate", "same-sas-address");
             continue;
         }
         if (slot != NULL) {
@@ -265,7 +265,7 @@ MPRController::readSasIOUnitPage0(void)
                  * whatever else that handle now names. */
                 slot->generation++;
                 slot->handle = handle;
-                setProperty("MPRTargetReuseState", "handle-moved-same-device");
+                MPR_DEBUG_PROP("MPRTargetReuseState", "handle-moved-same-device");
             }
         } else {
             slot = findTarget(handle);
@@ -280,7 +280,7 @@ MPRController::readSasIOUnitPage0(void)
                 slot->probeValid = false;
                 slot->identityValid = false;
                 slot->removalRequested = false;
-                setProperty("MPRTargetReuseState", "handle-reassigned");
+                MPR_DEBUG_PROP("MPRTargetReuseState", "handle-reassigned");
             } else {
                 /* A disk that returns after REMOVE_DEVICE gets a new firmware
                  * handle; reuse the retired slot of the same SAS address when
@@ -307,7 +307,7 @@ MPRController::readSasIOUnitPage0(void)
                 } else {
                     slot = allocTargetSlot();
                     if (slot == NULL) {
-                        setProperty("MPRTopologyFailure", "too-many-targets");
+                        MPR_DEBUG_PROP("MPRTopologyFailure", "too-many-targets");
                         return false;
                     }
                     /* A recycled slot can still own the nub of its previous
@@ -364,16 +364,16 @@ MPRController::readSasIOUnitPage0(void)
     for (UInt32 i = 0; i < kMPRMaxTargets; i++)
         if (fTargets[i].handle != 0) fTargetCount++;
 
-    setProperty("MPRStandaloneTargetCount", (unsigned long long)candidates, 32);
-    setProperty("MPRTargetCount", (unsigned long long)fTargetCount, 32);
+    MPR_DEBUG_PROP("MPRStandaloneTargetCount", (unsigned long long)candidates, 32);
+    MPR_DEBUG_PROP("MPRTargetCount", (unsigned long long)fTargetCount, 32);
     publishTargetProperties();
     /* Every eligible target stays in the table; publication is per target.
      * The selected handle's own device page is a cross-check, not a gate: one
      * unreadable page must not keep the other targets unpublished. */
     if (selected != 0 && !readSasDevicePage0(selected)) {
-        setProperty("MPRSasDevicePageState", "unavailable");
+        MPR_DEBUG_PROP("MPRSasDevicePageState", "unavailable");
     } else {
-        removeProperty("MPRSasDevicePageState");
+        MPR_DEBUG_REMOVE("MPRSasDevicePageState");
     }
     fAttachedDevHandle = selected;
     fLinkUpPhys = links;
@@ -386,12 +386,12 @@ MPRController::readSasIOUnitPage0(void)
         fTargetSasAddress = 0;
     }
     fIdentityLostCount = 0;
-    setProperty("MPRLinkUpPhys", (unsigned long long)links, 8);
-    setProperty("MPRAttachedDevHandle", (unsigned long long)selected, 16);
-    setProperty("MPRAttachedDeviceInfo", (unsigned long long)fTargetDeviceInfo, 32);
-    setProperty("MPRTopologyHasExpander", fHasExpander);
-    setProperty("MPRRaidFilterState", "standalone-only");
-    removeProperty("MPRTopologyFailure");
+    MPR_DEBUG_PROP("MPRLinkUpPhys", (unsigned long long)links, 8);
+    MPR_DEBUG_PROP("MPRAttachedDevHandle", (unsigned long long)selected, 16);
+    MPR_DEBUG_PROP("MPRAttachedDeviceInfo", (unsigned long long)fTargetDeviceInfo, 32);
+    MPR_DEBUG_PROP("MPRTopologyHasExpander", fHasExpander);
+    MPR_DEBUG_PROP("MPRRaidFilterState", "standalone-only");
+    MPR_DEBUG_REMOVE("MPRTopologyFailure");
     return true;
 }
 
@@ -502,7 +502,7 @@ MPRController::probeStableIdentity(void)
         strlcpy(fTargetSerial, serialText, sizeof(fTargetSerial));
         if (serial) fTargetIdentityValid = mprHexIdentity(fTargetIdentity,
             sizeof(fTargetIdentity), "ata-model-serial", key, sizeof(key));
-        setProperty("MPRSataSolidState", mprReadLe16(page + 434) == 1);
+        MPR_DEBUG_PROP("MPRSataSolidState", mprReadLe16(page + 434) == 1);
     }
     if (!fTargetIdentityValid && !fProtocolRecoveryPending &&
         scsiInquiryVpd(0x83, page, sizeof(page), &actual)) {
@@ -547,9 +547,9 @@ MPRController::probeStableIdentity(void)
                                                   "vpd80", key, 36 + serialBytes);
         }
     }
-    setProperty("MPRStableIdentityValid", fTargetIdentityValid);
-    if (fTargetIdentityValid) setProperty("MPRStableIdentity", fTargetIdentity);
-    else removeProperty("MPRStableIdentity");
+    MPR_DEBUG_PROP("MPRStableIdentityValid", fTargetIdentityValid);
+    if (fTargetIdentityValid) MPR_DEBUG_PROP("MPRStableIdentity", fTargetIdentity);
+    else MPR_DEBUG_REMOVE("MPRStableIdentity");
     return fTargetIdentityValid && !fProtocolRecoveryPending;
 }
 
@@ -567,9 +567,9 @@ MPRController::probeScsiIdentity(void)
 {
     if (fProtocolRecoveryPending || !allocatePageBuffer()) return false;
     bool ready = scsiTur();
-    setProperty("MPRTurStatus", ready ? "ok" : "failed");
+    MPR_DEBUG_PROP("MPRTurStatus", ready ? "ok" : "failed");
     bool ok = !fProtocolRecoveryPending && scsiInquiry() && probeStableIdentity();
-    setProperty("MPRScsiProbeState", ok ? "ok" : "failed");
+    MPR_DEBUG_PROP("MPRScsiProbeState", ok ? "ok" : "failed");
     return ok;
 }
 
@@ -581,10 +581,10 @@ MPRController::checkTargetIdentity(void)
      * device and advances that slot's media generation when they differ. */
     if (!fTargetIdentityValid || fCapacityBlocks == 0 || fBlockSize == 0 ||
         fCapacityBlocks > UINT64_MAX / fBlockSize) {
-        setProperty("MPRIdentityState", "unverified");
+        MPR_DEBUG_PROP("MPRIdentityState", "unverified");
         return false;
     }
-    setProperty("MPRIdentityState", "verified");
+    MPR_DEBUG_PROP("MPRIdentityState", "verified");
     return true;
 }
 
@@ -613,15 +613,15 @@ MPRController::probeTargetCapabilities(void)
             fNativeFuaSupported = (mode[3] & 0x10) != 0;
         }
     }
-    setProperty("MPRNativeFuaSupported", fNativeFuaSupported);
-    setProperty("MPRFuaPolicy", fNativeFuaSupported ? "native" : "ordered-cache-flush");
-    setProperty("MPRUnmapEnabled", fUnmapEnabled);
-    setProperty("MPRUnmapMaxLbaCount", (unsigned long long)fUnmapLimits.maxBlocks, 32);
-    setProperty("MPRUnmapMaxDescriptors", (unsigned long long)fUnmapLimits.maxDescriptors, 32);
-    setProperty("MPRUnmapOptimalGranularity", (unsigned long long)fUnmapLimits.optimalGranularity, 32);
-    setProperty("MPRUnmapAlignment", (unsigned long long)fUnmapLimits.alignment, 32);
-    setProperty("MPRUnmapAlignmentValid", fUnmapLimits.alignmentValid);
-    setProperty("MPRUnmapReadsZero", fUnmapLimits.readsZero);
+    MPR_DEBUG_PROP("MPRNativeFuaSupported", fNativeFuaSupported);
+    MPR_DEBUG_PROP("MPRFuaPolicy", fNativeFuaSupported ? "native" : "ordered-cache-flush");
+    MPR_DEBUG_PROP("MPRUnmapEnabled", fUnmapEnabled);
+    MPR_DEBUG_PROP("MPRUnmapMaxLbaCount", (unsigned long long)fUnmapLimits.maxBlocks, 32);
+    MPR_DEBUG_PROP("MPRUnmapMaxDescriptors", (unsigned long long)fUnmapLimits.maxDescriptors, 32);
+    MPR_DEBUG_PROP("MPRUnmapOptimalGranularity", (unsigned long long)fUnmapLimits.optimalGranularity, 32);
+    MPR_DEBUG_PROP("MPRUnmapAlignment", (unsigned long long)fUnmapLimits.alignment, 32);
+    MPR_DEBUG_PROP("MPRUnmapAlignmentValid", fUnmapLimits.alignmentValid);
+    MPR_DEBUG_PROP("MPRUnmapReadsZero", fUnmapLimits.readsZero);
     return !fProtocolRecoveryPending;
 }
 
@@ -630,7 +630,7 @@ MPRController::prepareTargetMedia(void)
 {
     if (fAttachedDevHandle == 0 || fRequestBuffer == NULL || fProtocolRecoveryPending ||
         !allocateResidentBuffers() || !checkTargetIdentity() || !probeTargetCapabilities()) {
-        setProperty("MPRMediaReady", false);
+        MPR_DEBUG_PROP("MPRMediaReady", false);
         return false;
     }
     UInt32 blocks = fCapacityBlocks < 8 ? (UInt32)fCapacityBlocks : 8;
@@ -643,10 +643,10 @@ MPRController::prepareTargetMedia(void)
     IOReturn status = kIOReturnIOError;
     bool ready = blocks != 0 &&
         scsiReadWrite(false, 0, blocks, fBlockSize, 9, false, false, &status);
-    setProperty("MPRMediaReadyStatus", (unsigned long long)(UInt32)status, 32);
+    MPR_DEBUG_PROP("MPRMediaReadyStatus", (unsigned long long)(UInt32)status, 32);
     ready = ready && !fProtocolRecoveryPending && fPageBuffer != NULL &&
             fDataBuffer != NULL && fDataBytes != 0;
-    setProperty("MPRMediaReady", ready);
+    MPR_DEBUG_PROP("MPRMediaReady", ready);
     return ready;
 }
 
@@ -659,7 +659,7 @@ MPRController::scsiSynchronizeCache(UInt64 lba, UInt64 blocks, UInt32 smid, bool
     IOReturn status = kIOReturnNotReady;
     if (!issueScsiCommand(cdb, length, MPI2_SCSIIO_CONTROL_NODATATRANSFER,
                           NULL, 0, smid, &status)) return status;
-    setProperty("MPRSyncBarrier", barrier);
+    MPR_DEBUG_PROP("MPRSyncBarrier", barrier);
     return kIOReturnSuccess;
 }
 
@@ -689,8 +689,8 @@ MPRController::scsiUnmap(const IOBlockStorageDeviceExtent *extents,
     if (!issueScsiCommand(cdb, sizeof(cdb), MPI2_SCSIIO_CONTROL_WRITE,
                           params, dataLen, smid, &status)) {
         fUnmapEnabled = false;
-        setProperty("MPRUnmapEnabled", false);
-        setProperty("MPRUnmapDisabled", "command-failed");
+        MPR_DEBUG_PROP("MPRUnmapEnabled", false);
+        MPR_DEBUG_PROP("MPRUnmapDisabled", "command-failed");
         return status;
     }
     return kIOReturnSuccess;
@@ -847,76 +847,76 @@ MPRController::publishTargetProperties(void)
                               slot->removalRequested ? "requested" :
                               slot->present ? "live" : "gone";
         snprintf(name, sizeof(name), "MPRTarget%uHandle", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->handle, 16);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->handle, 16);
         snprintf(name, sizeof(name), "MPRTarget%uDeviceInfo", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->deviceInfo, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->deviceInfo, 32);
         snprintf(name, sizeof(name), "MPRTarget%uSasAddress", (unsigned)i);
         snprintf(address, sizeof(address), "%016llx",
                  (unsigned long long)slot->sasAddress);
-        setProperty(name, address);
+        MPR_DEBUG_PROP(name, address);
         snprintf(name, sizeof(name), "MPRTarget%uPresent", (unsigned)i);
-        setProperty(name, slot->present);
+        MPR_DEBUG_PROP(name, slot->present);
         snprintf(name, sizeof(name), "MPRTarget%uProbed", (unsigned)i);
-        setProperty(name, slot->probeValid);
+        MPR_DEBUG_PROP(name, slot->probeValid);
         snprintf(name, sizeof(name), "MPRTarget%uProbeState", (unsigned)i);
-        setProperty(name, slot->probeState == kMPRProbeOk ? "ok" :
+        MPR_DEBUG_PROP(name, slot->probeState == kMPRProbeOk ? "ok" :
                           slot->probeState == kMPRProbeNotReady ?
                           "not-ready" : "failed");
         snprintf(name, sizeof(name), "MPRTarget%uProbeRetries", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->probeRetries, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->probeRetries, 32);
         snprintf(name, sizeof(name), "MPRTarget%uOnline", (unsigned)i);
-        setProperty(name, slot->online);
+        MPR_DEBUG_PROP(name, slot->online);
         snprintf(name, sizeof(name), "MPRTarget%uBlocks", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->capacityBlocks, 64);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->capacityBlocks, 64);
         snprintf(name, sizeof(name), "MPRTarget%uBlockSize", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->blockSize, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->blockSize, 32);
         snprintf(name, sizeof(name), "MPRTarget%uIdentity", (unsigned)i);
-        setProperty(name, slot->identityValid ? slot->identity : "unknown");
+        MPR_DEBUG_PROP(name, slot->identityValid ? slot->identity : "unknown");
         snprintf(name, sizeof(name), "MPRTarget%uModel", (unsigned)i);
-        setProperty(name, slot->model[0] != 0 ? slot->model : "unknown");
+        MPR_DEBUG_PROP(name, slot->model[0] != 0 ? slot->model : "unknown");
         snprintf(name, sizeof(name), "MPRTarget%uSerial", (unsigned)i);
-        setProperty(name, slot->serial[0] != 0 ? slot->serial : "unknown");
+        MPR_DEBUG_PROP(name, slot->serial[0] != 0 ? slot->serial : "unknown");
         snprintf(name, sizeof(name), "MPRTarget%uRemovalState", (unsigned)i);
-        setProperty(name, removal);
+        MPR_DEBUG_PROP(name, removal);
         snprintf(name, sizeof(name), "MPRTarget%uGeneration", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->generation, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->generation, 32);
         snprintf(name, sizeof(name), "MPRTarget%uFailureCount", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->failureCount, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->failureCount, 32);
         snprintf(name, sizeof(name), "MPRTarget%uWriteCount", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->writeCount, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->writeCount, 32);
     }
 }
 
 void
 MPRController::publishTargetCounters(void)
 {
-    setProperty("MPRScanCount", (unsigned long long)fScanSerial, 32);
-    setProperty("MPRRemovedMediaCount", (unsigned long long)fRemovedMediaCount, 32);
-    setProperty("MPRRemovalFailures", (unsigned long long)fRemovalFailures, 32);
-    setProperty("MPRFaultRecoveries", (unsigned long long)fFaultRecoveries, 32);
-    setProperty("MPRRediscoveryResets", (unsigned long long)fRediscoveryResets, 32);
+    MPR_DEBUG_PROP("MPRScanCount", (unsigned long long)fScanSerial, 32);
+    MPR_DEBUG_PROP("MPRRemovedMediaCount", (unsigned long long)fRemovedMediaCount, 32);
+    MPR_DEBUG_PROP("MPRRemovalFailures", (unsigned long long)fRemovalFailures, 32);
+    MPR_DEBUG_PROP("MPRFaultRecoveries", (unsigned long long)fFaultRecoveries, 32);
+    MPR_DEBUG_PROP("MPRRediscoveryResets", (unsigned long long)fRediscoveryResets, 32);
     /* Called from the watchdog: the counters move without a topology event, so
      * they are republished periodically instead of only on publication. */
     UInt32 probeRetries = 0;
     for (UInt32 i = 0; i < kMPRMaxTargets; i++)
         probeRetries += fTargets[i].probeRetries;
-    setProperty("MPRProbeRetries", (unsigned long long)probeRetries, 32);
+    MPR_DEBUG_PROP("MPRProbeRetries", (unsigned long long)probeRetries, 32);
     for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
         MPRTargetSlot *slot = &fTargets[i];
         if (slot->handle == 0 && slot->nub == NULL) continue;
         char name[48];
         snprintf(name, sizeof(name), "MPRTarget%uWriteCount", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->writeCount, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->writeCount, 32);
         snprintf(name, sizeof(name), "MPRTarget%uFailureCount", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->failureCount, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->failureCount, 32);
         snprintf(name, sizeof(name), "MPRTarget%uProbeState", (unsigned)i);
-        setProperty(name, slot->probeState == kMPRProbeOk ? "ok" :
+        MPR_DEBUG_PROP(name, slot->probeState == kMPRProbeOk ? "ok" :
                           slot->probeState == kMPRProbeNotReady ?
                           "not-ready" : "failed");
         snprintf(name, sizeof(name), "MPRTarget%uProbeRetries", (unsigned)i);
-        setProperty(name, (unsigned long long)slot->probeRetries, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->probeRetries, 32);
         snprintf(name, sizeof(name), "MPRTarget%uOnline", (unsigned)i);
-        setProperty(name, slot->online);
+        MPR_DEBUG_PROP(name, slot->online);
     }
 }
 
@@ -958,9 +958,9 @@ MPRController::invalidateTargets(void)
     for (UInt32 i = 0; i < kMPRMaxTargets; i++) invalidateTarget(&fTargets[i]);
     fMediaPresent = false;
     fDeviceOffline = true;
-    setProperty("MPRDeviceOffline", true);
-    setProperty("MPRMediaPresent", false);
-    setProperty("MPRMediaReady", false);
+    MPR_DEBUG_PROP("MPRDeviceOffline", true);
+    MPR_DEBUG_PROP("MPRMediaPresent", false);
+    MPR_DEBUG_PROP("MPRMediaReady", false);
     publishTargetProperties();
 }
 
@@ -1038,11 +1038,11 @@ MPRController::probeTarget(MPRTargetSlot *slot)
             (status == kIOReturnNotReady || status == kIOReturnBusy)
                 ? kMPRProbeNotReady : kMPRProbeFailed;
         snprintf(name, sizeof(name), "MPRTarget%uProbe", index);
-        setProperty(name, result == kMPRProbeNotReady ? "not-ready" : "failed");
+        MPR_DEBUG_PROP(name, result == kMPRProbeNotReady ? "not-ready" : "failed");
         snprintf(name, sizeof(name), "MPRTarget%uProbeStage", index);
-        setProperty(name, stage);
+        MPR_DEBUG_PROP(name, stage);
         snprintf(name, sizeof(name), "MPRTarget%uProbeStatus", index);
-        setProperty(name, (unsigned long long)(UInt32)status, 32);
+        MPR_DEBUG_PROP(name, (unsigned long long)(UInt32)status, 32);
         return result;
     }
     bool changed = slot->probeValid &&
@@ -1078,9 +1078,9 @@ MPRController::probeTarget(MPRTargetSlot *slot)
     }
     slot->probeValid = true;
     snprintf(name, sizeof(name), "MPRTarget%uProbe", index);
-    setProperty(name, "ok");
+    MPR_DEBUG_PROP(name, "ok");
     snprintf(name, sizeof(name), "MPRTarget%uProbeStatus", index);
-    setProperty(name, 0ULL, 32);
+    MPR_DEBUG_PROP(name, 0ULL, 32);
     return kMPRProbeOk;
 }
 
@@ -1168,13 +1168,13 @@ MPRController::ensureTargetsPublished(void)
         if (slot != NULL) {
             fCapacityBlocks = slot->capacityBlocks;
             fBlockSize = slot->blockSize;
-            setProperty("MPRMediaBlocks", slot->capacityBlocks, 64);
-            setProperty("MPRMediaBlockSize", (unsigned long long)slot->blockSize, 32);
+            MPR_DEBUG_PROP("MPRMediaBlocks", slot->capacityBlocks, 64);
+            MPR_DEBUG_PROP("MPRMediaBlockSize", (unsigned long long)slot->blockSize, 32);
         }
     }
     fMediaPresent = published != 0;
-    setProperty("MPRMediaPresent", fMediaPresent);
-    setProperty("MPRPublishedTargetCount", published, 32);
+    MPR_DEBUG_PROP("MPRMediaPresent", fMediaPresent);
+    MPR_DEBUG_PROP("MPRPublishedTargetCount", published, 32);
     publishTargetProperties();
     return allOk && published != 0;
 }
@@ -1265,7 +1265,7 @@ MPRController::retireTarget(MPRTargetSlot *slot)
     UInt16 iocStatus = 0xFFFF;
     (void)sendTaskMgmt(MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET, 0, 28, handle,
                        &iocStatus);
-    setProperty("MPRTargetResetStatus", (unsigned long long)iocStatus, 16);
+    MPR_DEBUG_PROP("MPRTargetResetStatus", (unsigned long long)iocStatus, 16);
     if (iocStatus == 0xFFFF) {
         /* No completion at all: the firmware may still own the request frame. */
         setTargetRemovalState(slot, "reset-reply-timeout");

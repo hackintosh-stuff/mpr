@@ -1,6 +1,6 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.20.12.
+Date: 2026-11-13. Driver version: 0.20.13.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes every eligible
@@ -10,8 +10,9 @@ independent disk through `IOBlockStorageDriver` as its own whole-disk
 ## Status
 
 Built, linked, signed ad hoc and loaded from the internal ESP on the test machine
-(macOS 26.7.2); the running version is confirmed with `kmutil showloaded` and
-`MPRBuild`.
+(macOS 26.7.2); the running version is confirmed with `kmutil showloaded`.
+`MPRBuild` and every other IORegistry property are published only when
+`mpr_debug=1` is present in boot-args; kernel log lines follow the same switch.
 
 The driver is qualified in two configurations: the test SATA disk attached
 directly to the SAS3008, and the same disk as the terminal disk behind an
@@ -88,6 +89,8 @@ Wire-format and large-LBA cases are checked on the host, not on this hardware.
   shutdown; unconditional controller rebuild before the first topology read on
   wake, with a watchdog-timed settling window for config/event and PortEnable
   replies, then per-target revalidation.
+- Diagnostic output is silent by default: adding `mpr_debug=1` to boot-args
+  enables both the kernel log lines and all IORegistry properties.
 
 Implementation, memory ownership, locking and diagnostic details are in
 [DEBUG.md](DEBUG.md). Scope, reference baseline, milestone status and remaining
@@ -142,5 +145,6 @@ Before any write, identify the internal disk and EFI partition by their current
 model, capacity, location and UUID. Back up `config.plist` beside itself only if
 that configuration must change, and validate any changed plist. After a
 deliberate deployment and reboot, confirm the loaded version with
-`kmutil showloaded` and `MPRBuild`. The build and local checks above neither
+`kmutil showloaded`; reading `MPRBuild` additionally requires `mpr_debug=1`.
+The build and local checks above neither
 deploy nor reboot; deployment is a separate, explicitly authorised step.

@@ -2,6 +2,7 @@
 #define MPRController_h
 
 #include <IOKit/IOService.h>
+#include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
@@ -18,6 +19,21 @@ class IOTimerEventSource;
 struct IOBlockStorageDeviceExtent;
 struct IOStorageCompletion;
 struct MPRAsyncState;
+
+/* Diagnostic output is silent by default. Adding mpr_debug=1 to boot-args
+ * enables both the kernel log lines and every IORegistry property this driver
+ * publishes, so a normal boot adds no log noise and no property dictionary.
+ * mprInitDebugOutput() is idempotent and runs from the earliest IOKit entry
+ * points, before probe()-time logging and before the first property write. */
+extern bool gMPRDebugEnabled;
+void mprInitDebugOutput(void);
+
+#define MPR_DEBUG_LOG(...) \
+    do { if (gMPRDebugEnabled) IOLog(__VA_ARGS__); } while (0)
+#define MPR_DEBUG_PROP(...) \
+    do { if (gMPRDebugEnabled) setProperty(__VA_ARGS__); } while (0)
+#define MPR_DEBUG_REMOVE(...) \
+    do { if (gMPRDebugEnabled) removeProperty(__VA_ARGS__); } while (0)
 
 /* One completion slot per SMID. processReplyQueue() fills it under
  * fReplyLock; each waiter consumes only its own slot, so a late reply can no

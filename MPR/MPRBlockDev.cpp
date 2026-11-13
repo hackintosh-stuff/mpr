@@ -108,9 +108,9 @@ MPRBlockDev::start(IOService *provider)
     /* IOBlockStorageDriver matches on this property; set it explicitly as
      * well as through IOBlockStorageDevice::init so the nub cannot lose it
      * when a future SDK changes the base implementation. */
-    setProperty(kIOBlockStorageDeviceTypeKey, kIOBlockStorageDeviceTypeGeneric);
-    setProperty("Physical Interconnect", "SAS");
-    setProperty("MPRTransport", "MPRController");
+    MPR_DEBUG_PROP(kIOBlockStorageDeviceTypeKey, kIOBlockStorageDeviceTypeGeneric);
+    MPR_DEBUG_PROP("Physical Interconnect", "SAS");
+    MPR_DEBUG_PROP("MPRTransport", "MPRController");
     return true;
 }
 
@@ -134,7 +134,7 @@ MPRBlockDev::setController(MPRController *controller, UInt16 handle)
     if (previous != NULL) previous->release();
     if (controller != NULL) {
         refreshIdentity();
-        setProperty("MPRBlockDevHandle", (unsigned long long)fDevHandle, 16);
+        MPR_DEBUG_PROP("MPRBlockDevHandle", (unsigned long long)fDevHandle, 16);
     }
 }
 

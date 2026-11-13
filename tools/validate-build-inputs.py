@@ -42,7 +42,10 @@ def main():
             errors.append(label + " does not match Info.plist")
 
     controller = (root / "MPR/MPRController.cpp").read_text(encoding="utf-8")
-    registry_versions = re.findall(r'setProperty\("MPRBuild",\s*"([^"]+)"\)', controller)
+    registry_versions = re.findall(
+        r'(?:setProperty|MPR_DEBUG_PROP)\("MPRBuild",\s*"([^"]+)"\)',
+        controller,
+    )
     if registry_versions != [version]:
         errors.append("IORegistry MPRBuild does not match Info.plist")
 
