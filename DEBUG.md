@@ -5,9 +5,10 @@ Date: 2026-11-13. Driver version: 0.21.0.
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
 remaining work are in [PLAN.md](PLAN.md). Diagnostic output is opt-in; see
-section 7. The current data path is source-only: native build, sanitizer
-tests and hardware qualification remain pending. Earlier hardware observations
-in this document are a regression baseline, not proof for the current source.
+section 7. The current data path is built natively with the Command Line Tools,
+linked, signed ad hoc, loaded from the internal ESP and qualified for read-only
+block I/O on one target. Writes, UNMAP, removal and PM observations in this
+document were made with the preceding build and remain a regression baseline.
 
 ## 1. Concurrency and ordering
 
@@ -90,7 +91,15 @@ Only the final data element has END_OF_LIST. A chain's length describes the
 actual target elements, including its next chain element when present.
 
 The implementation caps chains at four frames per window and caps each
-frame at 1024 bytes while honoring lower IOC limits. An unrepresentable
+frame at 1024 bytes while honoring lower IOC limits. The frame in use on this
+hardware reports eight 16-byte chain elements, so a 64 KiB client chunk whose
+mapping spans more than one inline element is described by two or three chained
+frames. With direct mapping enabled every client chunk in the measured runs was
+described this way while `MPRDirectMapFailures` stayed zero, which is the
+observed proof that the chain encoder and its storage bound are large enough
+for a page-fragmented 64 KiB mapping; a mapping that needed more than the
+window's chain storage would fall back to the private staging buffer and be
+counted as a mapping failure instead. An unrepresentable
 mapping uses the private contiguous resident staging window. At maximum depth,
 the fallback payload pool is 2 MiB and chain storage is at most 128 KiB, plus
 mapping/request metadata and the unchanged synchronous/probe pools. These
@@ -279,6 +288,29 @@ one-time read retry for a whole batch that failed with UNIT ATTENTION after
 DMA ended. The asynchronous scheduler returns decoded command errors; it does
 not restart a partially completed multi-command request.
 
+On this expander path a task-management request is not a local event. Every
+injection whose TMF actually reached the target coincided with a SAS removal
+report (`MPRTopoRemovalHits` advanced by one per injection, twelve times for
+twelve), covering ABORT TASK, LUN RESET and TARGET RESET, so the IOC's fabric
+report, not only the target's command queue, reacts to the reset. The driver
+does what it is built to do with a removal: it invalidates the target, sets
+`fHotplugPending` and re-runs discovery and media validation, and it records
+`MPRRecoveryState=media-revalidation` for the interval. Twelve such events in a
+row re-enumerated the target under a new BSD disk, and in that run raw requests
+above 128 KiB failed with `ENXIO` while smaller ones were served until the next
+boot; single-event runs did not reproduce that cap, so it is recorded without a
+cause. Treat a TMF to an expander-attached SATA disk as a fabric event and
+expect a re-enumeration, not a single failed request, with the medium
+unavailable for tens of seconds.
+
+An IOC-level rebuild does not disturb the fabric: with `mpr_tmf_fail=3` no TMF
+is sent at all, `resetAndReinitialize()` runs (`MPRResetCount` +1,
+`MPRResetInitiator=io-timeout`), `MPRTopoRemovalHits` stays unchanged, and the
+target is re-published as a new BSD disk whose transfers and digests are
+correct. On that path `MPRRecoveryState` is left reading `media-revalidation`
+after the medium is serving again, because only the success branch rewrites it;
+the property is a breadcrumb, not a live state.
+
 ## 5. Cache, FUA and UNMAP
 
 READ/WRITE selects 10- or 16-byte CDBs from the entire requested range.
@@ -333,10 +365,15 @@ wake that needed recovery does not keep reporting `wake-recovery-pending`.
 One planned rebuild per wake is mandatory after S3, so `MPRResetCount` grows by
 one; the control for "no extra reset" is that `MPRStickyFaultCount`,
 `MPRFaultRecoveries` and `MPRProtocolRecoveryPending` stay unchanged.
-`systemWillShutdown` follows the same quiesce path. Sleep/wake and shutdown are
-part of the earlier qualification baseline on the directly attached disk and
-with two targets behind the expander. Changed DMA ownership and PM failure
-paths require new qualification.
+`systemWillShutdown` follows the same quiesce path. Two sleep/wake cycles were
+measured on the current source at a single target: each wake grew
+`MPRResetCount` by exactly one with `MPRWakeRebuildState=ok` and
+`MPRProbeRetries=0`, the medium returned as the same BSD disk, and the
+read-only digests matched after each wake. Kernel power management timed the
+driver's quiesce at about 1.16 s and its return at about 10.2 s. Shutdown and
+the two-target PM path remain part of the earlier qualification baseline;
+changed DMA ownership and PM failure paths still require their own
+qualification.
 
 Stop drains the I/O and completion workers outside the transport lock, proves
 hardware DMA stop, then detaches any held client maps and completes them with
@@ -386,6 +423,13 @@ count remains one. Use deltas and actual client results, not counters alone.
 A property saying "online" is not data-integrity evidence. Always pair it with
 the active IOMedia count, actual byte count and readback content.
 
+`MPRIntCount` and `MPRReplyViaIrq` are written once, when `start()` returns, and
+are not refreshed afterwards; `MPRReplyViaIrq` has no increment site at all in
+this source. Neither of them is evidence about interrupt delivery during I/O.
+The reply path's own progress evidence is `MPRReplyDescriptors` and
+`MPRReplyBatches`; a working reply interrupt is not observable through a
+property here.
+
 `mpr_debug=1` enables the kernel log and every IORegistry property listed
 above. `mpr_timeout_test=1`, `mpr_tmf_fail=N` and `mpr_timeout_every=N`
 exercise recovery; none of these boot arguments is set by default. Serial
@@ -423,7 +467,9 @@ LUNs and general SCSI passthrough; DPM persistent numbering and multipath; IR
 logical volumes and RAID management; SES/enclosure control, SMP passthrough,
 firmware update and user-space tools; NVMe/PCIe/Tri-Mode, SAS2 and GEN35
 hardware. Hardware multi-queue/MSI-X scaling remains unimplemented. Direct
-client DMA and ready-first refill are implemented in source but unqualified.
+client DMA, ready-first refill and batched reply retirement are qualified for
+read-only I/O on one target; the write, removal and PM paths that share their
+ownership rules are not.
 The batching/empty-drain policy also uses the local Linux
 `mpt3sas_base.c::_base_process_reply_queue` as a behavior reference; the Linux
 implementation is not copied into the kext. Its per-vector queues are not
@@ -436,13 +482,22 @@ IEEE chain decoder with 2,000 deterministic SGL cases. The performance helper
 coverage includes requested-depth clamping, insufficient credits/queue entries,
 SMID separation and reset-time lower limits, signed wide-arithmetic resource
 oracles, and all completion permutations for a partially failing four-chunk
-request. These updated C++ tests have not been compiled or run for this source.
-They do not simulate IOKit mapping, IRQ interleaving or real DMA-stop evidence.
+request. The suite is built with ASan/UBSan at `-O1 -Wall -Wextra -Werror` on
+the target system's compiler and passes 158,638 assertions over its 2,000
+deterministic SGL cases. It does not simulate IOKit mapping, IRQ interleaving or
+real DMA-stop evidence.
 
 `tools/validate-build-inputs.py` checks LF text, plist/runtime/CLI/Xcode version
 consistency and inclusion of all four driver translation units in the Xcode
 project. It also checks host-test source line endings. Its successful result is
-not a C++ compilation or a kernel ABI/link validation. Native compilation,
-ASan/UBSan, linking, signing, deployment, hardware correctness and performance
-comparisons are separate pending steps in
-[PERFORMANCE_TEST_PROMPT.md](PERFORMANCE_TEST_PROMPT.md).
+not a C++ compilation or a kernel ABI/link validation.
+
+`tools/build-noxcode.sh` compiles the four translation units with the
+MacKernelSDK headers, links them with `ld -kext`, checks the kmod entry points
+and bundle type, rejects unresolved driver-internal symbols and signs the bundle
+ad hoc. The resulting kext is what the test machine loads from the ESP. Every
+symbol it leaves undefined was checked against the kernel collections on that
+machine; `___chkstk_darwin` is the only one not listed there, and the same
+reference was present in the previously qualified build. The Xcode project entry
+point cannot be exercised on this machine because only the Command Line Tools
+are installed, so that build path is unverified.
