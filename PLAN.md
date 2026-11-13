@@ -111,7 +111,7 @@ mpr/
 
 - 主机侧：`tools/test_protocol.cpp` 用独立基准字节与独立 chain 解码器验证协议层（136,593 条断言、2,000 个确定性 SGL 用例，含故意拒绝用例），启用 ASan/UBSan；`tools/validate-build-inputs.py` 校验 LF 行尾、bundle 与运行版本一致、所有编译单元均纳入 Xcode 工程。
 - 构建/加载：`tools/build-noxcode.sh` 产出 `MPR.kext`，校验 kmod 入口、bundle 类型、驱动内部符号与 plist 后 ad hoc 签名；注入内部 ESP 后以 `kmutil showloaded` 与 `MPRBuild` 三处一致确认。交叉编译的 Mach-O 目标不等于链接、签名、可加载。
-- 实机：单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。双目标时另验证两盘 LBA0 与高 LBA 读一致性、可写盘写后回读、以及 `MPRTargetNWriteCount` 只落在可写目标。睡眠/唤醒必须有旧版与当前版的 `MPRResetCount` 前后对照，并同时核对 `MPRResetInitiator`、`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending`、`MPRWakeRebuildState`、`MPRProbeRetries` 与两盘 online 时间；短睡与长睡都要测，单看「online」或单看一次复位都不能判定唤醒路径是否改善。
+- 实机：单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。双目标时另验证两盘 LBA0 与高 LBA 读一致性、可写盘写后回读、以及 `MPRTargetNWriteCount` 只落在可写目标。睡眠/唤醒必须有旧版与当前版的 `MPRResetCount` 前后对照，并同时核对 `MPRResetInitiator`、`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending`、`MPRWakeRebuildState`、`MPRProbeRetries` 与两盘 online 时间；短睡与长睡都要测，单看「online」或单看一次复位都不能判定唤醒路径是否改善。物理拔盘与在途 I/O 已有双目标实机结论，仅当改动触及移除、句柄重绑或媒体生命周期路径时才需重跑；只改电源或探测链时以既有证据为准，不要求重复现场拔盘。
 - 长跑：以命令数预算代替墙钟时间，关注按操作次数累积的驱动问题（回复帧、SMID、事件 ACK、属性字典、恢复循环退化），不是介质耐久性。串行命令原型曾以约 345 万条命令、90 分钟通过（p99 无漂移、`MPRResetCount` 不增长、属性数量稳定、参考区哈希不变）；当前异步调度版本尚未重跑。
 - 破坏性写仅限现场重新核对身份的测试盘，写窗口事后逐字节还原；`IORegistry` 的"在线"属性不能替代字节数与回读内容。
 
@@ -120,9 +120,9 @@ mpr/
 | # | 风险 | 缓解 |
 |---|---|---|
 | R1 | 系统升级后 vtable/符号/加载行为漂移 | 升级前重取 KC 并重跑离线核查，再做加载与只读回归；不外推旧结论 |
-| R2 | 多目标仅验证到"各自发布 + 只读隔离 + 读一致性"，移除/热插拔/PM 未在双目标下复测 | 逐目标路径已实现并记录未验证项；不以单目标结果推断多目标移除行为 |
+| R2 | 多目标覆盖限于同一背板上的两块终端盘，且为单盘依次拔插、单路在途 I/O | 移除/热插拔/PM 已在双目标下复测（含在途读/写在途拔盘、短睡与长睡唤醒）；不外推到其它 expander、多盘并发拔插或长时间压力 |
 | R3 | 固件带 IR 能力，过滤规则覆盖有限 | 无法确认独立盘身份时不发布；不把单盘结果推广到全部 IR 配置 |
-| R4 | expander 覆盖为同一背板上的两块终端盘（一块 SATA、一块 SSP），拔插与 PM 未复测 | 明确记录未复测项，不外推为通用支持 |
+| R4 | expander 覆盖为同一背板上的两块终端盘（一块 SATA、一块 SSP），插回依赖 PortEnable 重发现与两次有界 IOC 复位 | 该组合下拔插、PM 与在途 I/O 均已实测；记录复位期间另一目标短暂下线，不把单一组合的结果外推为通用 expander 支持 |
 | R5 | 性能原型的窗口拷贝与单一回复消费者 | 先保证正确性；调优时再评估直映与多队列 |
 | R6 | 路线 B 的 SPI KPI 已废弃 | 维持路线 A；改走 B 前单独完成构建与加载验证 |
 | R7 | ESP 有文件但实际未加载或仍运行旧版 | ESP-only 部署；重启后独立核对运行版本；config 变更前备份并校验 |
