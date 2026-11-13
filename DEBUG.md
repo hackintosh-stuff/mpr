@@ -1,6 +1,6 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.20.5.
+Date: 2026-11-13. Driver version: 0.20.6.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
@@ -108,6 +108,14 @@ identity: each slot keeps the SAS address and stable identity it was probed for,
 and compares a fresh probe against them. A change of identity, block count or
 block size advances that slot's generation, so I/O and cache commands accepted
 for the old medium fail instead of reaching the replacement.
+
+A snapshot is matched to the table by SAS address first, then by DevHandle. After
+a controller reset the IOC can hand one device a different handle and can swap
+two devices' handles; matching by handle first would then publish one disk twice
+and orphan the other's medium. A handle that moved for the same SAS address is
+rebound in place (generation advances, because queued I/O still carries the old
+handle), a handle that now names a different address is invalidated, and the same
+address listed twice in one snapshot is adopted once (`MPRTopologyDuplicate`).
 
 Every eligible handle from GET_NEXT_HANDLE is recorded in a bounded target
 table (`MPRTargetSlot`) and published as `MPRTargetCount` plus per-target

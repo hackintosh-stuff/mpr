@@ -240,12 +240,39 @@ MPRController::readSasIOUnitPage0(void)
             continue;
         }
         const UInt64 address = mprReadLe64(page + 0x0C);
-        MPRTargetSlot *slot = findTarget(handle);
+        /* Identity is the SAS address, not the firmware handle. After a
+         * controller reset the IOC can hand the same device a different handle,
+         * and two devices can swap handles; matching by handle first would then
+         * publish one disk twice and orphan the other's medium. */
+        MPRTargetSlot *slot = NULL;
+        for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+            if (fTargets[i].handle != 0 && fTargets[i].sasAddress == address) {
+                slot = &fTargets[i];
+                break;
+            }
+        }
+        if (slot != NULL && slot->scanToken == token) {
+            /* The same device is listed twice in one snapshot, which a reset
+             * can leave behind. Adopt it once instead of creating a second
+             * medium for one disk. */
+            setProperty("MPRTopologyDuplicate", "same-sas-address");
+            continue;
+        }
         if (slot != NULL) {
-            /* The same firmware address can name a different device. The old
-             * binding is dropped here; its commands and medium are invalidated
-             * before the new device is probed. */
-            if (slot->sasAddress != 0 && slot->sasAddress != address) {
+            if (slot->handle != handle) {
+                /* Same disk, new firmware address: rebind in place. Queued I/O
+                 * carries the old handle, so it must fail rather than reach
+                 * whatever else that handle now names. */
+                slot->generation++;
+                slot->handle = handle;
+                setProperty("MPRTargetReuseState", "handle-moved-same-device");
+            }
+        } else {
+            slot = findTarget(handle);
+            if (slot != NULL) {
+                /* The handle now names a different device. The old binding is
+                 * dropped here; its commands and medium are invalidated before
+                 * the new device is probed. */
                 if (slot->nub != NULL) slot->offlinePending = true;
                 slot->online = false;
                 slot->onlinePending = false;
@@ -255,46 +282,44 @@ MPRController::readSasIOUnitPage0(void)
                 slot->removalRequested = false;
                 slot->readOnly = true;
                 setProperty("MPRTargetReuseState", "handle-reassigned");
-            }
-        } else {
-            /* A disk that returns after REMOVE_DEVICE gets a new firmware
-             * handle. Reuse the retired slot of the same SAS address when one
-             * exists, so its nub and IOMedia come back instead of leaking a
-             * slot and creating a second medium for the same disk. */
-            MPRTargetSlot *retired = NULL;
-            for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
-                MPRTargetSlot *candidate = &fTargets[i];
-                /* The same SAS address means the same physical disk: reuse its
-                 * nub even if an OFFLINE notification is still owed, which the
-                 * worker delivers before ONLINE. */
-                if (candidate->handle == 0 && candidate->nub != NULL &&
-                    candidate->sasAddress == address) {
-                    retired = candidate;
-                    break;
-                }
-            }
-            if (retired != NULL) {
-                slot = retired;
-                slot->handle = handle;
-                slot->probeValid = false;
-                slot->identityValid = false;
-                slot->generation++;
-                slot->removalRequested = false;
-                slot->onlinePending = false;
-                setTargetRemovalState(slot, "reinserted");
             } else {
-                slot = allocTargetSlot();
-                if (slot == NULL) {
-                    setProperty("MPRTopologyFailure", "too-many-targets");
-                    return false;
+                /* A disk that returns after REMOVE_DEVICE gets a new firmware
+                 * handle; reuse the retired slot of the same SAS address when
+                 * one exists, so its nub and IOMedia come back instead of
+                 * leaking a slot and creating a second medium. */
+                MPRTargetSlot *retired = NULL;
+                for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
+                    MPRTargetSlot *candidate = &fTargets[i];
+                    if (candidate->handle == 0 && candidate->nub != NULL &&
+                        candidate->sasAddress == address) {
+                        retired = candidate;
+                        break;
+                    }
                 }
-                /* A recycled slot can still own the nub of its previous device;
-                 * that nub is re-pointed when this target is published. */
-                MPRBlockDev *reusedNub = slot->nub;
-                memset(slot, 0, sizeof(*slot));
-                slot->nub = reusedNub;
-                slot->handle = handle;
-                slot->readOnly = true;
+                if (retired != NULL) {
+                    slot = retired;
+                    slot->handle = handle;
+                    slot->probeValid = false;
+                    slot->identityValid = false;
+                    slot->generation++;
+                    slot->removalRequested = false;
+                    slot->onlinePending = false;
+                    setTargetRemovalState(slot, "reinserted");
+                } else {
+                    slot = allocTargetSlot();
+                    if (slot == NULL) {
+                        setProperty("MPRTopologyFailure", "too-many-targets");
+                        return false;
+                    }
+                    /* A recycled slot can still own the nub of its previous
+                     * device; that nub is re-pointed when this target is
+                     * published. */
+                    MPRBlockDev *reusedNub = slot->nub;
+                    memset(slot, 0, sizeof(*slot));
+                    slot->nub = reusedNub;
+                    slot->handle = handle;
+                    slot->readOnly = true;
+                }
             }
         }
         slot->handle = handle;
