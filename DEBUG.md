@@ -1,15 +1,18 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.21.0.
+Date: 2026-11-13. Driver version: 0.22.0.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
 remaining work are in [PLAN.md](PLAN.md). Diagnostic output is opt-in; see
 section 7. The current data path is built natively with the Command Line Tools,
-linked, signed ad hoc and loaded from the internal ESP. On one target it is
-qualified for read-only block I/O, a small write/flush cycle and two sleep/wake
-cycles. The UNMAP, removal, reinsertion and shutdown observations in this
-document were made with the preceding build and remain a regression baseline.
+linked and signed ad hoc. On one target it is qualified for read-only block I/O, a
+small write/flush cycle and two sleep/wake cycles. That evidence belongs to
+0.21.0, which is still the build loaded from the internal ESP; 0.22.0 changes only
+the PCI ID match table, adds `MPRChipName` and renames the block-device info
+string, and has been built and link-checked but not run. The UNMAP, removal,
+reinsertion and shutdown observations in this document were made with an earlier
+build and remain a regression baseline.
 
 ## 1. Concurrency and ordering
 
@@ -393,7 +396,7 @@ that is absent on a normal boot is expected, not a failed load.
 
 | Area | Useful IORegistry properties |
 |---|---|
-| Build and media | `MPRBuild`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady`, `MPRMediaReadyStatus`, `MPRPublishedTargetCount` |
+| Build and media | `MPRBuild`, `MPRChipName`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady`, `MPRMediaReadyStatus`, `MPRPublishedTargetCount` |
 | Targets | `MPRTargetCount`, `MPRTargetNHandle`, `MPRTargetNSasAddress`, `MPRTargetNPresent`, `MPRTargetNProbed`, `MPRTargetNProbeState`, `MPRTargetNProbeStatus`, `MPRTargetNProbeRetries`, `MPRTargetNOnline`, `MPRTargetNRemovalState`, `MPRTargetNMediaStatus`, `MPRTargetNGeneration` |
 | Discovery and removal | `MPRScanCount`, `MPRRemovedMediaCount`, `MPRRemovalFailures`, `MPRRemovalStage`, `MPRRetiredSlotsReleased`, `MPRRediscoveryResets`, `MPRRediscoveryState`, `MPRTopoRemovalHits`, `MPRTopologyGeneration` |
 | Async limits | `MPRAsyncRequestLimit`, `MPRAsyncRequestedDepth`, `MPRAsyncAllocatedDepth`, `MPRAsyncCommandLimit`, `MPRAsyncFirstSmid`, `MPRAsyncPeakRequests`, `MPRAsyncOutstanding`, `MPRAsyncPeakCommands` |
@@ -458,6 +461,14 @@ names are not macOS requirements.
 | Recovery | abort/LUN/target/IOC reset and watchdog | TMF escalation for the failed command's handle, ownership proof, no replay of uncertain writes, IOC state monitoring |
 | Sleep and shutdown | FreeBSD suspend/resume return EINVAL; separate shutdown path | Native IOKit PM with per-target flush and wake revalidation |
 | Builds | OS-specific build system | All driver translation units in the CLI and Xcode builds |
+
+Beyond the mechanisms above, the FreeBSD identifier table also matches the
+SAS3108 RAID controllers, the MPI 2.6 tri-mode family and the GEN35/SEA parts.
+This driver matches only the MPI 2.5 HBA pair, `0x0097` (SAS3008, the verified
+part) and `0x0096` (SAS3004): it implements neither RAID volume publication nor
+NVMe encapsulated requests, so the wider identifiers would bind controllers it
+cannot serve (PLAN section 1.3). `MPRChipName` reports which entry bound, and the
+probe log line records whether that entry has hardware evidence.
 
 Sleep and wake, physical pull and pulls with I/O in flight have earlier
 qualification evidence with two targets behind this expander; the current source

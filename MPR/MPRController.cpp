@@ -18,7 +18,32 @@
 #define super IOService
 OSDefineMetaClassAndStructors(MPRController, IOService)
 
-#define MPR_VENDOR_DEVICE 0x00971000U
+/* PCI IDs this driver implements. Every entry is an MPI 2.5 Fusion-MPT SAS3 IOC
+ * with the same register, queue and configuration-page model the code below
+ * drives, so the match table is the only per-chip difference. verified marks the
+ * parts this driver has actually run on. Absent on purpose: the IR-capable
+ * SAS3108 variants, whose logical volumes FreeBSD's mpr enumerates as disks while
+ * this driver refuses volumes and their members; the MPI 2.6/tri-mode family,
+ * which needs NVMe encapsulated requests; and SAS2, a different IOC generation. */
+struct MPRPciId {
+    UInt32      vendorDevice;   /* config space 0x00: device << 16 | vendor */
+    const char *name;
+    bool        verified;
+};
+
+static const MPRPciId kMPRPciIds[] = {
+    { 0x00971000U, "SAS3008", true  },
+    { 0x00961000U, "SAS3004", false },
+};
+
+static const MPRPciId *
+mprLookupPciId(UInt32 vendorDevice)
+{
+    for (unsigned i = 0; i < sizeof(kMPRPciIds) / sizeof(kMPRPciIds[0]); i++) {
+        if (kMPRPciIds[i].vendorDevice == vendorDevice) return &kMPRPciIds[i];
+    }
+    return NULL;
+}
 
 /* No diagnostic output until boot-args have been parsed. */
 bool gMPRDebugEnabled = false;
@@ -588,8 +613,9 @@ IOService *
 MPRController::probe(IOService *provider, SInt32 *score)
 {
     mprInitDebugOutput();
-    IOPCIDevice *pci;
-    UInt32       vendorDevice;
+    IOPCIDevice         *pci;
+    const MPRPciId      *id;
+    UInt32               vendorDevice;
 
     if (super::probe(provider, score) == NULL) {
         return NULL;
@@ -601,14 +627,18 @@ MPRController::probe(IOService *provider, SInt32 *score)
     }
 
     vendorDevice = pci->configRead32(0);
-    if (vendorDevice != MPR_VENDOR_DEVICE) {
+    id = mprLookupPciId(vendorDevice);
+    if (id == NULL) {
         MPR_DEBUG_LOG("MPR: probe rejected vendor/device 0x%08x\n",
               (unsigned int)vendorDevice);
         return NULL;
     }
 
-    MPR_DEBUG_LOG("MPR: probe matched SAS3008 (0x%08x)\n",
-          (unsigned int)vendorDevice);
+    /* Which chip bound is worth knowing on the unverified entries, since the
+     * rest of the diagnostics look identical on every supported part. */
+    MPR_DEBUG_PROP("MPRChipName", id->name);
+    MPR_DEBUG_LOG("MPR: probe matched %s (0x%08x), verified=%u\n", id->name,
+          (unsigned int)vendorDevice, id->verified ? 1U : 0U);
     return this;
 }
 
@@ -3209,7 +3239,7 @@ MPRController::start(IOService *provider)
     MPR_DEBUG_PROP("MPRMMIOLength", (unsigned long long)length, 64);
     MPR_DEBUG_PROP("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     MPR_DEBUG_PROP("MPRStage", "read-write");
-    MPR_DEBUG_PROP("MPRBuild", "0.21.0");
+    MPR_DEBUG_PROP("MPRBuild", "0.22.0");
     MPR_DEBUG_PROP("MPRFeatures",
                 "async-direct-dma,credit-depth,ready-refill,reply-batch-wakeup,"
                 "ieee-sgl-chain,read-write16,cache16,unmap-limits,"

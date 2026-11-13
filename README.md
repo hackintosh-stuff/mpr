@@ -1,18 +1,34 @@
-# MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
+# MPR — Fusion-MPT SAS3 (SAS3004/SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.21.0.
+Date: 2026-11-13. Driver version: 0.22.0.
 
-MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
-(`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes every eligible
-independent disk through `IOBlockStorageDriver` as its own whole-disk
-`IOMedia`.
+MPR is an IOKit block-storage driver for the LSI/Broadcom MPI 2.5 Fusion-MPT SAS3
+family on x86_64 macOS. It publishes every eligible independent disk through
+`IOBlockStorageDriver` as its own whole-disk `IOMedia`.
+
+## Supported hardware
+
+| Chip | PCI ID | Status |
+|---|---|---|
+| SAS3008 | `0x1000:0x0097` | verified on hardware |
+| SAS3004 | `0x1000:0x0096` | matches; same IOC generation with four phys, not run on hardware |
+
+Matching is by the exact vendor/device pair, so any vendor's board built on these
+chips binds. Everything else stays out: the IR-capable SAS3108 variants are not
+matched because this driver refuses RAID volumes and their members instead of
+publishing them, and the MPI 2.6/tri-mode family and SAS2 are different IOC
+generations (see [PLAN.md](PLAN.md) section 1.3). `MPRChipName` reports which
+entry bound.
 
 ## Status
 
 The current source implements client-buffer DMA, a credit-bounded command pool,
 ready-first completion/refill and batched reply retirement with event wakeups.
-It is built, linked, signed ad hoc and loaded from the internal ESP on the test
-machine (macOS 26.7.2, SAS3008, one SATA target).
+It is built, linked and signed ad hoc for the test machine (macOS 26.7.2,
+SAS3008, one SATA target). The build that machine loads from its internal ESP is
+0.21.0, and every runtime result below was measured with it; 0.22.0 only extends
+the PCI ID table, adds `MPRChipName` and renames the block-device info string, and
+has been built and link-checked but not deployed.
 
 Qualified for this source: read-only block I/O including requests larger than
 one command window, chunks at non-zero offsets, several concurrent client

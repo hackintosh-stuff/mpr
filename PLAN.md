@@ -1,20 +1,22 @@
-# PLAN — Fusion-MPT SAS3 (SAS3008) driver for macOS
+# PLAN — Fusion-MPT SAS3 (SAS3004/SAS3008) driver for macOS
 
-Status: source 0.21.0 (2026-11-13).
+Status: source 0.22.0 (2026-11-13). 0.22.0 only widens the PCI ID match table to
+the SAS3004, adds `MPRChipName` and renames the block-device info string; it is
+built and link-checked, not deployed. Every runtime result here belongs to 0.21.0,
+which the test machine still loads.
 
-Current state: client-buffer DMA, a credit-bounded command pool, harvest-and-refill
-on completion, and batched single-ring reply retirement with event wakeups are
-implemented, compiled natively with the Command Line Tools, linked, signed ad hoc
-and loaded from the internal ESP. On one target this source is qualified for
-read-only correctness, boundary and error paths, command storms (63.7 M commands
-in one 30-minute run), mixed read/write stress, a small write and flush cycle,
-two sleep/wake cycles, and four recovery variants (ABORT, LUN RESET, TARGET RESET
-and whole-IOC reset). The variants exposed one behaviour that is recorded but
-deliberately left unchanged: a task-management request that actually reaches the
-target costs a SAS removal event and tens of seconds of unavailability, while a
-whole-IOC rebuild does not. UNMAP, physical replug, dual targets and shutdown have
-not been re-run on this source; the earlier dual-target read/write, removal,
-recovery and PM results are regression baseline only.
+State: client-buffer DMA, a credit-bounded command pool, harvest-and-refill on
+completion, and batched single-ring reply retirement with event wakeups are
+implemented and build natively with the Command Line Tools. On one target that
+build is qualified for read-only correctness, boundary and error paths, command
+storms (63.7 M commands in one 30-minute run), mixed read/write stress, a small
+write and flush cycle, two sleep/wake cycles, and four recovery variants (ABORT,
+LUN RESET, TARGET RESET and whole-IOC reset). The variants exposed one behaviour
+that is recorded but deliberately left unchanged: a task-management request that
+actually reaches the target costs a SAS removal event and tens of seconds of
+unavailability, while a whole-IOC rebuild does not. UNMAP, physical replug, dual
+targets and shutdown have not been re-run on it; the earlier dual-target
+read/write, removal, recovery and PM results are regression baseline only.
 
 Build, host checks and installation are in [README.md](README.md). Implementation,
 capacity and memory accounting, locking, ABI formats, IORegistry properties and
@@ -24,8 +26,11 @@ diagnostics are in [DEBUG.md](DEBUG.md).
 
 ### 1.1 Target hardware and platform
 
-- HBA: Broadcom/Avago SAS3008, PCI `0x1000:0x0097`, MPI 2.5, 12 Gb/s SAS3,
-  firmware `09.00.00.00`; `IOCCapabilities` reports `INTEGRATED_RAID`.
+- HBA: Broadcom/Avago Fusion-MPT SAS3, MPI 2.5, 12 Gb/s. Matched PCI IDs:
+  `0x1000:0x0097` (SAS3008, the only part run on hardware) and `0x1000:0x0096`
+  (SAS3004, the same IOC generation with four phys). The test machine carries a
+  SAS3008 with firmware `09.00.00.00` and `IOCCapabilities` reporting
+  `INTEGRATED_RAID`.
 - Current configuration: one SATA SSD, PCCOOLER SSD T200 240 GB
   (468,862,128 × 512 B), as the terminal disk behind an Adaptec AEC-82885T
   expander and one backplane. The exFAT volume `testdisk` on it carries the
@@ -62,6 +67,10 @@ capacity, current device node), never a remembered `diskN`.
 
 - IR/RAID logical volumes and their member management, SES enclosure services,
   SMP passthrough, firmware update, booting from this driver's disks.
+- The IR-capable SAS3108 PCI IDs (`0x0090`/`0x0091`/`0x0094`/`0x0095`). FreeBSD's
+  `mpr` enumerates their RAID volumes as disks; this driver refuses volumes and
+  their members, so matching them would only bind a controller whose disks cannot
+  be published.
 - Multiple LUNs, multipath, and hardware verification of writes to SAS/SSP disks.
 - NVMe/PCIe/Tri-Mode, SAS2 (`mps`/`0x0072`), the GEN35/SEA branches.
 - Apple Silicon, dext/DriverKit, multi-queue/MSI-X expansion, a FreeBSD user
@@ -123,10 +132,10 @@ suspend/resume returns `EINVAL`, so the power path has to be written here.
 
 ## 4. Capabilities and boundaries
 
-The status column says which build the evidence belongs to. *Current* means this
-source, measured on one target. *Baseline* means the preceding build; it is
-regression coverage only. *Implemented* means the code exists without hardware
-evidence.
+The status column says which build the evidence belongs to. *Current* means the
+data path as shipped, measured on one target with 0.21.0 (0.22.0 changes matching
+only). *Baseline* means an earlier build; it is regression coverage only.
+*Implemented* means the code exists without hardware evidence.
 
 | Capability | Status | Boundary |
 |---|---|---|

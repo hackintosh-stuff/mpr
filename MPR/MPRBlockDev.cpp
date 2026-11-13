@@ -6,7 +6,7 @@
 #define super IOBlockStorageDevice
 OSDefineMetaClassAndStructors(MPRBlockDev, IOBlockStorageDevice)
 
-static char kMPRDeviceInfo[] = "MPR SAS3008 STP/SATA";
+static char kMPRDeviceInfo[] = "MPR SAS3 STP/SATA";
 
 bool
 MPRBlockDev::init(OSDictionary *properties)
