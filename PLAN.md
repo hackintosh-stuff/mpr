@@ -1,154 +1,319 @@
-# PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
+# PLAN — Fusion-MPT SAS3 (SAS3008) driver for macOS
 
-状态：源码 0.21.0（2026-11-13）。客户端 DMA、信用约束命令池、完成即回收/补发、单环批量回复与事件唤醒已原生编译、链接、ad hoc 签名、从内部 ESP 加载，并在单目标上完成只读正确性、边界/错误路径、命令压测（单次 6372 万条）、混合读写压测、最小写入/刷新、两次睡眠唤醒，以及 ABORT/LUN/TARGET/整 IOC 复位四种恢复变体的实机验收。恢复变体暴露出一条已记录但按用户决定暂不修改的行为：真正送达目标的任务管理请求会引发 SAS 移除事件与数十秒可用性中断，而整 IOC 重建不会。UNMAP、物理拔插、双目标与关机仍未测。此前的单/双目标读写、移除、恢复和睡眠/唤醒证据仅作为旧数据路径的回归基线，不是当前版本的通过证明。编译与实机验收入口见 [PERFORMANCE_TEST_PROMPT.md](PERFORMANCE_TEST_PROMPT.md)，源码行为见 [DEBUG.md](DEBUG.md)。
+Status: source 0.21.0 (2026-11-13).
 
-## 1. 目标与范围
+Current state: client-buffer DMA, a credit-bounded command pool, harvest-and-refill
+on completion, and batched single-ring reply retirement with event wakeups are
+implemented, compiled natively with the Command Line Tools, linked, signed ad hoc
+and loaded from the internal ESP. On one target this source is qualified for
+read-only correctness, boundary and error paths, command storms (63.7 M commands
+in one 30-minute run), mixed read/write stress, a small write and flush cycle,
+two sleep/wake cycles, and four recovery variants (ABORT, LUN RESET, TARGET RESET
+and whole-IOC reset). The variants exposed one behaviour that is recorded but
+deliberately left unchanged: a task-management request that actually reaches the
+target costs a SAS removal event and tens of seconds of unavailability, while a
+whole-IOC rebuild does not. UNMAP, physical replug, dual targets and shutdown have
+not been re-run on this source; the earlier dual-target read/write, removal,
+recovery and PM results are regression baseline only.
 
-### 1.1 目标硬件与平台
+Build, host checks and installation are in [README.md](README.md). Implementation,
+capacity and memory accounting, locking, ABI formats, IORegistry properties and
+diagnostics are in [DEBUG.md](DEBUG.md).
 
-- HBA：Broadcom/Avago SAS3008，PCI `0x1000:0x0097`，MPI 2.5，12 Gb/s SAS3；固件 `09.00.00.00`，`IOCCapabilities` 含 `INTEGRATED_RAID`。
-- 测试盘：PCCOOLER SSD T200 240 GB（468,862,128 × 512 B），exFAT 卷 `testdisk`；扩容器验证用 Adaptec AEC-82885T 加单背板。双目标、在途 I/O 与 PM 的实机结论来自此前同一背板上的第二块 SSP 盘（TOSHIBA MG04SCA60EE 6 TB），该盘现已移除，不再参与测试；当前配置为单块 SATA 盘。
-- 平台：macOS Tahoe 26.7.2（`25G332`、`Darwin 25.6.0`），x86_64，MSI X570 测试机；IOKit kext，基于 MacKernelSDK 构建。
-- 硬件事实：BAR0 是 I/O，MMIO 在 BAR1/BAR2（配置偏移 `0x14`）；地址随启动重新分配，不硬编码。
+## 1. Goal and scope
 
-实机操作的设备身份一律现场核对（型号、序列号、容量、当前设备号），不沿用历史 `diskN`。
+### 1.1 Target hardware and platform
 
-### 1.2 范围
+- HBA: Broadcom/Avago SAS3008, PCI `0x1000:0x0097`, MPI 2.5, 12 Gb/s SAS3,
+  firmware `09.00.00.00`; `IOCCapabilities` reports `INTEGRATED_RAID`.
+- Current configuration: one SATA SSD, PCCOOLER SSD T200 240 GB
+  (468,862,128 × 512 B), as the terminal disk behind an Adaptec AEC-82885T
+  expander and one backplane. The exFAT volume `testdisk` on it carries the
+  bounded write tests.
+- Baseline-only configurations: the preceding build was also qualified with the
+  same disk attached directly to the HBA, and with a second SSP disk
+  (TOSHIBA MG04SCA60EE 6 TB) behind the same backplane. That disk has been
+  removed; nothing in the current configuration exercises two targets or direct
+  attach.
+- Platform: macOS Tahoe 26.7.2 (`25G332`, `Darwin 25.6.0`), x86_64, MSI X570 test
+  machine; IOKit kext built against MacKernelSDK.
+- Hardware facts: BAR0 is I/O space and MMIO lives in BAR1/BAR2 (config offset
+  `0x14`); addresses are re-assigned at boot and are never hard-coded.
 
-1. 自研 `IOService`（provider = `IOPCIDevice`）实现 HBA：PCI 使能、BAR 映射、IOC 复位与初始化、队列、中断、事件订阅与 ACK。
-2. 把每个合格独立盘（STP/SATA 或 SSP）经系统 `IOBlockStorageDriver` 发布为原生整盘 `IOMedia`，并维护每个目标的身份、几何与媒体生命周期；所有已发布目标均可写，写入计数按目标统计。
-3. 块 I/O：READ/WRITE(10)/(16)、SYNCHRONIZE CACHE、FUA、auto sense、超时与 TMF 恢复、热插拔；UNMAP 仅在探测到支持且通过限制校验后启用。
-4. 电源与停机：睡眠/唤醒、`systemWillShutdown` 的静默路径。
-5. 诊断：IORegistry 属性与可选故障注入 boot-args。
+Device identity for any hardware step is verified on the spot (model, serial,
+capacity, current device node), never a remembered `diskN`.
 
-### 1.3 不做
+### 1.2 Scope
 
-- IR/RAID 逻辑卷及其成员管理、SES 机箱管理、SMP passthrough、固件升级、启动盘引导。
-- 多 LUN、多路径、SAS/SSP 盘写入的实机验证。
-- NVMe/PCIe/Tri-Mode、SAS2（`mps`/`0x0072`）、GEN35/SEA 分支。
-- Apple Silicon、dext/DriverKit、多硬件回复队列/MSI-X 扩展、FreeBSD user ioctl 兼容层。
-- 继承 `IOSCSIParallelInterfaceController`（§3 路线 B），仅保留为后续评估。
+1. A purpose-built `IOService` (provider = `IOPCIDevice`) that implements the HBA:
+   PCI enable, BAR mapping, IOC reset and initialization, queues, interrupts,
+   event subscription and acknowledgement.
+2. Every eligible independent disk (STP/SATA or SSP) published through the system
+   `IOBlockStorageDriver` as its own whole-disk `IOMedia`, with per-target
+   identity, geometry and medium lifetime; every published target is writable and
+   writes are counted per target.
+3. Block I/O: READ/WRITE(10)/(16), SYNCHRONIZE CACHE, FUA, auto sense, timeout and
+   TMF recovery, hotplug; UNMAP only when the device advertises it and the
+   reported limits pass validation.
+4. Power and shutdown: sleep/wake and the quiet path of `systemWillShutdown`.
+5. Diagnostics: IORegistry properties plus opt-in fault-injection boot arguments.
 
-## 2. 基线（可复现）
+### 1.3 Out of scope
 
-| 项目 | 内容 |
+- IR/RAID logical volumes and their member management, SES enclosure services,
+  SMP passthrough, firmware update, booting from this driver's disks.
+- Multiple LUNs, multipath, and hardware verification of writes to SAS/SSP disks.
+- NVMe/PCIe/Tri-Mode, SAS2 (`mps`/`0x0072`), the GEN35/SEA branches.
+- Apple Silicon, dext/DriverKit, multi-queue/MSI-X expansion, a FreeBSD user
+  ioctl compatibility layer.
+- Subclassing `IOSCSIParallelInterfaceController` (route B in §3); kept only as a
+  later evaluation.
+
+## 2. Reproducible baseline
+
+| Item | Content |
 |---|---|
-| FreeBSD 参考 | `freebsd/freebsd-src` `main`，commit `e56090afb68b6c036d6b54c7b66d762d98bd96d0`（2026-11-10），`sys/dev/mpr/` 与 `mpi/` 各 13 个文件；BSD-2-Clause |
-| Linux 参考 | `torvalds/linux` `master`，commit `b3dfbde62cf1981c4638939c159dfd087b7a72e9`（2026-11-10），`drivers/scsi/mpt3sas/` 16 个文件 + `mpi/` 10 个；GPL-2.0，仅作行为参考 |
-| MacKernelSDK | git 子模块 `3f750085caa17ec3a7880f11c11bf4f48cd6a164`（2026-09-23），基于 macOS 11 / Xcode 12.0 SDK 并补充 `xnu-8019.80.24` 头文件 |
-| Apple OSS | `apple-oss-distributions/IOSCSIParallelFamily` commit `560f74ab0c6f5d9aa6c99675d8e95986b202144d`，APSL 2.0，只读参考、不参与构建 |
-| 反编译资料 | `ida/BootKernelExtensions.kc`（67,600,384 B，MD5 `b9da5eafcd90e439ae7c55c1ca8ddf33`）与对应 IDA 数据库、离线核查脚本；仅用于核对 ABI、vtable 与依赖 |
-| 版本控制 | `MacKernelSDK` 是子模块；`reference/`、`ida/` 不入库、不参与构建；参考源码按上表固定 commit 复现 |
+| FreeBSD reference | `freebsd/freebsd-src` `main` at `e56090afb68b6c036d6b54c7b66d762d98bd96d0` (2026-11-10): `sys/dev/mpr/` and `mpi/`, 13 files each; BSD-2-Clause |
+| Linux reference | `torvalds/linux` `master` at `b3dfbde62cf1981c4638939c159dfd087b7a72e9` (2026-11-10): `drivers/scsi/mpt3sas/` 16 files plus `mpi/` 10 files; GPL-2.0, behaviour reference only |
+| MacKernelSDK | submodule at `3f750085caa17ec3a7880f11c11bf4f48cd6a164` (2026-09-23): macOS 11 / Xcode 12.0 SDK headers with `xnu-8019.80.24` additions |
+| Apple OSS | `apple-oss-distributions/IOSCSIParallelFamily` at `560f74ab0c6f5d9aa6c99675d8e95986b202144d`, APSL 2.0; read-only reference, not part of the build |
+| Decompilation material | workspace-level `ida/BootKernelExtensions.kc` (67,600,384 B, MD5 `b9da5eafcd90e439ae7c55c1ca8ddf33`) with its IDA database and offline check scripts; used only to confirm ABI, vtables and dependencies |
+| Version control | `MacKernelSDK` is a submodule; `reference/` and `ida/` are not committed and do not take part in the build; reference sources are reproduced at the commits pinned above |
 
-目录布局：
+Directory layout:
 
 ```
 mpr/
   README.md  DEBUG.md  PLAN.md  AGENTS.md  NOTICE
-  MPR/                               (Controller、BlockDev、Async、Target、MPI/mpi2_min.h、MPI/mpi2_target.h、Info.plist)
-  MPR.xcodeproj/                     (工程入口)
-  tools/build-noxcode.sh             (Command Line Tools 构建入口)
-  tools/test_protocol.cpp            (协议层主机侧测试)
-  tools/validate-build-inputs.py     (行尾/版本/工程成员校验)
-  MacKernelSDK/                      (submodule, 入库)
-  reference/                         (gitignored, 只读参考)
+  MPR/                               (MPRController, MPRBlockDev, MPRAsync, MPRTarget,
+                                      MPRCompletion.h, MPRDmaSgl.h, MPRPerformance.h,
+                                      MPRScsi.h, MPI/mpi2_min.h, MPI/mpi2_target.h,
+                                      Info.plist)
+  MPR.xcodeproj/                     (project entry point)
+  tools/build-noxcode.sh             (Command Line Tools build entry point)
+  tools/test_protocol.cpp            (host-side protocol tests)
+  tools/validate-build-inputs.py     (line endings, versions, project membership)
+  MacKernelSDK/                      (submodule, committed)
+  reference/                         (gitignored, read-only)
     freebsd/sys/dev/mpr/  + mpi/
     linux/drivers/scsi/mpt3sas/  + mpi/
     IOSCSIParallelFamily/            (Apple OSS, APSL 2.0)
 ```
 
-复现：对固定 commit 分别用 GitHub Contents API 递归列目录，从 `raw.githubusercontent.com` 取文件；Apple OSS 用 `codeload` tarball 取整树。本机访问 GitHub 需走 `http://127.0.0.1:10808` 代理，HTTPS 下载按工作区约束在 MCP 控制台执行。不要用移动分支的 `HEAD` 作基线。
+Reproduce the references by listing each pinned commit through the GitHub Contents
+API and fetching files from `raw.githubusercontent.com`; take the Apple OSS tree
+as a `codeload` tarball. In this workspace GitHub is reached through
+`http://127.0.0.1:10808`, and HTTPS downloads run in the MCP console per the
+workspace rules. A moving branch head is never a baseline.
 
-## 3. 架构决策
+## 3. Architecture decisions
 
-| 路线 | 做法 | 判定 |
+| Route | Approach | Verdict |
 |---|---|---|
-| **A（采纳）** | 自研 `IOService` 实现 HBA；每块盘实例化 `IOBlockStorageDevice` 子类 nub，由系统 `IOBlockStorageDriver` 生成 `IOMedia`/`IOMediaBSDClient` | 目标系统 vtable 槽位与 SDK 头离线核对一致，且已实机加载并发布 `IOMedia`；块设备状态、错误传播与恢复由本驱动负责 |
-| B | 继承 `IOSCSIParallelInterfaceController`，复用 macOS SCSI 应用层栈 | 静态依据齐备（SDK 头、117 个导出符号、官方 HBA 样例），但 KPI 已标注废弃，且需自研 `SCSIParallelTask` ↔ MPI 适配；最小子类链接/加载未验证 |
-| C | `IOService` + `IOUserClient` 透传 CDB | 只能调试，无法生成 `/dev/disk`，不作主路线 |
+| **A (adopted)** | Purpose-built `IOService` implements the HBA; each disk instantiates an `IOBlockStorageDevice` subclass nub, and the system `IOBlockStorageDriver` produces `IOMedia`/`IOMediaBSDClient` | vtable slots and SDK headers were checked offline against the target system and the driver loads and publishes `IOMedia` on hardware; block-device state, error propagation and recovery stay in this driver |
+| B | Subclass `IOSCSIParallelInterfaceController` and reuse the macOS SCSI stack | static evidence is complete (SDK headers, 117 exported symbols, the vendor HBA sample), but the KPI is marked deprecated and the `SCSIParallelTask` ↔ MPI adaptation would still be new code; a minimal subclass has not been linked or loaded |
+| C | `IOService` plus `IOUserClient` handing CDBs through | debugging only, cannot create a `/dev/disk`; not a main route |
 
-补充事实：目标系统的存储 family（`IOStorageFamily`、`IOSCSIArchitectureModelFamily`、`IOSCSIParallelFamily`）都在 BootKC 内，"系统没有 SCSI 栈"不成立；`OSBundleLibraries` 按实际使用的 API 与提供者兼容区间选择，现有 `IOStorageFamily = 1.0` 与运行时 2.1 不矛盾。FreeBSD 的 suspend/resume 直接返回 `EINVAL`，电源路径必须自研。
+Supporting facts: the target system's storage families (`IOStorageFamily`,
+`IOSCSIArchitectureModelFamily`, `IOSCSIParallelFamily`) all live inside BootKC, so
+"the system has no SCSI stack" is false; `OSBundleLibraries` is chosen from the
+APIs actually used and the provider's compatible range, so the existing
+`IOStorageFamily = 1.0` against a 2.1 runtime is not a contradiction. FreeBSD's
+suspend/resume returns `EINVAL`, so the power path has to be written here.
 
-## 4. 能力与边界
+## 4. Capabilities and boundaries
 
-下表既有“已验证”项仅表示旧数据路径已有实机证据。当前 DMA、异步调度、超时恢复和 PM 改动涉及这些路径，必须重新验收，不能继承通过状态。
+The status column says which build the evidence belongs to. *Current* means this
+source, measured on one target. *Baseline* means the preceding build; it is
+regression coverage only. *Implemented* means the code exists without hardware
+evidence.
 
-| 能力 | 状态 | 边界 |
+| Capability | Status | Boundary |
 |---|---|---|
-| IOC 初始化、Facts 约束队列、中断回复、事件订阅/ACK | 已验证（单目标，只读） | 单硬件回复环；32 描述符锁粒度批处理、非空才发布索引、中断唤醒及有界轮询 |
-| 异步请求调度 | 已验证（单目标，只读；实测生效深度 1/4/16/32 与请求值一致） | 64 请求记录，最多 32 命令窗口；按 IOC 信用及池容量降级，SMID 32–63；先回收就绪命令再补发，按原提交时刻计超时 |
-| 客户端 DMA、SGL/chain 与暂存回退 | 已验证（单目标，只读；直映与强制暂存两条路径均逐字节一致） | 正常路径映射客户端子范围，失败或关闭直映时才拷贝；未证明 DMA 停止则保留直接映射及客户端完成责任，不回调/不复用；已证明 DMA 停止的路径未在实盘制造 |
-| 块 I/O 与缓存命令 | 已验证 | READ/WRITE(10)/(16)、RC10/16、TUR、INQUIRY、SYNC(10)/(16)、FUA 回退 |
-| UNMAP | 已验证 | 探测 B0/B2 后启用，按上报限制拆分，不外扩调用者范围 |
-| 发现与身份 | 已验证（双目标） | 每个合格目标进入目标表并独立 probe/nub；handle 只作固件地址，复用按 SAS 地址与稳定身份判定 |
-| IR 成员过滤 | 已实现，未在阵列上验证 | 拒绝卷、成员盘、热备与扩容成员；当前固件虽带 IR 能力但无卷样本 |
-| 移除与恢复 | 已验证（双目标；含在途读/写在途拔盘） | 逐目标 TARGET_RESET → 命令排空 → REMOVE_DEVICE 实机触发：被拔盘立即离线、另一目标继续服务、在途请求以设备错误返回、不重放；TMF 级联与有界 IOC 复位另有注入验证 |
-| 热插拔与媒体生命周期 | 已验证（双目标，背板） | 拔盘即离线、另一目标不受影响；插回需 PortEnable 重发现（8 s/45 s 两次有界复位，期间另一盘短暂下线），按 SAS 地址复用槽位、盘号不变 |
-| 睡眠/唤醒、停机静默 | 已验证（双目标，含长睡眠） | 睡眠前逐已发布目标 flush；唤醒后两盘在 25 秒内恢复、盘号不变、`MPRPowerState=on`；未就绪目标按 1 秒节奏重试而不计入失败；唤醒总在首次拓扑读取前重建控制器，配置页/事件与 PortEnable 回复有看门狗计时的稳定窗口，不再产生管理超时、协议故障与 fault-driven 复位；每次唤醒仅有一次 S3 后必需的计划内重建（`MPRResetCount` +1），`MPRStickyFaultCount` / `MPRFaultRecoveries` 不变 |
-| 诊断输出开关 | 已实现 | 内核日志与所有 IORegistry 属性默认不产生；boot-args 加 `mpr_debug=1` 后全部开启，覆盖 init/probe/start 的启动阶段输出 |
-| 多 LUN、多路径、SES/SMP、NVMe/Tri-Mode | 未实现 | 见 §1.3 |
+| IOC initialization, Facts-constrained queues, interrupt replies, event subscribe/ACK | Current | one hardware reply ring; 32-descriptor index batches, host index written only when non-empty, interrupt wakeup with bounded polling |
+| Asynchronous request scheduling | Current (measured depth 1/4/16/32 matched the request) | 64 request records, at most 32 command windows; degraded by IOC credits and pool capacity; SMIDs 32–63; ready commands retired before free windows are refilled; timeout counted from the original submission |
+| Client DMA, SGL/chain and staging fallback | Current, read-only (direct and forced staging both byte-exact; the write tests used the direct path) | client subranges are mapped directly and copied only when direct mapping is off or unrepresentable; a request whose DMA stop is unproved keeps its mapping and completion responsibility, without callback or reuse; that branch has not been reproduced on media |
+| Block I/O and cache commands | Current | READ/WRITE(10)/(16), RC10/16, TUR, INQUIRY, SYNC(10)/(16), FUA with an ordered-flush fallback |
+| UNMAP | Implemented; qualified on the baseline build only | enabled after a B0/B2 probe, split to the reported limits, never extended beyond the caller's range |
+| Discovery and identity | Current, one target | every eligible target enters the target table and gets its own probe/nub; a handle is only a firmware address, and reuse is decided by SAS address and stable identity |
+| IR member filtering | Implemented, not verified on an array | volumes, member disks, hot spares and expansion members are refused; the firmware reports IR capability but no volume exists to test against |
+| Removal and recovery | Implemented; removal is baseline, TMF escalation is current | per-target TARGET_RESET → drain → REMOVE_DEVICE, all naming that slot's handle; §6 records the expander side effect of a delivered TMF |
+| Hotplug and media lifecycle | Baseline only | a pulled disk goes offline while the other target keeps serving; reinsert needs PortEnable rediscovery (two bounded resets at 8 s and 45 s, during which the other target drops out); the slot is reused by SAS address so the disk number stays |
+| Sleep/wake and shutdown | Sleep/wake current (two cycles, one target); shutdown baseline only | every published target is flushed before sleep; wake rebuilds the controller before the first topology read, gives config/event and PortEnable replies a watchdog-timed settling window, and brings media back with the same disk number; one planned rebuild per wake (`MPRResetCount` +1) with the sticky/fault counters unchanged |
+| Diagnostic gate | Implemented | kernel log lines and every IORegistry property are silent by default; `mpr_debug=1` enables both, including the init/probe/start phase |
+| Multi-LUN, multipath, SES/SMP, NVMe/Tri-Mode | Not implemented | see §1.3 |
 
-## 5. 里程碑状态
+## 5. Milestone status
 
-| 阶段 | 内容 | 状态 |
+| Stage | Content | Status |
 |---|---|---|
-| M0 环境 | Command Line Tools 构建、内部 ESP 注入、匹配与加载 | 完成 |
-| M1 寄存器与 IOC | READY → OPERATIONAL、IOC Facts、DMA 池、Manufacturing Page0 | 完成 |
-| M2 中断、回复与事件 | 中断回复、回复帧回收、按命令分派、EventMasks/ACK、PortEnable | 完成（回复帧回收随长时间运行覆盖，未单独统计绕环次数） |
-| M3 单盘只读 | 独立盘识别、身份与容量、只读 nub、大范围顺序读一致性 | 完成 |
-| M4 读写与恢复 | WRITE、缓存同步/FUA、UNMAP、sense、超时/TMF/复位 | 完成；带故障注入的长跑只完成多轮短程（无注入的串行命令原型另有 90 分钟/约 345 万条命令记录，见 §7） |
-| M5 拓扑、热插拔与 PM | nub 增删、handle 复用隔离、安全 stop、睡眠/唤醒 | 完成（直连与双目标背板，含在途 I/O 拔盘） |
-| M6 诊断工具（可选） | 独立 `IOUserClient`/工具、统计导出 | 未实施；现用 IORegistry 属性与 boot-args |
-| 性能数据路径 | 客户端 DMA、有界命令池、就绪回收与补发、单环批量回复/唤醒 | 完成（单目标只读）：原生构建/链接/签名/加载，只读正确性，旧版与新版的 A/B 读写延迟与吞吐，一次 TMF 级联恢复；写入/UNMAP/拔插/PM 未复测 |
-| M7 后续 | IR 卷、SES、多硬件队列、启动盘、签名发布；路线 B / dext 评估 | 不在当前范围 |
+| M0 environment | Command Line Tools build, internal ESP injection, matching and loading | done |
+| M1 registers and IOC | READY → OPERATIONAL, IOC Facts, DMA pools, Manufacturing Page 0 | done |
+| M2 interrupts, replies and events | interrupt-driven replies, reply-frame retirement, per-command dispatch, EventMasks/ACK, PortEnable | done; the retirement path is covered by long runs, wrap count was never counted separately |
+| M3 single-disk read-only | independent-disk discovery, identity and capacity, read-only nub, large sequential read consistency | done |
+| M4 read/write and recovery | WRITE, cache flush/FUA, UNMAP, sense, timeout/TMF/reset | done; the fault-injected soak stopped short (§6), the serial-command prototype's 90-minute run is in §7 |
+| M5 topology, hotplug and PM | nub add/remove, handle-reuse isolation, safe stop, sleep/wake | complete on the baseline build (direct attach and the dual-target backplane, including a pull with I/O in flight); the current source re-qualified sleep/wake only |
+| M6 diagnostic tooling (optional) | standalone `IOUserClient`/tool, statistics export | not done; IORegistry properties and boot arguments are used instead |
+| Performance data path | client DMA, bounded command pool, ready-first harvest and refill, batched single-ring replies with wakeups | done on one target: native build/link/sign/load, read-only correctness, A/B latency and throughput against the preceding build, one TMF escalation, a small write and flush cycle, two sleep/wake cycles, four recovery variants; UNMAP, physical replug, dual target and shutdown not re-run |
+| M7 later | IR volumes, SES, multiple hardware queues, boot disk, signed release; route B / dext evaluation | outside the current scope |
 
-## 6. 尚未完成
+## 6. Not yet done
 
-- 「一次唤醒零复位」尚未做到：S3 后 IOC 必须经 diag reset 与 IOC Init 才能回到 operational，因此每次唤醒仍有一次计划内重建，`MPRResetCount` +1。该复位发生在工作线程读取拓扑之前，不再由配置页超时或起转探测触发；`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending` 在唤醒前后保持不变。
-- 复位末段失败的诊断与重试：PortEnable/初始化一类失败目前只记为笼统的 `MPRReinitState=failed`，靠协议故障兜底再复位才恢复，缺少逐阶段的失败点与就地重试。
-- 任务管理请求在该 expander 上的副作用（按用户决定暂不修改恢复路径，仅记录）：真正送达目标的 TMF（ABORT/LUN/TARGET）每次都伴随一次 SAS 移除报告（`MPRTopoRemovalHits` 1:1），随后的重新枚举让介质中断数十秒（实测单次 LUN RESET 后 >45 s 无完成）；`mpr_tmf_fail=3` 走整 IOC 重建时 `MPRTopoRemovalHits` 不变、介质回来后传输与摘要均正常。未定论的两点：单次事件可正常恢复，但累计 12 次后出现过 >128 KiB 原始请求返回 `ENXIO`（重启后消失，单次事件未复现），原因不明；`MPRRecoveryState` 在复位型恢复后不会被改写回 `ok`，只是面包屑而非实时状态。
-- 故障注入长跑未跑满：需夹具在媒体重建后按新 BSD 号重开设备，并把预期内复位与短时错误纳入判据。
-- 性能路径的剩余空白：只读数据路径、子范围映射、链表、映射失败回退、不同深度、最小写入/刷新与两次睡眠唤醒已验收；UNMAP、物理拔插、关机、FUA 选择（用户态不可达）与双目标隔离未测；「未证明 DMA 停止」分支只有源码审查，没有在实盘复现（制造失控 DMA 不在允许范围）。大块顺序吞吐在 QD≥4 时稳定在约 150–155 MiB/s，不随深度增长，属该盘与该路径的特性而非调度问题；换成其它盘或直连需要重测。单硬件回复环、单调度工作线程与旧同步暂存路径仍保留；多队列/MSI-X 扩展未实现。
-- 换盘到不同容量设备、跨 macOS 版本回归、正式签名与发布流程。
-- 路线 B 的最小子类链接/加载验证（仅在决定改走该路线时开展）。
+- "One wake, zero resets" is not achieved: after S3 the IOC must go through a diag
+  reset and IOC Init before it is operational, so every wake still costs one
+  planned rebuild and `MPRResetCount` +1. That reset now happens before the worker
+  reads topology, so it is no longer triggered by a config-page timeout or a
+  spin-up probe; `MPRStickyFaultCount`, `MPRFaultRecoveries` and
+  `MPRProtocolRecoveryPending` stay unchanged across the wake.
+- Diagnostics and retry for failures in the tail of a reset: a PortEnable or
+  initialization failure is still recorded only as a generic
+  `MPRReinitState=failed`, and recovery depends on the protocol-fault path forcing
+  another reset. Per-stage failure points and in-place retry are missing.
+- Side effect of task-management requests on this expander (recorded, not fixed, by
+  decision): a TMF that really reaches the target (ABORT/LUN/TARGET) is always
+  accompanied by a SAS removal report (`MPRTopoRemovalHits` 1:1), and the
+  re-enumeration that follows interrupts the medium for tens of seconds (measured:
+  more than 45 s without completion after a single LUN RESET). With
+  `mpr_tmf_fail=3`, which rebuilds the whole IOC instead, `MPRTopoRemovalHits` does
+  not change and transfers and digests are normal once the medium returns. Two
+  points remain unresolved: a single event recovers correctly, but after twelve
+  accumulated events raw requests above 128 KiB returned `ENXIO` (gone after a
+  reboot, never reproduced with one event) with no known cause; and
+  `MPRRecoveryState` is not rewritten to `ok` after a reset-based recovery, so it
+  is a breadcrumb rather than a live state.
+- The fault-injected soak never ran to budget: the fixture must reopen the device
+  by its new BSD number after a medium rebuild, and treat expected resets and
+  brief error windows as in scope.
+- Remaining data-path gaps: UNMAP, physical replug, shutdown, FUA selection (not
+  reachable from user space here) and dual-target isolation have not been tested on
+  this source; the "DMA stop unproved" branch has only been read in source, since
+  provoking uncontrolled DMA is out of bounds. Large sequential throughput
+  saturates near 150–155 MiB/s from QD 4 and does not grow with depth, which is a
+  property of that disk and this path rather than a scheduling limit; another disk
+  or direct attach must be re-measured. One hardware reply ring, one scheduler
+  thread and the legacy synchronous staging path remain; multi-queue/MSI-X is not
+  implemented.
+- A different-capacity disk, regression across macOS versions, signing and release.
+- A minimal route B subclass build and load check, only if that route is chosen.
 
-## 7. 验证方式
+## 7. How the work is verified
 
-- 主机侧：`tools/test_protocol.cpp` 用独立基准字节与独立 chain 解码器验证协议层（含 2,000 个确定性 SGL 用例、信用/SMID 边界及乱序完成前缀用例），在目标系统的编译器上以 ASan/UBSan、`-Wall -Wextra -Werror` 构建并通过；`tools/validate-build-inputs.py` 校验 LF 行尾、bundle 与运行版本一致、所有编译单元均纳入 Xcode 工程。
-- 构建/加载：`tools/build-noxcode.sh` 产出 `MPR.kext`，校验 kmod 入口、bundle 类型、驱动内部符号与 plist 后 ad hoc 签名；注入内部 ESP 后核对 ESP 上 `Info.plist`、产物哈希与 `kmutil showloaded` 的版本；`MPRBuild` 只在 boot-args 带 `mpr_debug=1` 时发布，用它核对前须先开启诊断开关。交叉编译的 Mach-O 目标不等于链接、签名、可加载。
-- 性能对照：只读原始设备（不经文件缓存），同一数据窗口、同一负载、同一预热，每组重复三次取中位数并记录离散度；形状为顺序 128 KiB/1 MiB 与随机 4/16/64 KiB，QD 1/4/16/32；正式吞吐对照关闭 `mpr_debug` 并保持串口关闭，深度/直映开关则用开启诊断的短跑核对生效值与计数器。旧版对照只使用已部署的旧产物（版本与哈希单独记录），不覆盖工作树。
-- 实机：所有依赖 IORegistry 属性或内核日志的判据都要求 boot-args 带 `mpr_debug=1`；默认静默时属性不存在属预期，不得据此判定加载失败。单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。双目标时另验证两盘 LBA0 与高 LBA 读一致性、可写盘写后回读、以及 `MPRTargetNWriteCount` 按目标归因。睡眠/唤醒必须有旧版与当前版的 `MPRResetCount` 前后对照，并同时核对 `MPRResetInitiator`、`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending`、`MPRWakeRebuildState`、`MPRProbeRetries` 与两盘 online 时间；短睡与长睡都要测，单看「online」或单看一次复位都不能判定唤醒路径是否改善。当前性能改动触及 DMA 生命周期、在途命令、超时恢复与 PM，旧双目标拔盘证据不能替代新回归；仅在取得测试介质和拔盘授权后复测，未授权项明确标为未测试。
-- 长跑：以命令数预算代替墙钟时间，关注按操作次数累积的驱动问题（回复帧、SMID、事件 ACK、属性字典、恢复循环退化），不是介质耐久性。串行命令原型曾以约 345 万条命令、90 分钟通过（p99 无漂移、`MPRResetCount` 不增长、属性数量稳定、参考区哈希不变）。当前异步调度版本以 4 KiB 随机读跑了 2111 万条命令（直映，10 分钟）、6372 万条（直映，30 分钟）与 1066 万条（强制暂存），逐分钟采样 `MPRResetCount`、`MPRStickyFaultCount`、`MPRUnexpectedCompletionCount`、`MPRAsyncHeldDMA`、属性数量与 `ioreg` 体积，均无漂移；另跑混合尺寸（4 KiB–1 MiB，构建 32.8 万个链描述符）与 8 线程混合读写（324 万次操作、227 万次 4 KiB 原地写、6331 次 fsync，回读零不一致、末尾整文件关缓存比对一致）。边界用例单列：介质末尾、越界、零长、非对齐偏移与不足一个块的长度、16 MiB 单请求、2 万次随机单块读两次比对。
-- 恢复变体按"实际送达目标的请求"分类验证：`mpr_tmf_fail=0/1/2` 分别让 ABORT、LUN、TARGET 真正下发，`mpr_tmf_fail=3` 让三者都跳过而落到整 IOC 重建；每次只注入一次（`mpr_timeout_every` 取 1e6 或用一次性开关），注入前后核对 `MPRTopoRemovalHits`、`MPRTopologyGeneration`、`MPRResetCount`、`MPRResetInitiator`、目标代次与 BSD 号，并在恢复后重跑只读摘要比对。
-- 压力与故障注入的取舍：压测以"发出尽可能多的命令"为目标，不向介质写入大容量数据；写入验证限定在专用测试卷上的一个 32 MiB 文件加 2000 次 4 KiB 原地重写，回读关缓存逐字节比对后删除。故障注入只读进行（`mpr_timeout_test`、`mpr_timeout_every`、`mpr_tmf_fail`），一旦出现 panic、串盘、重复回调或不可控 DMA 即停止加量并保留现场；本次注入触发了 fabric 层移除事件，按此规则在 12 次后停止并向用户报告。
-- 破坏性写仅限现场重新核对身份的测试盘，写窗口事后逐字节还原；`IORegistry` 的"在线"属性不能替代字节数与回读内容。
+- Host side: `tools/test_protocol.cpp` validates the protocol layer against
+  independent golden bytes and an independent chain decoder (2,000 deterministic
+  SGL cases, credit/SMID boundaries, out-of-order completion prefixes). It builds
+  with ASan/UBSan and `-Wall -Wextra -Werror` on the target system's compiler and
+  runs 158,638 assertions. `tools/validate-build-inputs.py` checks LF line endings,
+  agreement between bundle, runtime and CLI versions, and that every translation
+  unit is part of the Xcode project.
+- Build and load: `tools/build-noxcode.sh` produces `MPR.kext`, verifies the kmod
+  entry points, bundle type, driver-internal symbols and plist, then signs it ad
+  hoc. After injecting it into the internal ESP, compare that ESP's `Info.plist`,
+  the artefact hash and the `kmutil showloaded` version. `MPRBuild` is published
+  only with `mpr_debug=1`, so enable diagnostics before reading it. A
+  cross-compiled Mach-O is not a linked, signed, loadable kext.
+- Performance comparison: read the raw device (no file cache), with the same data
+  window, the same load and the same warm-up; three repeats per configuration with
+  the spread recorded. Shapes are 128 KiB/1 MiB sequential and 4/16/64 KiB random
+  at QD 1/4/16/32. Throughput comparisons run with `mpr_debug` and serial logging
+  off; depth and direct-map switches are confirmed against the reported values in
+  short diagnostic runs. Compare only against an already deployed older build whose
+  version and hash are recorded separately; never against the working tree.
+- On hardware: every judgement that relies on an IORegistry property or a kernel
+  log line requires `mpr_debug=1`; with output silent by default an absent property
+  is expected and is not evidence of a failed load. Checks: two byte-identical
+  1 GiB sequential reads, write followed by a byte-exact readback, remount after
+  UNMAP, physical pull and pull with I/O in flight, an injected timeout escalating
+  through TMF to reset, and sleep/wake. Behind the expander the same bounded
+  read/write and UNMAP checks apply. With two targets, also compare LBA0 and
+  high-LBA reads on both, writable-disk readback, and per-target attribution in
+  `MPRTargetNWriteCount`. PM changes need `MPRResetCount` before and after for the
+  old and the new build, together with `MPRResetInitiator`, `MPRStickyFaultCount`,
+  `MPRFaultRecoveries`, `MPRProtocolRecoveryPending`, `MPRWakeRebuildState`,
+  `MPRProbeRetries` and both media's online times; test short and long sleeps,
+  because neither "online" alone nor a single reset count decides whether the wake
+  path improved. Repeat the pull tests only once test media and permission to pull
+  are available, and report anything not authorised as untested.
+- Long run: budget by command count instead of wall-clock and watch for
+  driver-side accumulation (reply frames, SMIDs, event ACKs, property dictionary,
+  a degenerate recovery loop) rather than media endurance. The earlier
+  serial-command prototype passed about 3.45 M commands over 90 minutes (flat p99,
+  `MPRResetCount` unchanged, stable property count, unchanged reference-region
+  hash). The current asynchronous scheduler ran 21.1 M 4 KiB random reads with
+  direct mapping (10 min), 63.7 M (30 min) and 10.7 M with forced staging, sampling
+  `MPRResetCount`, `MPRStickyFaultCount`, `MPRUnexpectedCompletionCount`,
+  `MPRAsyncHeldDMA`, the property count and the `ioreg` size every minute with no
+  drift. Mixed sizes (4 KiB–1 MiB, 328 k chained descriptors) and eight threads of
+  mixed read/write (3.24 M operations, 2.27 M in-place 4 KiB writes, 6,331 fsyncs)
+  produced zero mismatched readbacks and an exact final cache-disabled comparison.
+  Boundary cases are listed separately: end of media, one block past the end,
+  zero length, unaligned offsets and sub-block lengths, a 16 MiB single request,
+  and 20,000 random single-block reads compared over two passes.
+- Recovery variants are classified by the request that actually reaches the target:
+  `mpr_tmf_fail=0/1/2` really delivers ABORT, LUN and TARGET, while
+  `mpr_tmf_fail=3` skips all three and lands on a whole-IOC rebuild. Inject once
+  per run (`mpr_timeout_every` at 1e6 or a one-shot switch), compare
+  `MPRTopoRemovalHits`, `MPRTopologyGeneration`, `MPRResetCount`,
+  `MPRResetInitiator`, target generations and BSD numbers around the event, then
+  repeat the read-only digest comparison.
+- Stress versus fault injection: stress runs aim at the highest command count and
+  do not write large amounts of data to the medium. Write verification stays inside
+  one 32 MiB file on the dedicated test volume plus 2,000 in-place 4 KiB rewrites,
+  compared byte for byte with the cache disabled before deletion. Fault injection
+  is read-only (`mpr_timeout_test`, `mpr_timeout_every`, `mpr_tmf_fail`) and stops
+  increasing load on any panic, cross-disk transfer, duplicate callback or
+  uncontrolled DMA, preserving the evidence; the current injection triggered fabric
+  removal events and was stopped after twelve on that rule.
+- Destructive writes are limited to a test disk whose identity was re-verified on
+  the spot, and the written window is restored byte for byte afterwards. An
+  IORegistry "online" property never replaces byte counts and readback content.
 
-## 8. 风险
+## 8. Risks
 
-| # | 风险 | 缓解 |
+| # | Risk | Mitigation |
 |---|---|---|
-| R1 | 系统升级后 vtable/符号/加载行为漂移 | 升级前重取 KC 并重跑离线核查，再做加载与只读回归；不外推旧结论 |
-| R2 | 多目标覆盖限于同一背板上的两块终端盘，且为单盘依次拔插、单路在途 I/O | 移除/热插拔/PM 已在双目标下复测（含在途读/写在途拔盘、短睡与长睡唤醒）；不外推到其它 expander、多盘并发拔插或长时间压力 |
-| R3 | 固件带 IR 能力，过滤规则覆盖有限 | 无法确认独立盘身份时不发布；不把单盘结果推广到全部 IR 配置 |
-| R4 | expander 覆盖为同一背板上的两块终端盘（一块 SATA、一块 SSP），插回依赖 PortEnable 重发现与两次有界 IOC 复位 | 该组合下拔插、PM 与在途 I/O 均已实测；记录复位期间另一目标短暂下线，不把单一组合的结果外推为通用 expander 支持 |
-| R5 | 新客户端 DMA/流水调度尚未编译或实机验收，单回复环仍限制扩展 | DMA 未停止则不解映射/不回调；旧版及强制回退对照，先验证数据与恢复，再确认吞吐收益；多硬件队列单独评估 |
-| R6 | 路线 B 的 SPI KPI 已废弃 | 维持路线 A；改走 B 前单独完成构建与加载验证 |
-| R7 | ESP 有文件但实际未加载或仍运行旧版 | ESP-only 部署；重启后独立核对运行版本；config 变更前备份并校验 |
+| R1 | A system update shifts vtables, symbols or load behaviour | re-extract KC and re-run the offline checks before upgrading, then load and re-run the read-only regression; never extrapolate old conclusions |
+| R2 | Multi-target coverage is two terminal disks on one backplane, with one disk pulled at a time and one in-flight request, and it is baseline evidence | re-run removal, hotplug and PM on the current source before claiming them; do not extrapolate to other expanders or concurrent pulls |
+| R3 | The firmware can do IR while filtering coverage is limited | refuse to publish when an independent identity cannot be established; do not generalise single-disk results to IR configurations |
+| R4 | Reinsert behind this expander depends on PortEnable rediscovery and two bounded IOC resets | the other target drops out during those resets and that is recorded; do not present the combination as general expander support |
+| R5 | The current DMA and scheduling ownership rules are qualified for read-only, write/flush and PM on one target only; removal, UNMAP and dual-target paths share them without re-qualification, and one reply ring caps scaling | keep the unproved-DMA-stop rule (no unmap, no callback), compare against forced staging, validate data and recovery before throughput, and evaluate multiple hardware queues separately |
+| R6 | Route B's SPI KPI is deprecated | stay on route A; complete a build and load check before switching |
+| R7 | The ESP holds a file that was not loaded, or an older build is still running | ESP-only deployment; verify the running version after reboot; back up and validate any config change |
 
-## 9. 许可
+## 9. Licensing
 
-1. FreeBSD `mpr`（BSD-2-Clause）：`MPR/MPI/mpi2_min.h` 保留 Broadcom 版权与三条款许可；来源与许可清单见仓库 `NOTICE`。
-2. Linux `mpt3sas`（GPL-2.0）只作行为与协议参考，不复制代码到驱动源码；`reference/` 不入库、不参与构建。
-3. MPI 结构体定义以 FreeBSD `mpi/*.h` 为唯一代码来源；与 Linux 版的差异只在 `MPI/` 内注释记录，不混用。
-4. `MacKernelSDK` 头文件仅用于编译，遵循其自身许可，不拷入驱动源码树。
-5. `ida/` 的 KC 与 IDA 数据库只用于核对接口、vtable、符号与依赖，不复制 Apple 实现，不把 KC 地址写入驱动。
-6. `reference/IOSCSIParallelFamily/`（APSL 2.0）只作头文件、ABI 与依赖键参考；若将来引用其常量或结构定义，按 APSL 保留声明并在 `NOTICE` 单列来源与 commit。
+1. FreeBSD `mpr` is BSD-2-Clause. The MPI wire definitions transcribed into
+   `MPR/MPI/mpi2_min.h` and `MPR/MPI/mpi2_target.h` keep the Broadcom copyright and
+   its three-clause redistribution terms; source and licence inventory are in
+   `NOTICE`.
+2. Linux `mpt3sas` (GPL-2.0) is a behaviour and protocol reference only; no code is
+   copied into the driver, and `reference/` is neither committed nor built.
+3. MPI structures are sourced exclusively from FreeBSD `mpi/*.h`; differences from
+   the Linux version are noted in `MPI/` comments only, never mixed.
+4. `MacKernelSDK` headers are used for compilation under their own licence and are
+   not copied into the driver tree.
+5. The KC and IDA database under `ida/` are used only to confirm interfaces,
+   vtables, symbols and dependencies; no Apple implementation is copied and no KC
+   address is written into the driver.
+6. `reference/IOSCSIParallelFamily/` (APSL 2.0) is referenced for headers, ABI and
+   dependency keys only; if its constants or structures are ever used, keep the
+   APSL notice and list source and commit in `NOTICE`.
 
-## 10. 操作约束
+## 10. Operating constraints
 
-- 驱动只安装到经现场核对的**内部 SATA 盘 ESP** 的 `EFI/OC/Kexts/MPR.kext`，由 OpenCore `Kernel > Add` 注入；不写 `/Library/Extensions`、其它系统卷或 USB EFI，不把 AuxKC 重建当作部署步骤。
-- 改 `config.plist` 前在同目录备份，改后 `plutil -lint`/`ocvalidate` 并核对只有预期差异；仅替换 kext 时 config 应保持不变。
-- 上传的文本文件必须是 LF；改后重新检查，不沿用旧副本的检查结论。
-- 串口调试默认关闭（`debug=0x100`、无 `serial=5`），仅在需要抓内核日志时临时开启并随即关闭。
-- 预计超过 1 GB 的备份须先说明范围、大小与位置并取得针对该备份的许可；验收用流式校验和，不自动制作整盘镜像。
-- 实机写入、部署、重启按会话中已授权的具体范围执行；写测试仅限重新核对身份后的测试盘。
+- The driver is installed only into `EFI/OC/Kexts/MPR.kext` on the verified
+  **internal SATA disk's** ESP and injected through OpenCore `Kernel > Add`. Never
+  write `/Library/Extensions`, another system volume or a USB EFI, and never treat
+  an AuxKC rebuild as a deployment step.
+- Back up `config.plist` beside itself before editing; after editing run
+  `plutil -lint`/`ocvalidate` and confirm the only difference is the intended one.
+  A kext-only replacement leaves the config unchanged.
+- Uploaded text files must be LF; re-check after every edit instead of relying on an
+  earlier check of an older copy.
+- Serial debugging stays off by default (`debug=0x100`, no `serial=5`); enable it
+  only to capture kernel logs and disable it again immediately afterwards.
+- Any backup expected to exceed 1 GB needs its scope, size and location stated and
+  an explicit permission for that backup beforehand; acceptance runs use streaming
+  checksums and never create a whole-disk image on their own.
+- Hardware writes, deployment and reboots happen within the specific scope
+  authorised in the session; write tests are limited to a test disk whose identity
+  was re-verified.

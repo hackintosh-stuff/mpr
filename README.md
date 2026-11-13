@@ -17,9 +17,7 @@ machine (macOS 26.7.2, SAS3008, one SATA target).
 Qualified for this source: read-only block I/O including requests larger than
 one command window, chunks at non-zero offsets, several concurrent client
 requests, fragmented and page-unaligned client buffers, and byte-exact
-comparison against digests recorded under the previous build. One injected
-reply loss escalated through ABORT_TASK and LUN RESET to TARGET RESET and left
-the target serving I/O with no controller reset and no sticky fault.
+comparison against digests recorded under the previous build.
 
 Also qualified for this source: a sustained command storm (21.1 million
 commands in 600 s with client-buffer DMA and 10.7 million in 300 s with the
@@ -77,20 +75,13 @@ to re-run fabric discovery; each takes seconds to about 25 s, during which the o
 targets are briefly offline. The exFAT volume that was being written verified clean
 after the pull.
 
-Sleep and wake with both targets attached was exercised on that baseline. Sleep flushes each
-published target; wake brings both media back at their own disk numbers in under
-25 s with byte-exact readback on both. A disk that is
-still becoming ready is retried in place instead of being counted as a failed
-probe. The wake rebuilds the controller before the first topology read and
-gives config/event and PortEnable replies a bounded settling budget, so fabric
-settling produces no protocol fault and no extra IOC reset. One planned
-controller rebuild per wake remains mandatory after S3; the power-state and
-fault counters behind these claims are listed in [DEBUG.md](DEBUG.md).
+Sleep and wake with both targets attached was exercised on that baseline: sleep
+flushes each published target, and wake brought both media back at their own disk
+numbers in under 25 s with byte-exact readback. The current source re-ran sleep
+and wake on one target only; those measurements are below.
 
-Not covered: SAS/SSP write paths are not verified on hardware; multipath,
-multiple LUNs, enclosure services, long duration or concurrent stress.
-The long-run result recorded in [PLAN.md](PLAN.md) belongs to an earlier
-serial-command prototype, not to the current asynchronous scheduler.
+Not covered by that baseline: SAS/SSP write paths are not verified on hardware;
+multipath, multiple LUNs, enclosure services, long duration or concurrent stress.
 Wire-format and large-LBA cases are checked on the host, not on this hardware.
 
 ## Capabilities
@@ -145,13 +136,9 @@ the same disk.
 
 IR RAID volumes, multipath, multi-LUN devices, SES/SMP management,
 NVMe/Tri-Mode, firmware flashing and FreeBSD user ioctl compatibility are
-outside this driver. The ordinary asynchronous path maps client buffers rather
-than forcing a driver staging copy. IOKit may still use internal bounce memory;
-this is not a guarantee that every platform performs zero copies. The legacy
-synchronous bulk/probe path retains staging. There remains one hardware reply
-queue and one serialized I/O scheduler.
-
-These limits are not additional hardware requirements.
+outside this driver. IOKit may still bounce through internal memory, so direct
+client mapping is not a guarantee that every platform performs zero copies; the
+legacy synchronous bulk/probe path keeps staging.
 
 ## Performance configuration
 

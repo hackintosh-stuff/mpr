@@ -6,8 +6,9 @@ This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
 remaining work are in [PLAN.md](PLAN.md). Diagnostic output is opt-in; see
 section 7. The current data path is built natively with the Command Line Tools,
-linked, signed ad hoc, loaded from the internal ESP and qualified for read-only
-block I/O on one target. Writes, UNMAP, removal and PM observations in this
+linked, signed ad hoc and loaded from the internal ESP. On one target it is
+qualified for read-only block I/O, a small write/flush cycle and two sleep/wake
+cycles. The UNMAP, removal, reinsertion and shutdown observations in this
 document were made with the preceding build and remain a regression baseline.
 
 ## 1. Concurrency and ordering
@@ -394,13 +395,13 @@ that is absent on a normal boot is expected, not a failed load.
 |---|---|
 | Build and media | `MPRBuild`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady`, `MPRMediaReadyStatus`, `MPRPublishedTargetCount` |
 | Targets | `MPRTargetCount`, `MPRTargetNHandle`, `MPRTargetNSasAddress`, `MPRTargetNPresent`, `MPRTargetNProbed`, `MPRTargetNProbeState`, `MPRTargetNProbeStatus`, `MPRTargetNProbeRetries`, `MPRTargetNOnline`, `MPRTargetNRemovalState`, `MPRTargetNMediaStatus`, `MPRTargetNGeneration` |
-| Discovery and removal | `MPRScanCount`, `MPRRemovedMediaCount`, `MPRRemovalFailures`, `MPRRemovalStage`, `MPRRetiredSlotsReleased`, `MPRRediscoveryResets`, `MPRRediscoveryState` |
+| Discovery and removal | `MPRScanCount`, `MPRRemovedMediaCount`, `MPRRemovalFailures`, `MPRRemovalStage`, `MPRRetiredSlotsReleased`, `MPRRediscoveryResets`, `MPRRediscoveryState`, `MPRTopoRemovalHits`, `MPRTopologyGeneration` |
 | Async limits | `MPRAsyncRequestLimit`, `MPRAsyncRequestedDepth`, `MPRAsyncAllocatedDepth`, `MPRAsyncCommandLimit`, `MPRAsyncFirstSmid`, `MPRAsyncPeakRequests`, `MPRAsyncOutstanding`, `MPRAsyncPeakCommands` |
 | Client DMA | `MPRDirectDMAEnabled`, `MPRDirectCommands`, `MPRMappedCommands`, `MPRDirectBytes`, `MPRCopiedBytes`, `MPRChainedCommands`, `MPRBounceCommands`, `MPRDirectMapFailures`, `MPRAsyncHeldDMA` |
 | Reply retirement | `MPRHardwareReplyQueues`, `MPRReplyBatches`, `MPRReplyDescriptors`, `MPRReplyMaxBatch`, `MPRReplyIndexWrites` |
 | Identity/filter | `MPRStableIdentityValid`, `MPRStableIdentity`, `MPRIdentityState`, `MPRRaidFilterState`, `MPRStandaloneTargetCount`, `MPRSasDevicePageState` |
-| Capabilities | `MPRNativeFuaSupported`, `MPRFuaPolicy`, `MPRUnmapEnabled`, `MPRUnmapMaxLbaCount`, `MPRUnmapMaxDescriptors`, `MPRUnmapReadsZero` |
-| Recovery | `MPRHotplugState`, `MPRProbeRetries`, `MPRResetCount`, `MPRResetInitiator`, `MPRReinitState`, `MPRRecoveryState`, `MPRFaultRecoveries`, `MPRFaultRecoveryState`, `MPRDeviceOffline`, `MPRTmfHandle`, `MPRTmfResetStatus` |
+| Capabilities | `MPRNativeFuaSupported`, `MPRFuaPolicy`, `MPRUnmapEnabled`, `MPRUnmapDisabled`, `MPRUnmapMaxLbaCount`, `MPRUnmapMaxDescriptors`, `MPRUnmapOptimalGranularity`, `MPRUnmapAlignment`, `MPRUnmapAlignmentValid`, `MPRUnmapReadsZero` |
+| Recovery | `MPRHotplugState`, `MPRProbeRetries`, `MPRResetCount`, `MPRResetInitiator`, `MPRReinitState`, `MPRRecoveryState`, `MPRFaultRecoveries`, `MPRFaultRecoveryState`, `MPRDeviceOffline`, `MPRTmfHandle`, `MPRTargetResetStatus` |
 | Protocol | `MPRProtocolRecoveryPending`, `MPRProtocolFaultCode`, `MPRProtocolFaultSmid`, `MPRStickyFaultCode`, `MPRStickyFaultSmid`, `MPRStickyFaultCount`, `MPRBadReplySite`, `MPREventAckQueued`, `MPREventAckFailed` |
 | Power | `MPRPowerState`, `MPRPowerFlushStatus`, `MPRPowerFlushCount`, `MPRStopDMAState`, `MPRWatchdogIOCState`, `MPRWakeNotReadyCount`, `MPRWakeQuiesced`, `MPRWakeMemoryEnabled`, `MPRWakeBusMasterEnabled`, `MPRWakeRebuildState`, `MPRWakeSettleTicks` |
 | Writes | `MPRWriteCount`, `MPRWriteBytes`, `MPRLastWriteLba`, `MPRLastWriteSmid`, `MPRTargetNWriteCount`, `MPRTargetNFailureCount` |
@@ -430,10 +431,9 @@ The reply path's own progress evidence is `MPRReplyDescriptors` and
 `MPRReplyBatches`; a working reply interrupt is not observable through a
 property here.
 
-`mpr_debug=1` enables the kernel log and every IORegistry property listed
-above. `mpr_timeout_test=1`, `mpr_tmf_fail=N` and `mpr_timeout_every=N`
-exercise recovery; none of these boot arguments is set by default. Serial
-kernel logging remains off by default under the workspace rules.
+`mpr_timeout_test=1`, `mpr_tmf_fail=N` and `mpr_timeout_every=N` exercise
+recovery; none of these boot arguments is set by default. Serial kernel logging
+remains off by default under the workspace rules.
 
 ## 8. Coverage against the FreeBSD driver
 
@@ -460,16 +460,14 @@ names are not macOS requirements.
 | Builds | OS-specific build system | All driver translation units in the CLI and Xcode builds |
 
 Sleep and wake, physical pull and pulls with I/O in flight have earlier
-qualification evidence with two targets behind this expander. The current
-source needs these regressions repeated. Outside the qualification baseline: more than two targets,
-a different expander or backplane, and concurrent multi-disk pulls; multiple
-LUNs and general SCSI passthrough; DPM persistent numbering and multipath; IR
-logical volumes and RAID management; SES/enclosure control, SMP passthrough,
-firmware update and user-space tools; NVMe/PCIe/Tri-Mode, SAS2 and GEN35
-hardware. Hardware multi-queue/MSI-X scaling remains unimplemented. Direct
-client DMA, ready-first refill and batched reply retirement are qualified for
-read-only I/O on one target; the write, removal and PM paths that share their
-ownership rules are not.
+qualification evidence with two targets behind this expander; the current source
+re-ran sleep and wake only, so those two-target regressions are still owed. Scope
+limits are in PLAN section 1.3. Hardware multi-queue/MSI-X scaling remains
+unimplemented. Direct client DMA, ready-first refill and batched reply retirement
+are qualified for read-only I/O, a small write/flush cycle and sleep/wake on one
+target; the removal, UNMAP and dual-target paths that share their ownership rules
+have not been re-run.
+
 The batching/empty-drain policy also uses the local Linux
 `mpt3sas_base.c::_base_process_reply_queue` as a behavior reference; the Linux
 implementation is not copied into the kext. Its per-vector queues are not
