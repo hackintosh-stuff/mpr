@@ -69,6 +69,18 @@ enum { kMPRMaxProbeRetries = 60 };
  * unsuccessful passes. */
 enum { kMPRProbeResetThreshold = 3 };
 
+/* Wake settling window. After a diag reset the expander and a spun-down disk
+ * can take much longer than the steady-state 2 s budget to answer a config
+ * page. Quarantining that SMID turns a transient into a protocol fault and a
+ * second, fault-driven IOC reset, so config/event replies get a bounded
+ * longer wait while this window is open. The watchdog ticks it down: nothing
+ * sleeps under fIOLock merely to time the window. */
+enum {
+    kMPRWakeSettleTicks = 30,
+    kMPRWakeConfigTimeoutMs = 8000,
+    kMPRWakePortEnableTimeoutMs = 60000
+};
+
 /* Per-target state for multi-target isolation. A DevHandle is a firmware
  * address, not a disk: it can name a different device after a replug, so each
  * slot also carries the SAS address, stable identity and medium generation it
@@ -277,6 +289,10 @@ private:
     /* Watchdog ticks after a wake during which the IOC may legitimately still
      * report a non-operational doorbell. */
     UInt32                     fResumeGraceTicks;
+    /* Watchdog ticks after a wake during which config/event replies may be
+     * slow while the fabric settles. Written under fIOLock, decremented by
+     * the watchdog and read by the synchronous management path. */
+    volatile UInt32            fWakeSettleTicks;
     /* A disk that leaves the fabric behind an expander is not necessarily
      * rediscovered when it returns: without SMP there is no per-phy reset, so
      * the IOC only re-runs discovery on PortEnable. These count the age of the

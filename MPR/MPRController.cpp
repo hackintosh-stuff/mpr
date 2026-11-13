@@ -370,7 +370,23 @@ MPRController::finishManagementRequest(UInt32 smid, UInt32 timeoutMs,
                                         UInt8 *reply, UInt8 *kind)
 {
     if (smid == 0 || smid >= 10 || fReplyLock == NULL) return false;
-    if (!waitForSmid(timeoutMs, smid) ||
+    /* SMIDs 1, 2 and 4 are config/event requests posted while the IOC is
+     * re-enumerating the fabric. During the wake settling window their reply
+     * can legitimately take longer than 2 s. PortEnable (3) already has its
+     * own 30 s allowance, and SCSI probes (6) must keep the short timeout so
+     * a device that never answers still classifies as a definite failure. */
+    UInt32 timeout = timeoutMs;
+    if ((smid == 1 || smid == 2 || smid == 4) && fWakeSettleTicks != 0 &&
+        timeout < kMPRWakeConfigTimeoutMs)
+        timeout = kMPRWakeConfigTimeoutMs;
+    /* PortEnable is the firmware's whole discovery pass. After a long sleep
+     * an expander plus a spun-down disk can keep it busy well past 30 s;
+     * timing out there quarantines SMID 3 and turns one wake rebuild into a
+     * failed rebuild plus a second, fault-driven reset. */
+    if (smid == 3 && fWakeSettleTicks != 0 &&
+        timeout < kMPRWakePortEnableTimeoutMs)
+        timeout = kMPRWakePortEnableTimeoutMs;
+    if (!waitForSmid(timeout, smid) ||
         !takeReplySlot(smid, reply, 64, kind)) {
         /* The IOC may still own this frame AND the shared DMA buffer.
          * Keep the busy bit until a diagnostic reset has stopped old DMA. */
@@ -3020,6 +3036,7 @@ MPRController::start(IOService *provider)
     fFaultRecoveries = 0;
     fIdleScanTicks = 0;
     fResumeGraceTicks = 0;
+    fWakeSettleTicks = 0;
     fRemovedMediaCount = 0;
     fRemovedAgeTicks = 0;
     fRediscoveryResets = 0;
@@ -3114,7 +3131,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.20.9");
+    setProperty("MPRBuild", "0.20.11");
     setProperty("MPRFeatures",
                 "async-pool,ieee-sgl-chain,read-write16,cache16,unmap-limits,"
                 "stable-identity,raid-filter,auto-sense,tmf,remove-device,pm-quiesce");
@@ -3385,9 +3402,35 @@ MPRController::resumePower(void)
 {
     if (!fSuspended) return true;
     IOLockLock(fIOLock);
-    bool ready = !fStopping && fPowerQuiesced && fPCIDevice != NULL &&
-        fPCIDevice->setMemoryEnable(true) && fPCIDevice->setBusMasterEnable(true);
-    if (ready) ready = resetAndReinitialize();
+    /* Restore the PCI command register before the IOC can answer anything.
+     * These helpers are called for their side effect: their bool result is not
+     * a readiness proof on this controller. Sleep could not prove that DMA
+     * stopped here, so fPowerQuiesced was false and the old gate skipped this
+     * rebuild entirely. The first config-page read after wake then timed out
+     * on SMID 4, quarantined the frame and forced the hotplug worker into a
+     * fault-driven IOC reset. A wake must always put the IOC back into a
+     * known state before any topology read; a quiesce that failed makes that
+     * more necessary, not less. */
+    bool pciReady = !fStopping && fPCIDevice != NULL;
+    bool memoryEnabled = false, busMasterEnabled = false;
+    if (pciReady) {
+        memoryEnabled = fPCIDevice->setMemoryEnable(true);
+        busMasterEnabled = fPCIDevice->setBusMasterEnable(true);
+    }
+    setProperty("MPRWakeQuiesced", fPowerQuiesced);
+    setProperty("MPRWakeMemoryEnabled", memoryEnabled);
+    setProperty("MPRWakeBusMasterEnabled", busMasterEnabled);
+    /* Config/event replies get a longer, bounded wait until the watchdog
+     * closes this window. It is opened before the rebuild so the discovery
+     * poll inside resetAndReinitialize() is covered too. */
+    fWakeSettleTicks = kMPRWakeSettleTicks;
+    bool ready = false;
+    const char *rebuildState = "skipped-no-pci";
+    if (pciReady) {
+        ready = resetAndReinitialize();
+        rebuildState = ready ? "ok" : "failed";
+    }
+    setProperty("MPRWakeRebuildState", rebuildState);
     /* The fabric needs a moment after the IOC reset on wake: the expander and
      * the disks renegotiate their links, and probing them immediately made the
      * first probe fail and cost an extra reset. */
@@ -4078,6 +4121,12 @@ MPRController::watchdogTimeout(IOTimerEventSource *sender)
 {
     if (fStopping) return;
     if (fResumeGraceTicks != 0) fResumeGraceTicks--;
+    /* The window must stay open for the whole wake rebuild: a long discovery
+     * can hold one PortEnable request for tens of seconds. It only starts
+     * counting down once the wake path has re-enabled acceptance. */
+    if (fWakeSettleTicks != 0 && !fSuspended && !fReinitInProgress)
+        fWakeSettleTicks--;
+    setProperty("MPRWakeSettleTicks", (unsigned long long)fWakeSettleTicks, 32);
     if (!fStarting && !fReinitInProgress && !fSuspended && fRegs != NULL &&
         fResumeGraceTicks == 0) {
         UInt32 state = readReg(MPI2_DOORBELL_OFFSET) & MPI2_IOC_STATE_MASK;

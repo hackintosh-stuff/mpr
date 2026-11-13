@@ -1,6 +1,6 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.20.9.
+Date: 2026-11-13. Driver version: 0.20.11.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
@@ -214,6 +214,11 @@ A config-page management timeout is a different condition: the IOC may still
 own the timed-out request frame, so `finishManagementRequest()` quarantines it
 and records a protocol fault that the worker recovers with one bounded IOC
 reset. That recovery is not a probe failure and is deliberately retained.
+During the wake settling window the config/event (SMIDs 1, 2 and 4) and
+PortEnable (SMID 3) reply budgets are extended to 8 s and 60 s respectively,
+so a slowly settling fabric does not create that fault in the first place.
+SCSI probes keep their 2 s budget, so a device that never answers still
+classifies as a definite failure.
 
 Timeout recovery attempts ABORT TASK, LUN RESET and TARGET RESET, each naming
 the handle recorded for the failed SMID, subject to available TMF credit and
@@ -247,22 +252,37 @@ after DMA stop is proved.
 
 Wake restores PCI access, rebuilds queues/events/topology, re-enumerates and
 re-probes every present target, then reopens acceptance; each medium takes
-OFFLINE -> ONLINE around that rebuild. The fabric needs a moment to settle, so
-the wake path waits 1.5 s after the IOC reset before probing and ignores a
-non-operational doorbell for four watchdog ticks, because after wake the IOC
-can report standby while it comes up. `fResumeGraceTicks` and that 1.5 s delay
-are retained.
+OFFLINE -> ONLINE around that rebuild. `resumePower()` always performs that
+rebuild. The PCI helper results and `fPowerQuiesced` are published as
+`MPRWakeMemoryEnabled`, `MPRWakeBusMasterEnabled` and `MPRWakeQuiesced`, but
+they never gate the rebuild: a quiesce that could not prove DMA stopped still
+leaves an IOC that must be put back into a known state. On this machine
+`setBusMasterEnable(true)` returns false after wake while the IOC is usable;
+gating on it used to skip the rebuild, so the worker's first SMID 4 config read
+timed out on an uninitialised IOC and forced a fault-driven reset. The outcome
+of the planned rebuild is published in `MPRWakeRebuildState`.
+
+`fWakeSettleTicks` (30 ticks) is opened before the rebuild and is only counted
+down by the watchdog once the wake path has re-enabled acceptance, so it stays
+open for a long discovery pass. `MPRWakeSettleTicks` reports it. While open,
+config/event replies get 8 s and PortEnable gets 60 s; PortEnable has been
+measured at 20-30 s on this expander, and the old 30 s ceiling turned a long
+sleep into a failed rebuild plus a second fault-driven reset. The fabric also
+needs a moment to settle, so the wake path waits 1.5 s after the IOC reset
+before probing and ignores a non-operational doorbell for four watchdog ticks.
+`fResumeGraceTicks` and that 1.5 s delay are retained.
 
 A target that answers NOT READY at the wake probe is left to the hotplug
 worker: `resumePower()` records `MPRWakeNotReadyCount` but does not invalidate
 every medium or force an extra IOC reset on that account. The worker owns the
 single retry budget and sets `MPRPowerState` to `on` when media recover, so a
-wake that needed recovery does not keep reporting `wake-recovery-pending`. A
-config-page management timeout during settling is still a protocol fault and
-still needs one bounded controller rebuild, as described in section 4; that is
-why a wake still increments `MPRResetCount` once. `systemWillShutdown` follows
-the same quiesce path. Sleep/wake and shutdown are qualified on the directly
-attached disk and with two targets behind the expander.
+wake that needed recovery does not keep reporting `wake-recovery-pending`.
+One planned rebuild per wake is mandatory after S3, so `MPRResetCount` grows by
+one; the control for "no extra reset" is that `MPRStickyFaultCount`,
+`MPRFaultRecoveries` and `MPRProtocolRecoveryPending` stay unchanged.
+`systemWillShutdown` follows the same quiesce path. Sleep/wake and shutdown are
+qualified on the directly attached disk and with two targets behind the
+expander.
 
 Stop waits for the I/O and completion workers outside the transport lock,
 then tears down DMA. Scheduler/transport locks remain alive until final
@@ -280,7 +300,7 @@ service release so callers retained before stop can unwind safely.
 | Capabilities | `MPRNativeFuaSupported`, `MPRFuaPolicy`, `MPRUnmapEnabled`, `MPRUnmapMaxLbaCount`, `MPRUnmapMaxDescriptors`, `MPRUnmapReadsZero` |
 | Recovery | `MPRHotplugState`, `MPRProbeRetries`, `MPRResetCount`, `MPRResetInitiator`, `MPRReinitState`, `MPRRecoveryState`, `MPRFaultRecoveries`, `MPRFaultRecoveryState`, `MPRDeviceOffline`, `MPRTmfHandle`, `MPRTmfResetStatus` |
 | Protocol | `MPRProtocolRecoveryPending`, `MPRProtocolFaultCode`, `MPRStickyFaultCount`, `MPRBadReplySite`, `MPREventAckQueued`, `MPREventAckFailed` |
-| Power | `MPRPowerState`, `MPRPowerFlushStatus`, `MPRPowerFlushCount`, `MPRStopDMAState`, `MPRWatchdogIOCState`, `MPRWakeNotReadyCount` |
+| Power | `MPRPowerState`, `MPRPowerFlushStatus`, `MPRPowerFlushCount`, `MPRStopDMAState`, `MPRWatchdogIOCState`, `MPRWakeNotReadyCount`, `MPRWakeQuiesced`, `MPRWakeMemoryEnabled`, `MPRWakeBusMasterEnabled`, `MPRWakeRebuildState`, `MPRWakeSettleTicks` |
 | Writes | `MPRWriteCount`, `MPRWriteBytes`, `MPRLastWriteLba`, `MPRLastWriteSmid`, `MPRTargetNWriteCount`, `MPRTargetNFailureCount` |
 
 A property saying "online" is not data-integrity evidence. Always pair it with

@@ -1,6 +1,6 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.20.9.
+Date: 2026-11-13. Driver version: 0.20.11.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes every eligible
@@ -51,14 +51,16 @@ long duration or concurrent stress, and throughput tuning are out of scope.
 Wire-format and large-LBA cases are checked on the host, not on this hardware.
 Sleep and wake with both targets attached was exercised: sleep flushes the
 writable target, and wake brings both media back at their own disk numbers in
-under 25 s with `MPRPowerState` back at `on`; the array member's LBA0 digest is
-unchanged. A disk that is still becoming ready is retried in place instead of
-being counted as a failed probe, so a slow spin-up cannot by itself escalate to
-an IOC reset. A wake still includes one bounded controller rebuild, and
-`MPRResetCount` grows by one: on this machine a config-page management timeout
-while the fabric settles needs that recovery, because the IOC may still own the
-timed-out request frame. Eliminating that last reset is outside the probe
-classification and is not claimed here.
+under 25 s with `MPRPowerState` back at `on`; the array member's leading 8 MiB
+digest is unchanged. A disk that is still becoming ready is retried in place
+instead of being counted as a failed probe, so a slow spin-up cannot by itself
+escalate to an IOC reset. The wake always rebuilds the controller before any
+topology read and gives config/event and PortEnable replies a bounded settling
+budget, so fabric settling no longer produces a config-page management timeout,
+a protocol fault or a fault-driven reset: `MPRStickyFaultCount` and
+`MPRFaultRecoveries` stay flat across a wake. One planned controller rebuild
+per wake remains mandatory after S3, so `MPRResetCount` still grows by one; no
+additional reset is taken.
 
 ## Capabilities
 
@@ -85,7 +87,9 @@ classification and is not claimed here.
   per-target retry budget: a device answering NOT READY, UNIT ATTENTION or BUSY
   is retried without consuming the failure budget or triggering an IOC reset.
 - Registered power states: per-target flush, then DMA stop for sleep and
-  shutdown; rebuild and per-target revalidation on wake.
+  shutdown; unconditional controller rebuild before the first topology read on
+  wake, with a watchdog-timed settling window for config/event and PortEnable
+  replies, then per-target revalidation.
 
 Implementation, memory ownership, locking and diagnostic details are in
 [DEBUG.md](DEBUG.md). Scope, reference baseline, milestone status and remaining
