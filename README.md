@@ -29,16 +29,17 @@ per-device write allowlist. Write accounting is per target, so each completed
 write is attributable to the device that received it.
 
 Pulling either disk while the other stays published was also exercised, with a
-read in flight on one target and with a write in flight on the other. The dropped target is retired with TARGET_RESET, a drain of its aborted
-commands and SAS IO Unit Control REMOVE_DEVICE, all naming that handle; its
-medium goes offline, the other target keeps serving I/O, and the request in
-flight fails with a device error instead of completing silently. A returned disk
-is re-probed and republished, matched by SAS address, so the same disk number
-comes back rather than a second medium for the same drive. Reinsertion behind
-this expander is not announced, so the driver spends at most two bounded IOC
-resets (8 s and 45 s after the removal) to re-run fabric discovery; each takes
-seconds to about 25 s, during which the other targets are briefly offline. The
-exFAT volume that was being written verified clean after the pull.
+read in flight on one target and with a write in flight on the other. The dropped
+target is retired with TARGET_RESET, a drain of its aborted commands and
+SAS IO Unit Control REMOVE_DEVICE, all naming that handle; its medium goes offline,
+the other target keeps serving I/O, and the request in flight fails with a device
+error instead of completing silently. A returned disk is re-probed and republished,
+matched by SAS address, so the same disk number comes back rather than a second
+medium for the same drive. Reinsertion behind this expander is not announced,
+so the driver spends at most two bounded IOC resets (8 s and 45 s after the removal)
+to re-run fabric discovery; each takes seconds to about 25 s, during which the other
+targets are briefly offline. The exFAT volume that was being written verified clean
+after the pull.
 
 Sleep and wake with both targets attached is exercised. Sleep flushes each
 published target; wake brings both media back at their own disk numbers in under
