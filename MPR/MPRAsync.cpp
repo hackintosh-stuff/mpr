@@ -50,7 +50,7 @@ struct MPRAsyncState {
     UInt64 sequence, turn, fence;
     UInt64 directBytes, copiedBytes;
     UInt32 outstanding, peak, mappedCommands, chainedCommands, bounceCommands;
-    UInt32 mapFailures, peakCommands, heldCommands;
+    UInt32 mapFailures, peakCommands, heldCommands, nativePrpCommands;
     UInt32 requestedSlots, slotCapacity, slotLimit;
     bool directEnabled, dmaBlocked;
     bool scheduled, completionsScheduled, accepting, stopping, barrier, released;
@@ -171,12 +171,12 @@ mprAllocateWindow(MPRAsyncWindow &window, IOMapper *mapper)
         window.chainsPrepared = window.chains->prepare() == kIOReturnSuccess;
     window.chainDma = IODMACommand::withSpecification(
         kIODMACommandOutputHost64, 63, kMPRChainStorageBytes,
-        IODMACommand::kMapped, kMPRChainStorageBytes, 16, mapper);
+        IODMACommand::kMapped, kMPRChainStorageBytes, 4096, mapper);
     bool chainsReady = window.chains && window.chainsPrepared &&
         window.chains->getBytesNoCopy() && window.chainDma &&
         window.chainDma->setMemoryDescriptor(window.chains) == kIOReturnSuccess &&
         mprSingleMapping(window.chainDma, kMPRChainStorageBytes, &window.chainAddress) &&
-        (window.chainAddress & 15) == 0;
+        (window.chainAddress & 4095) == 0;
     if (!chainsReady) {
         if (window.chainDma) {
             window.chainDma->clearMemoryDescriptor();
@@ -198,7 +198,7 @@ mprAllocateWindow(MPRAsyncWindow &window, IOMapper *mapper)
 static bool
 mprMapClient(MPRAsyncWindow &window, MPRAsyncRequest &job,
              UInt8 *frame, UInt32 frameBytes, UInt32 chainFrameBytes,
-             UInt32 maxChainDepth, MPRSglResult *result)
+             UInt32 maxChainDepth, bool nvme, MPRSglResult *result)
 {
     if (!window.dma ||
         window.dma->setMemoryDescriptor(job.buffer, false) != kIOReturnSuccess)
@@ -232,7 +232,11 @@ mprMapClient(MPRAsyncWindow &window, MPRAsyncRequest &job,
         }
     }
     UInt32 depth = maxChainDepth < kMPRChainLimit ? maxChainDepth : kMPRChainLimit;
-    if (mapped) mapped = mprBuildIeeeSgl(frame, frameBytes,
+    if (mapped && nvme) mapped = mprBuildNvmeSgl(frame, frameBytes,
+        MPR_SCSIIO_SGE_DWORDS * 4, segments, count, window.bytes,
+        window.chains ? (UInt8 *)window.chains->getBytesNoCopy() : NULL,
+        window.chainAddress, kMPRChainStorageBytes, result);
+    else if (mapped) mapped = mprBuildIeeeSgl(frame, frameBytes,
         MPR_SCSIIO_SGE_DWORDS * 4, segments, count, window.bytes,
         window.chains ? (UInt8 *)window.chains->getBytesNoCopy() : NULL,
         window.chainAddress, chainFrameBytes, depth,
@@ -395,6 +399,8 @@ MPRController::publishAsyncStats(void)
     UInt32 peakCommands = state->peakCommands, direct = state->mappedCommands;
     UInt32 chained = state->chainedCommands, bounce = state->bounceCommands;
     UInt32 failures = state->mapFailures, held = state->heldCommands;
+    UInt32 nativePrp = state->nativePrpCommands;
+    UInt32 nvmeDsm = fNvmeDsmCommands;
     IOLockLock(state->lock);
     UInt32 peak = state->peak, outstanding = state->outstanding;
     IOLockUnlock(state->lock);
@@ -411,6 +417,8 @@ MPRController::publishAsyncStats(void)
     MPR_DEBUG_PROP("MPRBounceCommands", (unsigned long long)bounce, 32);
     MPR_DEBUG_PROP("MPRDirectMapFailures", (unsigned long long)failures, 32);
     MPR_DEBUG_PROP("MPRAsyncHeldDMA", (unsigned long long)held, 32);
+    MPR_DEBUG_PROP("MPRNativePrpCommands", (unsigned long long)nativePrp, 32);
+    MPR_DEBUG_PROP("MPRNvmeDsmCommands", (unsigned long long)nvmeDsm, 32);
 }
 
 void
@@ -730,8 +738,14 @@ MPRController::asyncWorker(void)
                 continue;
             }
             UInt64 remaining = job->total - job->issued;
-            UInt32 blocks = (UInt32)((remaining < kMPRAsyncBytes ?
-                                     remaining : kMPRAsyncBytes) / blockSize);
+            UInt32 limit = kMPRAsyncBytes;
+            const bool nvme = slot->kind == kMPRTargetNvme;
+            if (nvme) {
+                if (slot->maxTransferBytes && slot->maxTransferBytes < limit)
+                    limit = slot->maxTransferBytes;
+                if (!window.chains && limit > 16384) limit = 16384;
+            }
+            UInt32 blocks = (UInt32)((remaining < limit ? remaining : limit) / blockSize);
             if (!blocks || !fRequestBuffer || !fRequestBuffer->getBytesNoCopy() ||
                 fRequestFrameSize < MPR_SCSIIO_SGE_DWORDS * 4 + 16 ||
                 !prepareScsiSense(smid)) {
@@ -770,13 +784,30 @@ MPRController::asyncWorker(void)
             memcpy(request->CDB, cdb, cdbLength);
             MPRSglResult sgl = {};
             if (state->directEnabled && mprMapClient(window, *job, frame,
-                    fRequestFrameSize, fChainFrameBytes, fMaxChainDepth, &sgl)) {
+                    fRequestFrameSize, fChainFrameBytes, fMaxChainDepth, nvme, &sgl)) {
                 request->ChainOffset = sgl.requestChainOffset;
             } else {
                 if (state->directEnabled) ++state->mapFailures;
                 request->ChainOffset = 0;
-                mprSglElement(frame + MPR_SCSIIO_SGE_DWORDS * 4,
-                    window.bounceAddress, window.bytes, 0, 0x40);
+                if (nvme) {
+                    MPRDmaSegment segment = {window.bounceAddress, window.bytes};
+                    if (!mprBuildNvmeSgl(frame, fRequestFrameSize,
+                        MPR_SCSIIO_SGE_DWORDS * 4, &segment, 1, window.bytes,
+                        window.chains ? (UInt8 *)window.chains->getBytesNoCopy() : NULL,
+                        window.chainAddress, kMPRChainStorageBytes, &sgl) ||
+                        (sgl.chainsUsed && (!window.chainDma ||
+                         window.chainDma->synchronize(kIODirectionOut) != kIOReturnSuccess))) {
+                        cancelUnpostedCommand(smid);
+                        job->status = kIOReturnNoResources;
+                        MPR_DEBUG_LOG("MPR: NVMe mapped fallback/PRP unavailable handle=0x%04x bytes=%u\n",
+                                      job->devHandle, (unsigned)window.bytes);
+                        progress = true;
+                        continue;
+                    }
+                } else {
+                    mprSglElement(frame + MPR_SCSIIO_SGE_DWORDS * 4,
+                        window.bounceAddress, window.bytes, 0, 0x40);
+                }
                 if (job->write) {
                     IOByteCount copied = job->buffer->readBytes(
                         (IOByteCount)window.offset, window.bounce->getBytesNoCopy(),
@@ -802,6 +833,7 @@ MPRController::asyncWorker(void)
             }
             window.request = job;
             window.posted = true;
+            if (nvme && sgl.chainsUsed && !sgl.requestChainOffset) ++state->nativePrpCommands;
             if (window.direct) {
                 ++state->mappedCommands;
                 state->directBytes += window.bytes;

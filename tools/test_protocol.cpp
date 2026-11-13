@@ -12,6 +12,7 @@
 #include "../MPR/MPRCompletion.h"
 #include "../MPR/MPRDmaSgl.h"
 #include "../MPR/MPRPerformance.h"
+#include "../MPR/MPI/mpi26_devices.h"
 
 #include <algorithm>
 #include <array>
@@ -439,8 +440,82 @@ static void performanceLimitTests()
     CHECK(mprCompletedPrefix(UINT64_MAX, UINT64_MAX) == UINT64_MAX);
 }
 
+static void nvmePrpTests()
+{
+    CHECK(sizeof(MPRNvmeEncapRequest) == 96);
+    CHECK(sizeof(MPRNvmeEncapReply) == 24);
+    CHECK(offsetof(MPRNvmeEncapRequest, ErrorResponseBaseAddress) == 16);
+    CHECK(offsetof(MPRNvmeEncapRequest, DataLength) == 28);
+    CHECK(offsetof(MPRNvmeEncapReply, ErrorResponseCount) == 20);
+    CHECK(MPI2_FUNCTION_NVME_ENCAPSULATED == 0x33);
+    CHECK(MPI26_RPY_DESCRIPT_FLAGS_PCIE_ENCAPSULATED_SUCCESS == 8);
+    std::vector<uint8_t> frame(128, 0xA7), prp(4096, 0xB6);
+    MPRSglResult result = {};
+    MPRDmaSegment small = {0x100000, 512};
+    CHECK(mprBuildNvmeSgl(frame.data(), frame.size(), 96, &small, 1, 512,
+                           nullptr, 0, 0, &result));
+    CHECK(!result.chainsUsed && !result.requestChainOffset && frame[111] == 0x40);
+    CHECK(readLittle(frame.data() + 96, 8) == small.address);
+    CHECK(prp[0] == 0xB6);
+    const uint64_t listAddress = UINT64_C(0x12345000);
+    const uint32_t offsets[] = {0, 1, 511, 512, 2047, 4095};
+    for (uint32_t offset : offsets) {
+        std::vector<MPRDmaSegment> segments;
+        std::vector<uint64_t> pages;
+        uint32_t left = 65536;
+        for (uint32_t i = 0; left; ++i) {
+            uint64_t address = UINT64_C(0x100000000) + (uint64_t)i * 0x3000;
+            if (!i) address += offset;
+            uint32_t bytes = std::min(left, 4096U - (uint32_t)(address & 4095));
+            pages.push_back(address);
+            // Split each physical page into contiguous subsegments. The PRP
+            // decoder must reconstruct pages, not blindly list DMA segments.
+            uint32_t first = std::min(bytes, 137U);
+            segments.push_back({address, first});
+            if (first < bytes) segments.push_back({address + first, bytes - first});
+            left -= bytes;
+        }
+        CHECK(mprBuildNvmeSgl(frame.data(), frame.size(), 96,
+            segments.data(), segments.size(), 65536, prp.data(), listAddress, prp.size(), &result));
+        CHECK(result.chainsUsed == 1 && result.requestChainOffset == 0);
+        CHECK(readLittle(frame.data() + 96, 8) == pages[0]);
+        CHECK(readLittle(frame.data() + 104, 4) == 4096 - offset);
+        CHECK(frame[111] == 0 && frame[126] == 0 && frame[127] == 0x88);
+        CHECK(readLittle(frame.data() + 112, 8) == listAddress);
+        CHECK(readLittle(frame.data() + 120, 4) == (pages.size() - 1) * 8);
+        for (unsigned i = 1; i < pages.size(); ++i)
+            CHECK(readLittle(prp.data() + (i - 1) * 8, 8) == pages[i]);
+        std::fill(frame.begin(), frame.end(), 0xA7);
+        std::fill(prp.begin(), prp.end(), 0xB6);
+        CHECK(!mprBuildNvmeSgl(frame.data(), frame.size(), 96,
+            segments.data(), segments.size(), 65536, prp.data(), listAddress + 8, prp.size(), &result));
+        CHECK(std::all_of(frame.begin(), frame.end(), [](uint8_t v) { return v == 0xA7; }));
+        CHECK(std::all_of(prp.begin(), prp.end(), [](uint8_t v) { return v == 0xB6; }));
+        segments[1].address += 1; // mid-page hole or unaligned second page
+        CHECK(!mprBuildNvmeSgl(frame.data(), frame.size(), 96,
+            segments.data(), segments.size(), 65536, prp.data(), listAddress, prp.size(), &result));
+        CHECK(std::all_of(frame.begin(), frame.end(), [](uint8_t v) { return v == 0xA7; }));
+        CHECK(std::all_of(prp.begin(), prp.end(), [](uint8_t v) { return v == 0xB6; }));
+    }
+    MPRDmaSegment large = {0x100123, 65536};
+    CHECK(mprBuildNvmeSgl(frame.data(), frame.size(), 96, &large, 1, 65536,
+                           prp.data(), listAddress, prp.size(), &result));
+    CHECK(readLittle(prp.data(), 8) == 0x101000);
+    CHECK(readLittle(prp.data() + 15 * 8, 8) == 0x110000);
+    CHECK(!mprBuildNvmeSgl(frame.data(), 127, 96, &large, 1, 65536,
+                            prp.data(), listAddress, prp.size(), &result));
+    CHECK(!mprBuildNvmeSgl(frame.data(), frame.size(), 96, &large, 1, 65535,
+                            prp.data(), listAddress, prp.size(), &result));
+    CHECK(!mprBuildNvmeSgl(frame.data(), frame.size(), 96, &large, 1, 65536,
+                            prp.data(), listAddress, 4095, &result));
+    large = {UINT64_C(0x7ffffffffffff000), 65536};
+    CHECK(!mprBuildNvmeSgl(frame.data(), frame.size(), 96, &large, 1, 65536,
+                            prp.data(), listAddress, prp.size(), &result));
+}
+
 int main()
 {
+    nvmePrpTests();
     performanceLimitTests();
     cdbTests();
     vpdAndRaidTests();

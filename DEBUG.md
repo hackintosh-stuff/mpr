@@ -1,18 +1,67 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.22.0.
+Date: 2026-11-13. Driver version: 0.23.0.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
 remaining work are in [PLAN.md](PLAN.md). Diagnostic output is opt-in; see
-section 7. The current data path is built natively with the Command Line Tools,
-linked and signed ad hoc. On one target it is qualified for read-only block I/O, a
-small write/flush cycle and two sleep/wake cycles. That evidence belongs to
-0.21.0, which is still the build loaded from the internal ESP; 0.22.0 changes only
-the PCI ID match table, adds `MPRChipName` and renames the block-device info
-string, and has been built and link-checked but not run. The UNMAP, removal,
-reinsertion and shutdown observations in this document were made with an earlier
-build and remain a regression baseline.
+section 7. Version 0.23.0 is source-implemented and checked with host regressions
+and cross-compilation; there is no new native link/sign/load or hardware result.
+The runtime measurements retained below belong to 0.21.0 and the older baseline,
+not this version or the newly matched families.
+
+## Controller families and target kinds
+
+`mpr_pci.c` supplies all 29 exact PCI IDs and GEN35/SEA classification; four
+INVALID0/INVALID1 SEA entries are rejected in probe and start. IOC Facts chooses
+MPI 2.5/2.6 and NVMe capability. SEA uses at most three register reads when zero
+is returned (`mprvar.h::mpr_regread`), and atomic request posting only when
+IOC Facts advertises it (`mpr.c::mpr_enqueue_request`). Other controllers keep
+the paired low/high descriptor writes. MMIO is selected from the first usable
+memory BAR, skipping I/O BARs and 64-bit upper halves, rather than assuming BAR1.
+A PCIe-only personality may omit SAS IO Unit Page0; only INVALID_PAGE with
+NVMe capability permits that fallback, not a transport or malformed-page error.
+
+Standard and extended config reads share the checked two-stage header/data
+reader. RAID Volume Pages 0/1 provide state and WWID; PCIe Device Pages 0/2
+provide identity, access flags, MDTS and reset timeout. Eligible IR volumes are
+published separately from their hidden members/spares. Target identity is
+`(kind, WWID)` across SAS/SATA, RAID-volume and PCIe-NVMe namespaces, with 64
+bounded slots. Removal checks all enabled namespaces before resetting/removing
+a handle; unreadable identity is not permission to reset a different device.
+RAID volumes never receive SAS REMOVE_DEVICE, and member ownership suppresses
+physical target reset/remove while original command completions are drained.
+
+Ordinary NVMe I/O remains SCSI_IO_REQUEST, as in `mprsas_action_scsiio`. Large or
+fragmented mappings use the first IEEE simple element plus a native PRP chain
+(`mpr_check_pcie_native_sgl`). PRP lists describe device-visible page addresses,
+validate page boundaries before writing and use ChainOffset zero; per-window
+4 KiB mapped storage is synchronized and retained until completion/DMA-stop.
+The 64 KiB window needs at most 16 PRP entries. Unrepresentable client mappings
+use the same checked path through private staging. Async windows honor MDTS;
+small inline IEEE lists can be translated by firmware. Synchronous commands
+have 32 resident 4 KiB PRP pages appended to the request pool on NVMe-capable
+controllers; their lifetime is the pool's existing DMA-safe lifetime.
+
+Advertised UNMAP becomes native NVMe DSM for LUN zero / namespace one
+(`mprsas_build_nvme_unmap`). Its descriptors occupy SMID 30's resident page;
+packed MPI structures have compile-time offset/size checks. PCIe success replies
+are accepted only for an outstanding NVMe encapsulated command; address replies
+validate handle, command length, IOC status and bounded NVMe completion data.
+A timed-out DSM is never replayed. PCIe target reset uses the protocol-level
+flag and the Page 2 reset timeout, with a 15-second minimum.
+
+PCIe topology event lengths/counts are checked before rescanning; enumeration
+completion triggers reconciliation, not an in-progress enumeration. Ordinary
+PCIe status notifications are not treated as hotplug. Existing periodic scans
+remain the fallback for missed events.
+
+Opt-in diagnostics include `MPRNegotiatedMPI`, `MPRGen35`, `MPRSeaIOC`,
+`MPRAtomicRequests`, `MPRNvmeProtocol`, `MPRRaidVolumeCount`, `MPRNvmeTargetCount`,
+`MPRTargetNKind`, `MPRTargetNMDTS`, `MPRTargetNResetTimeoutSeconds`,
+`MPRNativePrpCommands` and `MPRNvmeDsmCommands`. Logs identify refusal/skip,
+config failure, identity changes, TMF flags/timeouts and DSM failures. Successful
+I/O is counted, not printed per command; everything uses `mpr_debug=1`.
 
 ## 1. Concurrency and ordering
 
@@ -106,7 +155,7 @@ window's chain storage would fall back to the private staging buffer and be
 counted as a mapping failure instead. An unrepresentable
 mapping uses the private contiguous resident staging window. At maximum depth,
 the fallback payload pool is 2 MiB and chain storage is at most 128 KiB, plus
-mapping/request metadata and the unchanged synchronous/probe pools. These
+mapping/request metadata and the synchronous/probe pools (plus 128 KiB of resident PRP pages on NVMe-capable controllers). These
 buffers are allocated during initialization, not on the completion hot path.
 
 Asynchronous commands use SMIDs 32-63. SMIDs 1-9 remain management/probes,
@@ -163,8 +212,9 @@ candidates with `MPI2_SAS_DEVICE_INFO_SEP` are excluded from both the disk
 count and the standalone-target count. Without this exclusion an enclosure
 processor counts as a disk and is probed as if it were one.
 
-On IR-capable firmware, RAID Configuration Page 0 is enumerated to exclude
-volumes, member disks, hot spares and expansion members. Configuration
+On IR-capable firmware, RAID Configuration Page 0 excludes members, hot spares
+and expansion members from physical-disk publication. RAID Volume Pages 0/1
+separately enumerate usable logical volumes. Configuration
 transport failures or malformed pages fail closed. IR change events retire
 the old eligibility decision.
 
@@ -175,7 +225,7 @@ and compares a fresh probe against them. A change of identity, block count or
 block size advances that slot's generation, so I/O and cache commands accepted
 for the old medium fail instead of reaching the replacement.
 
-A snapshot is matched to the table by SAS address first, then by DevHandle. After
+A snapshot is matched by target kind plus WWID first, then by DevHandle. After
 a controller reset the IOC can hand one device a different handle and can swap
 two devices' handles; matching by handle first would then publish one disk twice
 and orphan the other's medium. A handle that moved for the same SAS address is
@@ -455,23 +505,20 @@ names are not macOS requirements.
 | SCSI data contract | `mprsas_action_scsiio` plus CAM disk policy | READ/WRITE(10)/(16), exact block transfers, bounded sense, SYNC(10)/(16), FUA fallback |
 | Thin provisioning | CAM disk and UNMAP policy | B0/B2 capability probe, input validation, bounded descriptor and block batching |
 | Discovery | SAS config pages and discovery events | GET_NEXT_HANDLE enumeration merged into a per-handle table; SEP/SES devices excluded; every eligible target published |
-| IR membership protection | IR config handling, RAID_COMPONENT filtering | RAID Configuration Page0 enumeration; volumes, members, spares and expansion disks refused |
+| IR membership protection | IR config handling, RAID_COMPONENT filtering | RAID Configuration Page0 hides physical members/spares; Volume Pages0/1 publish usable logical volumes |
 | Persistent identity | SATA IDENTIFY, SCSI identifiers | Per-target ATA model+serial or validated VPD identifier, capacity/block-size comparison, per-target media generations |
 | Target removal | `mprsas_prepare_remove`, `mprsas_remove_device` | Per-target guarded TARGET_RESET/drain/REMOVE_DEVICE naming the removed handle, with handle-reuse checks and bounded fallback |
 | Recovery | abort/LUN/target/IOC reset and watchdog | TMF escalation for the failed command's handle, ownership proof, no replay of uncertain writes, IOC state monitoring |
 | Sleep and shutdown | FreeBSD suspend/resume return EINVAL; separate shutdown path | Native IOKit PM with per-target flush and wake revalidation |
 | Builds | OS-specific build system | All driver translation units in the CLI and Xcode builds |
 
-Beyond the mechanisms above, the FreeBSD identifier table also matches the
-SAS3108 RAID controllers, the MPI 2.6 tri-mode family and the GEN35/SEA parts.
-This driver matches only the MPI 2.5 HBA pair, `0x0097` (SAS3008, the verified
-part) and `0x0096` (SAS3004): it implements neither RAID volume publication nor
-NVMe encapsulated requests, so the wider identifiers would bind controllers it
-cannot serve (PLAN section 1.3). `MPRChipName` reports which entry bound, and the
-probe log line records whether that entry has hardware evidence.
+The PCI/generation, IR and NVMe implementation now covers the exact families in
+the pinned FreeBSD table; the source mechanisms and diagnostics are described
+above. This does not add SAS2/mps or unrelated MegaRAID/mrsas support, and it does
+not claim hardware qualification beyond the earlier SAS3008 observations.
 
 Sleep and wake, physical pull and pulls with I/O in flight have earlier
-qualification evidence with two targets behind this expander; the current source
+qualification evidence with two targets behind this expander; the 0.21.0 baseline
 re-ran sleep and wake only, so those two-target regressions are still owed. Scope
 limits are in PLAN section 1.3. Hardware multi-queue/MSI-X scaling remains
 unimplemented. Direct client DMA, ready-first refill and batched reply retirement
@@ -492,8 +539,9 @@ coverage includes requested-depth clamping, insufficient credits/queue entries,
 SMID separation and reset-time lower limits, signed wide-arithmetic resource
 oracles, and all completion permutations for a partially failing four-chunk
 request. The suite is built with ASan/UBSan at `-O1 -Wall -Wextra -Werror` on
-the target system's compiler and passes 158,638 assertions over its 2,000
-deterministic SGL cases. It does not simulate IOKit mapping, IRQ interleaving or
+WSL GCC and passes 158,829 assertions over its 2,000
+deterministic SGL cases, including native PRP boundaries and MPI NVMe wire layouts.
+It does not simulate IOKit mapping, IRQ interleaving or
 real DMA-stop evidence.
 
 `tools/validate-build-inputs.py` checks LF text, plist/runtime/CLI/Xcode version
@@ -504,7 +552,7 @@ not a C++ compilation or a kernel ABI/link validation.
 `tools/build-noxcode.sh` compiles the four translation units with the
 MacKernelSDK headers, links them with `ld -kext`, checks the kmod entry points
 and bundle type, rejects unresolved driver-internal symbols and signs the bundle
-ad hoc. The resulting kext is what the test machine loads from the ESP. Every
+ad hoc. The earlier 0.21.0 resulting kext supplied the recorded ESP measurements. Every
 symbol it leaves undefined was checked against the kernel collections on that
 machine; `___chkstk_darwin` is the only one not listed there, and the same
 reference was present in the previously qualified build. The Xcode project entry

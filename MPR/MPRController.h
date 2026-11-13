@@ -102,9 +102,14 @@ enum {
  * address, not a disk: it can name a different device after a replug, so each
  * slot also carries the SAS address, stable identity and medium generation it
  * was probed for. Every published target is writable. */
-enum { kMPRMaxTargets = 8 };
-struct MPRTargetSlot
-{
+enum { kMPRMaxTargets = 64 };
+enum MPRTargetKind { kMPRTargetSas, kMPRTargetRaidVolume, kMPRTargetNvme };
+
+struct MPRTargetSlot {
+    MPRTargetKind kind;
+    UInt32 maxTransferBytes;
+    UInt8 resetTimeoutSeconds;
+    bool hiddenByRaid;
     UInt16 handle;
     UInt32 deviceInfo;
     UInt16 flags;
@@ -155,6 +160,10 @@ private:
     /* Bounded asynchronous scheduler. Client DMA, fallback buffers and SMIDs
      * are independent of the synchronous management/probe staging area. */
     MPRAsyncState    *fAsync;
+    UInt8 fChipFlags;
+    UInt16 fMpiVersion;
+    bool fNvmeProtocol, fAtomicRequests;
+    UInt32 fNvmeDsmCommands;
     UInt32           fMaxChainDepth;
     UInt32           fChainFrameBytes;
     bool             fPowerQuiesced;
@@ -467,7 +476,17 @@ private:
 
     bool   readExtConfigPage(UInt8 extPageType, UInt32 pageAddress,
                              UInt8 *buffer, UInt32 bufferBytes,
-                             UInt32 *actualBytes, UInt16 *iocStatus = NULL);
+                             UInt32 *actualBytes, UInt16 *iocStatus = NULL,
+                             UInt8 pageNumber = 0);
+    bool   readConfigPage(UInt8 pageType, UInt8 extPageType, UInt8 pageNumber,
+                          UInt32 pageAddress, UInt8 *buffer, UInt32 bufferBytes,
+                          UInt32 *actualBytes, UInt16 *iocStatus = NULL);
+    bool   mergeTarget(MPRTargetKind kind, UInt16 handle, UInt64 address,
+                        UInt32 info, UInt16 flags, UInt32 token,
+                        UInt32 maxTransfer = 0, UInt8 resetTimeout = 0);
+    bool   scanAdditionalTargets(UInt32 token, UInt32 *selected);
+    bool   readAdditionalTarget(MPRTargetSlot *slot, bool *present, UInt64 *address);
+    bool   checkOtherTargetKinds(UInt16 handle, MPRTargetKind expected, bool *occupied);
     bool   readSasIOUnitPage0(void);
     bool   readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo = NULL);
     bool   discoverTopology(void);
@@ -552,6 +571,8 @@ private:
                                   bool barrier);
     IOReturn scsiUnmap(const IOBlockStorageDeviceExtent *extents,
                        UInt32 extentsCount, UInt32 smid);
+    IOReturn issueNvmeDsm(const IOBlockStorageDeviceExtent *extents,
+                          UInt32 count, UInt32 smid);
     bool   sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid,
                         UInt16 handle, UInt16 *iocStatus = NULL);
     bool   recoverTimedOutCommand(UInt32 smid);

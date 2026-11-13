@@ -25,7 +25,7 @@ static inline uint32_t mprConfiguredCommandDepth(int requested)
 {
     if (requested <= 0) return kMPRAsyncMaxCommands;
     return (uint32_t)requested < kMPRAsyncMaxCommands ?
-           (uint32_t)requested : kMPRAsyncMaxCommands;
+           (uint32_t)requested : (uint32_t)kMPRAsyncMaxCommands;
 }
 
 /* Conservatively reserve all low SMIDs/credits, plus reply capacity for
@@ -41,7 +41,7 @@ mprAsyncCommandLimit(uint32_t allocated, uint32_t requestCount,
         postDepth <= kMPRReplyReserve + 1 ||
         freeDepth <= kMPRReplyReserve + 1) return 0;
     uint32_t limit = allocated < kMPRAsyncMaxCommands ?
-                     allocated : kMPRAsyncMaxCommands;
+                     allocated : (uint32_t)kMPRAsyncMaxCommands;
     const uint32_t bounds[] = {
         requestCount - kMPRAsyncFirstSmid,
         requestCredit - kMPRAsyncFirstSmid,

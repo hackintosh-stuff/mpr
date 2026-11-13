@@ -1,11 +1,13 @@
-# PLAN — Fusion-MPT SAS3 (SAS3004/SAS3008) driver for macOS
+# PLAN — Fusion-MPT SAS3 / Tri-Mode driver for macOS
 
-Status: source 0.22.0 (2026-11-13). 0.22.0 only widens the PCI ID match table to
-the SAS3004, adds `MPRChipName` and renames the block-device info string; it is
-built and link-checked, not deployed. Every runtime result here belongs to 0.21.0,
-which the test machine still loads.
+Status: source 0.23.0 (2026-11-13). The exact FreeBSD PCI table, MPI 2.6,
+GEN35/SEA, IR volume and PCIe NVMe paths are implemented. This source-only change
+has host protocol and cross-compilation evidence, not native link/sign/load or
+new hardware evidence. All runtime results and completed milestones retained
+below belong to the documented 0.21.0/earlier SAS3008 baseline. No deployment or
+running-version inspection was performed for this change.
 
-State: client-buffer DMA, a credit-bounded command pool, harvest-and-refill on
+Recorded 0.21.0 baseline: client-buffer DMA, a credit-bounded command pool, harvest-and-refill on
 completion, and batched single-ring reply retirement with event wakeups are
 implemented and build natively with the Command Line Tools. On one target that
 build is qualified for read-only correctness, boundary and error paths, command
@@ -26,11 +28,12 @@ diagnostics are in [DEBUG.md](DEBUG.md).
 
 ### 1.1 Target hardware and platform
 
-- HBA: Broadcom/Avago Fusion-MPT SAS3, MPI 2.5, 12 Gb/s. Matched PCI IDs:
-  `0x1000:0x0097` (SAS3008, the only part run on hardware) and `0x1000:0x0096`
-  (SAS3004, the same IOC generation with four phys). The test machine carries a
-  SAS3008 with firmware `09.00.00.00` and `IOCCapabilities` reporting
-  `INTEGRATED_RAID`.
+- Controllers: exact FreeBSD `mpr_pci.c` SAS3004/3008, Fusion-MPT SAS3108
+  variants, SAS32xx/33xx, GEN35 and configured/hard-secure SEA IDs (29 recognized,
+  25 attachable; four non-secure SEA IDs refused). The README hardware table
+  contains the exact device IDs. IOC Facts selects MPI 2.5/2.6; newly supported
+  families are not hardware-qualified. Recorded hardware evidence is SAS3008
+  firmware `09.00.00.00`, reporting `INTEGRATED_RAID` without an array.
 - Current configuration: one SATA SSD, PCCOOLER SSD T200 240 GB
   (468,862,128 × 512 B), as the terminal disk behind an Adaptec AEC-82885T
   expander and one backplane. The exFAT volume `testdisk` on it carries the
@@ -53,7 +56,8 @@ capacity, current device node), never a remembered `diskN`.
 1. A purpose-built `IOService` (provider = `IOPCIDevice`) that implements the HBA:
    PCI enable, BAR mapping, IOC reset and initialization, queues, interrupts,
    event subscription and acknowledgement.
-2. Every eligible independent disk (STP/SATA or SSP) published through the system
+2. Eligible SAS/SATA disks, IR logical volumes and PCIe NVMe LUN-0 targets (up to
+   64 typed target slots) published through the system
    `IOBlockStorageDriver` as its own whole-disk `IOMedia`, with per-target
    identity, geometry and medium lifetime; every published target is writable and
    writes are counted per target.
@@ -65,14 +69,12 @@ capacity, current device node), never a remembered `diskN`.
 
 ### 1.3 Out of scope
 
-- IR/RAID logical volumes and their member management, SES enclosure services,
-  SMP passthrough, firmware update, booting from this driver's disks.
-- The IR-capable SAS3108 PCI IDs (`0x0090`/`0x0091`/`0x0094`/`0x0095`). FreeBSD's
-  `mpr` enumerates their RAID volumes as disks; this driver refuses volumes and
-  their members, so matching them would only bind a controller whose disks cannot
-  be published.
-- Multiple LUNs, multipath, and hardware verification of writes to SAS/SSP disks.
-- NVMe/PCIe/Tri-Mode, SAS2 (`mps`/`0x0072`), the GEN35/SEA branches.
+- RAID creation/reconfiguration, raw member/spare access, SES enclosure services,
+  SMP passthrough, firmware update and booting from this driver's disks.
+- Multiple LUNs / additional NVMe namespaces, multipath, SAS2 (`mps`/`0x0072`)
+  and unrelated MegaRAID (`mrsas`) IDs; SEA non-secure modes are refused.
+- Hardware qualification of newly matched controllers, RAID volumes and PCIe
+  NVMe paths is not established by host checks or object cross-compilation.
 - Apple Silicon, dext/DriverKit, multi-queue/MSI-X expansion, a FreeBSD user
   ioctl compatibility layer.
 - Subclassing `IOSCSIParallelInterfaceController` (route B in §3); kept only as a
@@ -82,7 +84,7 @@ capacity, current device node), never a remembered `diskN`.
 
 | Item | Content |
 |---|---|
-| FreeBSD reference | `freebsd/freebsd-src` `main` at `e56090afb68b6c036d6b54c7b66d762d98bd96d0` (2026-11-10): `sys/dev/mpr/` and `mpi/`, 13 files each; BSD-2-Clause |
+| FreeBSD reference | `freebsd/freebsd-src` `main` at `e56090afb68b6c036d6b54c7b66d762d98bd96d0` (2026-11-10): `sys/dev/mpr/` and `mpi/`, 13 files each; driver BSD-2-Clause, MPI headers Broadcom three-clause terms |
 | Linux reference | `torvalds/linux` `master` at `b3dfbde62cf1981c4638939c159dfd087b7a72e9` (2026-11-10): `drivers/scsi/mpt3sas/` 16 files plus `mpi/` 10 files; GPL-2.0, behaviour reference only |
 | MacKernelSDK | submodule at `3f750085caa17ec3a7880f11c11bf4f48cd6a164` (2026-09-23): macOS 11 / Xcode 12.0 SDK headers with `xnu-8019.80.24` additions |
 | Apple OSS | `apple-oss-distributions/IOSCSIParallelFamily` at `560f74ab0c6f5d9aa6c99675d8e95986b202144d`, APSL 2.0; read-only reference, not part of the build |
@@ -96,7 +98,7 @@ mpr/
   README.md  DEBUG.md  PLAN.md  AGENTS.md  NOTICE
   MPR/                               (MPRController, MPRBlockDev, MPRAsync, MPRTarget,
                                       MPRCompletion.h, MPRDmaSgl.h, MPRPerformance.h,
-                                      MPRScsi.h, MPI/mpi2_min.h, MPI/mpi2_target.h,
+                                      MPRScsi.h, MPI/mpi2_min.h, MPI/mpi2_target.h, MPI/mpi26_devices.h,
                                       Info.plist)
   MPR.xcodeproj/                     (project entry point)
   tools/build-noxcode.sh             (Command Line Tools build entry point)
@@ -132,10 +134,10 @@ suspend/resume returns `EINVAL`, so the power path has to be written here.
 
 ## 4. Capabilities and boundaries
 
-The status column says which build the evidence belongs to. *Current* means the
-data path as shipped, measured on one target with 0.21.0 (0.22.0 changes matching
-only). *Baseline* means an earlier build; it is regression coverage only.
-*Implemented* means the code exists without hardware evidence.
+The status column separates source implementation from recorded hardware
+measurements. *Current* in the retained baseline rows means the 0.21.0 measurement
+set, not a load-test of 0.23.0. *Baseline* means an earlier build. *Implemented*
+means code exists without new hardware evidence.
 
 | Capability | Status | Boundary |
 |---|---|---|
@@ -145,12 +147,13 @@ only). *Baseline* means an earlier build; it is regression coverage only.
 | Block I/O and cache commands | Current | READ/WRITE(10)/(16), RC10/16, TUR, INQUIRY, SYNC(10)/(16), FUA with an ordered-flush fallback |
 | UNMAP | Implemented; qualified on the baseline build only | enabled after a B0/B2 probe, split to the reported limits, never extended beyond the caller's range |
 | Discovery and identity | Current, one target | every eligible target enters the target table and gets its own probe/nub; a handle is only a firmware address, and reuse is decided by SAS address and stable identity |
-| IR member filtering | Implemented, not verified on an array | volumes, member disks, hot spares and expansion members are refused; the firmware reports IR capability but no volume exists to test against |
+| IR member filtering | Implemented, not verified on an array | usable logical volumes are published; member disks, hot spares and expansion members are hidden; the firmware reports IR capability but no volume exists to test against |
 | Removal and recovery | Implemented; removal is baseline, TMF escalation is current | per-target TARGET_RESET → drain → REMOVE_DEVICE, all naming that slot's handle; §6 records the expander side effect of a delivered TMF |
 | Hotplug and media lifecycle | Baseline only | a pulled disk goes offline while the other target keeps serving; reinsert needs PortEnable rediscovery (two bounded resets at 8 s and 45 s, during which the other target drops out); the slot is reused by SAS address so the disk number stays |
 | Sleep/wake and shutdown | Sleep/wake current (two cycles, one target); shutdown baseline only | every published target is flushed before sleep; wake rebuilds the controller before the first topology read, gives config/event and PortEnable replies a watchdog-timed settling window, and brings media back with the same disk number; one planned rebuild per wake (`MPRResetCount` +1) with the sticky/fault counters unchanged |
 | Diagnostic gate | Implemented | kernel log lines and every IORegistry property are silent by default; `mpr_debug=1` enables both, including the init/probe/start phase |
-| Multi-LUN, multipath, SES/SMP, NVMe/Tri-Mode | Not implemented | see §1.3 |
+| MPI2.6 / GEN35 / SEA / IR volumes / PCIe NVMe | Implemented, hardware unverified | exact IDs/security gate, typed discovery, bounded PRP, native DSM, PCIe reset/event paths; see README and DEBUG |
+| Multi-LUN, multipath, SES/SMP | Not implemented | see §1.3 |
 
 ## 5. Milestone status
 
@@ -161,10 +164,10 @@ only). *Baseline* means an earlier build; it is regression coverage only.
 | M2 interrupts, replies and events | interrupt-driven replies, reply-frame retirement, per-command dispatch, EventMasks/ACK, PortEnable | done; the retirement path is covered by long runs, wrap count was never counted separately |
 | M3 single-disk read-only | independent-disk discovery, identity and capacity, read-only nub, large sequential read consistency | done |
 | M4 read/write and recovery | WRITE, cache flush/FUA, UNMAP, sense, timeout/TMF/reset | done; the fault-injected soak stopped short (§6), the serial-command prototype's 90-minute run is in §7 |
-| M5 topology, hotplug and PM | nub add/remove, handle-reuse isolation, safe stop, sleep/wake | complete on the baseline build (direct attach and the dual-target backplane, including a pull with I/O in flight); the current source re-qualified sleep/wake only |
+| M5 topology, hotplug and PM | nub add/remove, handle-reuse isolation, safe stop, sleep/wake | complete on the baseline build (direct attach and the dual-target backplane, including a pull with I/O in flight); the 0.21.0 baseline re-qualified sleep/wake only |
 | M6 diagnostic tooling (optional) | standalone `IOUserClient`/tool, statistics export | not done; IORegistry properties and boot arguments are used instead |
 | Performance data path | client DMA, bounded command pool, ready-first harvest and refill, batched single-ring replies with wakeups | done on one target: native build/link/sign/load, read-only correctness, A/B latency and throughput against the preceding build, one TMF escalation, a small write and flush cycle, two sleep/wake cycles, four recovery variants; UNMAP, physical replug, dual target and shutdown not re-run |
-| M7 later | IR volumes, SES, multiple hardware queues, boot disk, signed release; route B / dext evaluation | outside the current scope |
+| M7 later | RAID management, SES, multiple hardware queues, boot disk, signed release; route B / dext evaluation | outside the current scope |
 
 ## 6. Not yet done
 

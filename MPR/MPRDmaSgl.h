@@ -113,4 +113,71 @@ mprBuildIeeeSgl(uint8_t *request, uint32_t requestBytes, uint32_t sglOffset,
     return true;
 }
 
+/* Native NVMe PRPs use the same first IEEE element, followed by an IEEE
+ * chain with NSF_NVME_PRP (FreeBSD mpr_check_pcie_native_sgl). One command is
+ * bounded to 64 KiB, so its remaining <=16 pages fit in one 4 KiB PRP list.
+ * Validate the complete logical layout before writing either DMA buffer. A
+ * discontinuity inside a device page requires the caller's mapped fallback;
+ * discontiguous pages are legal, but a mid-page hole is not representable. */
+static inline bool
+mprBuildNvmeSgl(uint8_t *request, uint32_t requestBytes, uint32_t sglOffset,
+                const MPRDmaSegment *segments, uint32_t segmentCount,
+                uint32_t expectedBytes, uint8_t *prpStorage,
+                uint64_t prpAddress, uint32_t prpBytes, MPRSglResult *result)
+{
+    if (!request || !segments || !segmentCount || !result || !expectedBytes ||
+        expectedBytes > 65536 || sglOffset > requestBytes ||
+        requestBytes - sglOffset < 16) return false;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < segmentCount; ++i) {
+        if (!segments[i].length || segments[i].address > UINT64_C(0x7fffffffffffffff) ||
+            segments[i].length - 1 > UINT64_C(0x7fffffffffffffff) - segments[i].address)
+            return false;
+        total += segments[i].length;
+        if (total > expectedBytes) return false;
+    }
+    if (total != expectedBytes) return false;
+    /* The firmware directly translates small, inline IEEE lists. This also
+     * keeps probe/configuration-sized I/O working without a PRP allocation. */
+    if (segmentCount <= (requestBytes - sglOffset) / 16 &&
+        (segments[0].address & 4095) + expectedBytes <= 5 * 4096)
+        return mprBuildIeeeSgl(request, requestBytes, sglOffset, segments,
+            segmentCount, expectedBytes, NULL, 0, 0, 0, 0, result);
+    if (requestBytes - sglOffset < 32 || !prpStorage || !prpAddress ||
+        (prpAddress & 4095) || prpBytes < 4096 ||
+        prpAddress > UINT64_C(0x7ffffffffffff000)) return false;
+    uint64_t pages[17];
+    uint32_t pageCount = 0, si = 0, used = 0, remaining = expectedBytes;
+    while (remaining) {
+        if (si >= segmentCount || pageCount == 17) return false;
+        uint64_t address = segments[si].address + used;
+        if (pageCount && (address & 4095)) return false;
+        pages[pageCount++] = address;
+        uint32_t bytes = 4096 - (uint32_t)(address & 4095);
+        if (bytes > remaining) bytes = remaining;
+        remaining -= bytes;
+        while (bytes) {
+            if (si >= segmentCount || segments[si].address + used != address) return false;
+            uint32_t take = segments[si].length - used;
+            if (take > bytes) take = bytes;
+            address += take;
+            bytes -= take;
+            used += take;
+            if (used == segments[si].length) { ++si; used = 0; }
+        }
+    }
+    if (si != segmentCount || used || pageCount < 2) return false;
+    for (uint32_t i = 1; i < pageCount; ++i) {
+        mprSglStore32(prpStorage + (i - 1) * 8, (uint32_t)pages[i]);
+        mprSglStore32(prpStorage + (i - 1) * 8 + 4, (uint32_t)(pages[i] >> 32));
+    }
+    uint32_t firstBytes = 4096 - (uint32_t)(pages[0] & 4095);
+    mprSglElement(request + sglOffset, pages[0], firstBytes, 0, 0);
+    mprSglElement(request + sglOffset + 16, prpAddress,
+                   (pageCount - 1) * 8, 0, 0x88); /* CHAIN | NSF_NVME_PRP */
+    result->chainsUsed = 1;
+    result->requestChainOffset = 0; /* Native PRP chains are not MPI chain offsets. */
+    return true;
+}
+
 #endif

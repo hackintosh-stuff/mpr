@@ -15,7 +15,7 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.22.0</string>
+	<string>0.23.0</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
 	<key>CFBundleSupportedPlatforms</key>
@@ -23,7 +23,7 @@
 		<string>MacOSX</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>0.22.0</string>
+	<string>0.23.0</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>MPRController</key>
@@ -35,11 +35,11 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IOPCIPrimaryMatch</key>
-			<string>0x00961000 0x00971000</string>
+			<string>0x00961000 0x00971000 0x00901000 0x00911000 0x00941000 0x00951000 0x00c91000 0x00c41000 0x00c51000 0x00c61000 0x00c01000 0x00c11000 0x00af1000 0x00ac1000 0x00ad1000 0x00ae1000 0x00aa1000 0x00ab1000 0x00d11000 0x00d21000 0x00d01000 0x00e41000 0x00e51000 0x00e61000 0x00e71000 0x00e01000 0x00e11000 0x00e21000 0x00e31000</string>
 			</dict>
 	</dict>
 	<key>OSBundleCompatibleVersion</key>
-	<string>0.22.0</string>
+	<string>0.23.0</string>
 	<key>OSBundleLibraries</key>
 	<dict>
 		<key>com.apple.iokit.IOPCIFamily</key>

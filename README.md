@@ -1,41 +1,50 @@
-# MPR — Fusion-MPT SAS3 (SAS3004/SAS3008) kext for macOS
+# MPR — Fusion-MPT SAS3 / Tri-Mode kext for macOS
 
-Date: 2026-11-13. Driver version: 0.22.0.
+Date: 2026-11-13. Driver version: 0.23.0.
 
-MPR is an IOKit block-storage driver for the LSI/Broadcom MPI 2.5 Fusion-MPT SAS3
-family on x86_64 macOS. It publishes every eligible independent disk through
-`IOBlockStorageDriver` as its own whole-disk `IOMedia`.
+MPR is an IOKit block-storage driver for LSI/Broadcom MPI 2.5/2.6 Fusion-MPT
+controllers on x86_64 macOS. Eligible SAS/SATA disks, firmware IR RAID volumes
+and PCIe NVMe targets each publish a LUN-0 whole-disk `IOMedia` through
+`IOBlockStorageDriver`.
 
 ## Supported hardware
 
-| Chip | PCI ID | Status |
-|---|---|---|
-| SAS3008 | `0x1000:0x0097` | verified on hardware |
-| SAS3004 | `0x1000:0x0096` | matches; same IOC generation with four phys, not run on hardware |
+The exact PCI table follows the pinned `reference/freebsd/sys/dev/mpr/mpr_pci.c`:
+29 recognized IDs, of which four SEA non-secure-mode IDs are explicitly refused
+before PCI enable/MMIO, leaving 25 attachable IDs. This is implementation
+coverage, not hardware qualification for every card or firmware.
 
-Matching is by the exact vendor/device pair, so any vendor's board built on these
-chips binds. Everything else stays out: the IR-capable SAS3108 variants are not
-matched because this driver refuses RAID volumes and their members instead of
-publishing them, and the MPI 2.6/tri-mode family and SAS2 are different IOC
-generations (see [PLAN.md](PLAN.md) section 1.3). `MPRChipName` reports which
-entry bound.
+| Family | Device IDs (vendor `0x1000`) | Evidence |
+|---|---|---|
+| SAS3004 / SAS3008 | `0x0096`, `0x0097` | SAS3008 has earlier-build hardware evidence; this version is not load-tested |
+| SAS3108 Fusion-MPT variants | `0x0090`, `0x0091`, `0x0094`, `0x0095` | Source implemented; hardware unverified |
+| SAS3216 / SAS3224 / SAS3316 / SAS3324 | `0x00c9`, `0x00c4`, `0x00c5`, `0x00c6`, `0x00c0`, `0x00c1` | Source implemented; hardware unverified |
+| GEN35: SAS3408/3416/3508/3516/3616/3708/3716 | `0x00af`, `0x00ac`, `0x00ad`, `0x00ae`, `0x00aa`, `0x00ab`, `0x00d1`, `0x00d2`, `0x00d0` | Source implemented; hardware unverified |
+| SEA: SAS3816 / SAS3916, configured/hard secure | `0x00e5`, `0x00e6`, `0x00e1`, `0x00e2` | Source implemented; hardware unverified |
+
+Rejected SEA non-secure IDs: `0x00e4`, `0x00e7`, `0x00e0`, `0x00e3`. Matching is by exact
+vendor/device pair, not by a wildcard or a marketing model name. SAS2 (`mps`)
+and unrelated MegaRAID (`mrsas`) device IDs remain outside the table.
+`MPRChipName`, negotiated MPI version and generation/capability diagnostics are
+available with `mpr_debug=1`.
 
 ## Status
 
-The current source implements client-buffer DMA, a credit-bounded command pool,
-ready-first completion/refill and batched reply retirement with event wakeups.
-It is built, linked and signed ad hoc for the test machine (macOS 26.7.2,
-SAS3008, one SATA target). The build that machine loads from its internal ESP is
-0.21.0, and every runtime result below was measured with it; 0.22.0 only extends
-the PCI ID table, adds `MPRChipName` and renames the block-device info string, and
-has been built and link-checked but not deployed.
+Version 0.23.0 adds the wider PCI/generation paths, IR volume publication and
+PCIe NVMe transport, PRP and DSM handling. Validation in this change is limited
+to host protocol regressions and x86_64 Mach-O object cross-compilation against
+MacKernelSDK. It has not been natively linked/signed, deployed or load-tested.
 
-Qualified for this source: read-only block I/O including requests larger than
+All runtime measurements below belong to the previously documented SAS3008
+build 0.21.0, not 0.23.0 or any newly matched hardware. The running machine was
+not queried or changed during this source-only work.
+
+Qualified on 0.21.0: read-only block I/O including requests larger than
 one command window, chunks at non-zero offsets, several concurrent client
 requests, fragmented and page-unaligned client buffers, and byte-exact
 comparison against digests recorded under the previous build.
 
-Also qualified for this source: a sustained command storm (21.1 million
+Also qualified on 0.21.0: a sustained command storm (21.1 million
 commands in 600 s with client-buffer DMA and 10.7 million in 300 s with the
 staging path, no error, no reset, flat latency), a small write and flush cycle
 with byte-exact readback, and two sleep/wake cycles that each cost exactly one
@@ -48,7 +57,7 @@ new BSD disk with raw transfers above 128 KiB failing until a reboot. An
 IOC-level rebuild that sends no task-management request left the fabric alone.
 See "Injected recovery, by escalation level" below.
 
-Not yet qualified for this source: UNMAP, physical removal and reinsertion,
+Not yet qualified on 0.21.0: UNMAP, physical removal and reinsertion,
 shutdown, and FUA selection (not reachable from user space here). The removal
 and multi-target observations below were made with the preceding build and are
 regression coverage only. Confirm the actually loaded version with
@@ -93,7 +102,7 @@ after the pull.
 
 Sleep and wake with both targets attached was exercised on that baseline: sleep
 flushes each published target, and wake brought both media back at their own disk
-numbers in under 25 s with byte-exact readback. The current source re-ran sleep
+numbers in under 25 s with byte-exact readback. The 0.21.0 build re-ran sleep
 and wake on one target only; those measurements are below.
 
 Not covered by that baseline: SAS/SSP write paths are not verified on hardware;
@@ -118,8 +127,12 @@ Wire-format and large-LBA cases are checked on the host, not on this hardware.
   SYNCHRONIZE CACHE(10)/(16), and FUA with an ordered cache-flush fallback.
 - UNMAP after Block Limits and Logical Block Provisioning verification, split to
   the reported limits without extending the caller's discard range.
-- SAS device-handle enumeration, independent-disk filtering on IR-capable
-  firmware, and stable identity with capacity and block-size revalidation.
+- Typed SAS/SATA, IR volume and PCIe NVMe enumeration, with RAID member/spare
+  hiding, volume-state validation and type-plus-WWID identity. Up to 64 targets.
+- Memory-BAR discovery, MPI 2.5/2.6 negotiation, GEN35/SEA identification, SEA zero-register-read
+  retry and capability-gated atomic request posting.
+- NVMe native PRP lists on direct/staging paths, MDTS-bounded asynchronous
+  transfers, PCIe protocol-level resets and native DSM for advertised UNMAP.
 - Per-command sense and completion ownership; TMF escalation and IOC recovery
   that name the failed command's own handle; no replay of a write with uncertain
   completion.
@@ -146,13 +159,15 @@ work are in [PLAN.md](PLAN.md).
 
 Each published target is a LUN-0 whole disk with its own medium. Discovery,
 probing, removal and recovery are per target: a handle names one firmware
-address, and the driver keeps the SAS address, stable identity and medium
+address, and the driver keeps the target kind, WWID, stable identity and medium
 generation that address was probed for, so a reused handle is never treated as
 the same disk.
 
-IR RAID volumes, multipath, multi-LUN devices, SES/SMP management,
-NVMe/Tri-Mode, firmware flashing and FreeBSD user ioctl compatibility are
-outside this driver. IOKit may still bounce through internal memory, so direct
+Array creation/reconfiguration and raw access to RAID members, multipath,
+multi-LUN/extra NVMe namespaces, SES/SMP management, firmware flashing and
+FreeBSD user ioctl compatibility remain outside this driver. IR volume deletion
+never sends physical REMOVE_DEVICE; member disks newly claimed by firmware are
+retired without target reset or REMOVE_DEVICE. Unknown/reused handles fail closed. IOKit may still bounce through internal memory, so direct
 client mapping is not a guarantee that every platform performs zero copies; the
 legacy synchronous bulk/probe path keeps staging.
 
@@ -177,7 +192,7 @@ each, median of the repeats, debug output and serial logging off. `MPRAsyncComma
 reported the requested depth in every configuration (1, 4, 16 and 32), so the
 depth limit was not reduced by credits or allocation.
 
-| Shape | QD | Preceding build | This source | Latency p50 |
+| Shape | QD | Preceding build | 0.21.0 baseline | Latency p50 |
 |---|---|---|---|---|
 | 4 KiB random | 1 | 0.96 k IOPS | 4.9 k IOPS | 1.03 ms -> 0.23 ms |
 | 4 KiB random | 32 | 3.9 k IOPS | 31.6 k IOPS | 8.15 ms -> 0.83 ms |
