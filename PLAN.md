@@ -1,6 +1,6 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：源码 0.20.11（2026-11-13）。已在内部 SATA 盘的 ESP 部署并经 OpenCore 注入加载，单盘读写、热插拔、超时/TMF/复位恢复与睡眠/唤醒均已实机验证；多目标场景下两块盘各自发布、按 DevHandle 路由、写入策略隔离，以及两块盘分别物理拔插后的逐目标移除与重新发布，均已实机验证。当前源码行为与诊断见 [DEBUG.md](DEBUG.md)，对外能力与验证边界见 [README.md](README.md)。
+状态：源码 0.20.11（2026-11-13）。已在内部 SATA 盘的 ESP 部署并经 OpenCore 注入加载，单盘读写、热插拔、超时/TMF/复位恢复与睡眠/唤醒均已实机验证；多目标场景下两块盘各自发布、按 DevHandle 路由、写入策略隔离，读在途与写在途拔盘后的逐目标移除与句柄重绑，以及双目标短睡/长睡唤醒，均已实机验证。当前源码行为与诊断见 [DEBUG.md](DEBUG.md)，对外能力与验证边界见 [README.md](README.md)。
 
 ## 1. 目标与范围
 
@@ -45,7 +45,7 @@
 ```
 mpr/
   README.md  DEBUG.md  PLAN.md  AGENTS.md  NOTICE
-  MPR/                               (Controller、BlockDev、Async、Target、MPI/mpi2_min.h、Info.plist)
+  MPR/                               (Controller、BlockDev、Async、Target、MPI/mpi2_min.h、MPI/mpi2_target.h、Info.plist)
   MPR.xcodeproj/                     (工程入口)
   tools/build-noxcode.sh             (Command Line Tools 构建入口)
   tools/test_protocol.cpp            (协议层主机侧测试)
@@ -93,7 +93,7 @@ mpr/
 | M1 寄存器与 IOC | READY → OPERATIONAL、IOC Facts、DMA 池、Manufacturing Page0 | 完成 |
 | M2 中断、回复与事件 | 中断回复、回复帧回收、按命令分派、EventMasks/ACK、PortEnable | 完成（回复帧回收随长时间运行覆盖，未单独统计绕环次数） |
 | M3 单盘只读 | 独立盘识别、身份与容量、只读 nub、大范围顺序读一致性 | 完成 |
-| M4 读写与恢复 | WRITE、缓存同步/FUA、UNMAP、sense、超时/TMF/复位 | 完成；注入长跑只完成多轮短程 |
+| M4 读写与恢复 | WRITE、缓存同步/FUA、UNMAP、sense、超时/TMF/复位 | 完成；带故障注入的长跑只完成多轮短程（无注入的串行命令原型另有 90 分钟/约 345 万条命令记录，见 §7） |
 | M5 拓扑、热插拔与 PM | nub 增删、handle 复用隔离、安全 stop、睡眠/唤醒 | 完成（直连与双目标背板，含在途 I/O 拔盘） |
 | M6 诊断工具（可选） | 独立 `IOUserClient`/工具、统计导出 | 未实施；现用 IORegistry 属性与 boot-args |
 | M7 后续 | IR 卷、SES、多队列、启动盘、签名发布；路线 B / dext 评估 | 不在当前范围 |
@@ -110,7 +110,7 @@ mpr/
 ## 7. 验证方式
 
 - 主机侧：`tools/test_protocol.cpp` 用独立基准字节与独立 chain 解码器验证协议层（136,593 条断言、2,000 个确定性 SGL 用例，含故意拒绝用例），启用 ASan/UBSan；`tools/validate-build-inputs.py` 校验 LF 行尾、bundle 与运行版本一致、所有编译单元均纳入 Xcode 工程。
-- 构建/加载：`tools/build-noxcode.sh` 产出 `MPR.kext`，校验 kmod 入口、bundle 类型、驱动内部符号与 plist 后 ad hoc 签名；注入内部 ESP 后以 `kmutil showloaded` 与 `MPRBuild` 三处一致确认。交叉编译的 Mach-O 目标不等于链接、签名、可加载。
+- 构建/加载：`tools/build-noxcode.sh` 产出 `MPR.kext`，校验 kmod 入口、bundle 类型、驱动内部符号与 plist 后 ad hoc 签名；注入内部 ESP 后核对 ESP 上 `Info.plist`、`kmutil showloaded` 与 `MPRBuild` 三处版本一致。交叉编译的 Mach-O 目标不等于链接、签名、可加载。
 - 实机：单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。双目标时另验证两盘 LBA0 与高 LBA 读一致性、可写盘写后回读、以及 `MPRTargetNWriteCount` 只落在可写目标。睡眠/唤醒必须有旧版与当前版的 `MPRResetCount` 前后对照，并同时核对 `MPRResetInitiator`、`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending`、`MPRWakeRebuildState`、`MPRProbeRetries` 与两盘 online 时间；短睡与长睡都要测，单看「online」或单看一次复位都不能判定唤醒路径是否改善。物理拔盘与在途 I/O 已有双目标实机结论，仅当改动触及移除、句柄重绑或媒体生命周期路径时才需重跑；只改电源或探测链时以既有证据为准，不要求重复现场拔盘。
 - 长跑：以命令数预算代替墙钟时间，关注按操作次数累积的驱动问题（回复帧、SMID、事件 ACK、属性字典、恢复循环退化），不是介质耐久性。串行命令原型曾以约 345 万条命令、90 分钟通过（p99 无漂移、`MPRResetCount` 不增长、属性数量稳定、参考区哈希不变）；当前异步调度版本尚未重跑。
 - 破坏性写仅限现场重新核对身份的测试盘，写窗口事后逐字节还原；`IORegistry` 的"在线"属性不能替代字节数与回读内容。

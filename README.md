@@ -46,21 +46,21 @@ resets (8 s and 45 s after the removal) to re-run fabric discovery; each takes
 seconds to about 25 s, during which the other targets are briefly offline. The
 exFAT volume that was being written verified clean after the pull.
 
+Sleep and wake with both targets attached is exercised. Sleep flushes each
+writable target; wake brings both media back at their own disk numbers in under
+25 s, with the array member's leading 8 MiB digest unchanged. A disk that is
+still becoming ready is retried in place instead of being counted as a failed
+probe. The wake rebuilds the controller before the first topology read and
+gives config/event and PortEnable replies a bounded settling budget, so fabric
+settling produces no protocol fault and no extra IOC reset. One planned
+controller rebuild per wake remains mandatory after S3; the power-state and
+fault counters behind these claims are listed in [DEBUG.md](DEBUG.md).
+
 Not covered: SAS/SSP write paths, multipath, multiple LUNs, enclosure services,
 long duration or concurrent stress, and throughput tuning are out of scope.
+The long-run result recorded in [PLAN.md](PLAN.md) belongs to an earlier
+serial-command prototype, not to the current asynchronous scheduler.
 Wire-format and large-LBA cases are checked on the host, not on this hardware.
-Sleep and wake with both targets attached was exercised: sleep flushes the
-writable target, and wake brings both media back at their own disk numbers in
-under 25 s with `MPRPowerState` back at `on`; the array member's leading 8 MiB
-digest is unchanged. A disk that is still becoming ready is retried in place
-instead of being counted as a failed probe, so a slow spin-up cannot by itself
-escalate to an IOC reset. The wake always rebuilds the controller before any
-topology read and gives config/event and PortEnable replies a bounded settling
-budget, so fabric settling no longer produces a config-page management timeout,
-a protocol fault or a fault-driven reset: `MPRStickyFaultCount` and
-`MPRFaultRecoveries` stay flat across a wake. One planned controller rebuild
-per wake remains mandatory after S3, so `MPRResetCount` still grows by one; no
-additional reset is taken.
 
 ## Capabilities
 
@@ -144,4 +144,5 @@ Before any write, identify the internal disk and EFI partition by their current
 model, capacity, location and UUID. Back up `config.plist` beside itself only if
 that configuration must change, and validate any changed plist. After a
 deliberate deployment and reboot, confirm the loaded version with
-`kmutil showloaded` and `MPRBuild`. This patch does not deploy or reboot.
+`kmutil showloaded` and `MPRBuild`. The build and local checks above neither
+deploy nor reboot; deployment is a separate, explicitly authorised step.

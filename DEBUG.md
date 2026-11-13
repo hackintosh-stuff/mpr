@@ -124,8 +124,8 @@ table (`MPRTargetSlot`) and published as `MPRTargetCount` plus per-target
 `MPRTargetNReadOnly`, `MPRTargetNBlocks`, `MPRTargetNBlockSize`,
 `MPRTargetNIdentity`, `MPRTargetNModel`, `MPRTargetNSerial`,
 `MPRTargetNRemovalState`, `MPRTargetNGeneration`,
-`MPRTargetNProbeState`, `MPRTargetNProbeRetries`, `MPRTargetNWriteCount` and
-`MPRTargetNFailureCount` properties.
+`MPRTargetNProbeState`, `MPRTargetNProbeStatus`, `MPRTargetNProbeRetries`,
+`MPRTargetNWriteCount` and `MPRTargetNFailureCount` properties.
 Each target is probed through the read-only management chain and gets its own
 `MPRBlockDev` nub; `MPRPublishedTargetCount` counts successful publications.
 An async request carries the originating DevHandle, and the worker resolves
@@ -294,12 +294,12 @@ service release so callers retained before stop can unwind safely.
 |---|---|
 | Build and media | `MPRBuild`, `MPRFeatures`, `MPRMediaPresent`, `MPRMediaGeneration`, `MPRMediaReady`, `MPRMediaReadyStatus`, `MPRPublishedTargetCount` |
 | Targets | `MPRTargetCount`, `MPRTargetNHandle`, `MPRTargetNSasAddress`, `MPRTargetNPresent`, `MPRTargetNProbed`, `MPRTargetNProbeState`, `MPRTargetNProbeStatus`, `MPRTargetNProbeRetries`, `MPRTargetNOnline`, `MPRTargetNRemovalState`, `MPRTargetNMediaStatus`, `MPRTargetNGeneration` |
-| Discovery and removal | `MPRScanCount`, `MPRRemovedMediaCount`, `MPRRemovalFailures`, `MPRRemovalStage`, `MPRRetiredSlotsReleased`, `MPRRediscoveryResets`, `MPRRediscoveryState`, `MPRFaultRecoveries`, `MPRFaultRecoveryState` |
+| Discovery and removal | `MPRScanCount`, `MPRRemovedMediaCount`, `MPRRemovalFailures`, `MPRRemovalStage`, `MPRRetiredSlotsReleased`, `MPRRediscoveryResets`, `MPRRediscoveryState` |
 | Async and DMA | `MPRAsyncRequestLimit`, `MPRAsyncCommandLimit`, `MPRAsyncPeakRequests`, `MPRMappedCommands`, `MPRChainedCommands`, `MPRBounceCommands` |
 | Identity/filter | `MPRStableIdentityValid`, `MPRStableIdentity`, `MPRIdentityState`, `MPRRaidFilterState`, `MPRStandaloneTargetCount`, `MPRSasDevicePageState` |
 | Capabilities | `MPRNativeFuaSupported`, `MPRFuaPolicy`, `MPRUnmapEnabled`, `MPRUnmapMaxLbaCount`, `MPRUnmapMaxDescriptors`, `MPRUnmapReadsZero` |
 | Recovery | `MPRHotplugState`, `MPRProbeRetries`, `MPRResetCount`, `MPRResetInitiator`, `MPRReinitState`, `MPRRecoveryState`, `MPRFaultRecoveries`, `MPRFaultRecoveryState`, `MPRDeviceOffline`, `MPRTmfHandle`, `MPRTmfResetStatus` |
-| Protocol | `MPRProtocolRecoveryPending`, `MPRProtocolFaultCode`, `MPRStickyFaultCount`, `MPRBadReplySite`, `MPREventAckQueued`, `MPREventAckFailed` |
+| Protocol | `MPRProtocolRecoveryPending`, `MPRProtocolFaultCode`, `MPRProtocolFaultSmid`, `MPRStickyFaultCode`, `MPRStickyFaultSmid`, `MPRStickyFaultCount`, `MPRBadReplySite`, `MPREventAckQueued`, `MPREventAckFailed` |
 | Power | `MPRPowerState`, `MPRPowerFlushStatus`, `MPRPowerFlushCount`, `MPRStopDMAState`, `MPRWatchdogIOCState`, `MPRWakeNotReadyCount`, `MPRWakeQuiesced`, `MPRWakeMemoryEnabled`, `MPRWakeBusMasterEnabled`, `MPRWakeRebuildState`, `MPRWakeSettleTicks` |
 | Writes | `MPRWriteCount`, `MPRWriteBytes`, `MPRLastWriteLba`, `MPRLastWriteSmid`, `MPRTargetNWriteCount`, `MPRTargetNFailureCount` |
 
@@ -334,12 +334,14 @@ names are not macOS requirements.
 | Sleep and shutdown | FreeBSD suspend/resume return EINVAL; separate shutdown path | Native IOKit PM with per-target flush and wake revalidation |
 | Builds | OS-specific build system | All driver translation units in the CLI and Xcode builds |
 
-Outside this configuration, and not silently treated as implemented: sleep and
-wake with several targets behind an expander; multiple LUNs and general SCSI
-passthrough; DPM persistent numbering and multipath; IR logical volumes and RAID
-management; SES/enclosure control, SMP passthrough, firmware update and
-user-space tools; NVMe/PCIe/Tri-Mode, SAS2 and GEN35 hardware; direct DMA into
-client buffers, multi-queue/MSI-X scaling and tuning.
+Sleep and wake, physical pull and pulls with I/O in flight are qualified with
+two targets behind this expander, as are short and long sleeps. Outside that
+configuration, and not silently treated as implemented: more than two targets,
+a different expander or backplane, and concurrent multi-disk pulls; multiple
+LUNs and general SCSI passthrough; DPM persistent numbering and multipath; IR
+logical volumes and RAID management; SES/enclosure control, SMP passthrough,
+firmware update and user-space tools; NVMe/PCIe/Tri-Mode, SAS2 and GEN35
+hardware; direct DMA into client buffers, multi-queue/MSI-X scaling and tuning.
 
 ## 9. Host-side checks
 
