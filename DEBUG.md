@@ -1,6 +1,6 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.20.11.
+Date: 2026-11-13. Driver version: 0.20.12.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
@@ -121,12 +121,12 @@ Every eligible handle from GET_NEXT_HANDLE is recorded in a bounded target
 table (`MPRTargetSlot`) and published as `MPRTargetCount` plus per-target
 `MPRTargetNHandle`, `MPRTargetNDeviceInfo`, `MPRTargetNSasAddress`,
 `MPRTargetNPresent`, `MPRTargetNProbed`, `MPRTargetNOnline`,
-`MPRTargetNReadOnly`, `MPRTargetNBlocks`, `MPRTargetNBlockSize`,
+`MPRTargetNBlocks`, `MPRTargetNBlockSize`,
 `MPRTargetNIdentity`, `MPRTargetNModel`, `MPRTargetNSerial`,
 `MPRTargetNRemovalState`, `MPRTargetNGeneration`,
 `MPRTargetNProbeState`, `MPRTargetNProbeStatus`, `MPRTargetNProbeRetries`,
 `MPRTargetNWriteCount` and `MPRTargetNFailureCount` properties.
-Each target is probed through the read-only management chain and gets its own
+Each target is probed through a non-mutating management chain and gets its own
 `MPRBlockDev` nub; `MPRPublishedTargetCount` counts successful publications.
 An async request carries the originating DevHandle, and the worker resolves
 geometry, admission, fast-path capability and the FUA mode from that target's
@@ -138,15 +138,13 @@ the controller's default handle there would send every target's commands to one
 disk. A nub reports its own INQUIRY vendor/product/revision from the slot that
 names its handle.
 
-Access is fail-closed. `MPRWritableDevices` in the kext personality is an array
-of Model/Serial rules; only a SATA disk whose ATA model and serial match a rule
-with a concrete serial is published writable, and an SSP target is read-only
-regardless of any rule. Every other target, including a disk from an unknown
-array, stays read-only: `reportWriteProtection()` reports write protection,
-write requests are rejected with `kIOReturnNotWritable`, UNMAP is rejected, and
-cache synchronisation is a no-op that sends no command. The nub records
-`MPRBlockDevReadOnly`, `MPRBlockDevHandle` and the controller records
-`MPRWriteRuleCount` plus the per-target properties above.
+Every published target is writable. The driver keeps no write allowlist and no
+per-target write-protection state, so the nub forwards writes, cache
+synchronisation and UNMAP to the controller without a local gate.
+`IOBlockStorageDevice` declares `reportWriteProtection()` pure virtual, so the
+nub still implements it and simply reports the media as not write-protected.
+The nub records `MPRBlockDevHandle`; the controller records the per-target
+properties above and its per-target write accounting.
 
 ## 4. Hotplug and recovery
 
@@ -246,7 +244,7 @@ device/recovery state. Read-zero behavior is claimed only when advertised.
 
 `setPowerState` is the registered PM entry point. The normal operating vote
 is On. Sleep closes asynchronous acceptance, fences accepted I/O, flushes each
-writable target through that target's own handle, disables reply delivery,
+published target through that target's own handle, disables reply delivery,
 resets/quiesces the IOC and disables PCI bus mastering. Ownership is reset only
 after DMA stop is proved.
 

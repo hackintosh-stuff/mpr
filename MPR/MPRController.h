@@ -84,9 +84,8 @@ enum {
 /* Per-target state for multi-target isolation. A DevHandle is a firmware
  * address, not a disk: it can name a different device after a replug, so each
  * slot also carries the SAS address, stable identity and medium generation it
- * was probed for. A newly discovered disk is read-only unless an explicit
- * write rule matches it. */
-enum { kMPRMaxTargets = 8, kMPRMaxWriteRules = 4 };
+ * was probed for. Every published target is writable. */
+enum { kMPRMaxTargets = 8 };
 struct MPRTargetSlot
 {
     UInt16 handle;
@@ -95,7 +94,6 @@ struct MPRTargetSlot
     UInt64 sasAddress;
     bool   fastPath;
     bool   present;         /* listed by the current topology snapshot */
-    bool   readOnly;
     UInt64 capacityBlocks;
     UInt32 blockSize;
     bool   identityValid;
@@ -368,17 +366,13 @@ private:
     /* SCSI IO completion tracking. */
     UInt32                     fAttachedDevHandle;
 
-    /* Target table and write policy. Access is fail-closed: a target is
-     * read-only unless an explicit MPRWritableDevices rule matches it. */
+    /* Target table. Model and serial are the probed identity published in
+     * IORegistry; they no longer gate write access. */
     MPRTargetSlot              fTargets[kMPRMaxTargets];
     UInt32                     fTargetCount;
     UInt32                     fScanSerial;
-    char                       fWriteRuleModel[kMPRMaxWriteRules][64];
-    char                       fWriteRuleSerial[kMPRMaxWriteRules][32];
-    UInt32                     fWriteRuleCount;
     char                       fTargetModel[64];
     char                       fTargetSerial[32];
-    bool                       fTargetReadOnly;
     UInt16                     fLastReplySmid;
     UInt32                     fLastReplyKind;   /* 0 none, 1 address reply, 2 scsi success */
     UInt32                     fScsiSuccess;
@@ -542,12 +536,9 @@ public:
                                    IOService *whatDevice) APPLE_KEXT_OVERRIDE;
     virtual void systemWillShutdown(IOOptionBits specifier) APPLE_KEXT_OVERRIDE;
 
-    /* Multi-target discovery and fail-closed write policy. */
-    bool loadWritePolicy(void);
-    bool isWritableIdentity(const char *model, const char *serial) const;
+    /* Multi-target discovery. */
     MPRTargetSlot *findTarget(UInt16 handle);
     UInt32 targetCount(void) const { return fTargetCount; }
-    bool isTargetReadOnly(void) const { return fTargetReadOnly; }
     UInt32 getBlockSizeForHandle(UInt16 handle) {
         MPRTargetSlot *slot = findTarget(handle);
         return slot != NULL ? slot->blockSize : 0;

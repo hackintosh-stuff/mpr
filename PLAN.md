@@ -1,13 +1,13 @@
 # PLAN — 将 LSI/Broadcom Fusion-MPT SAS3 驱动移植到 macOS
 
-状态：源码 0.20.11（2026-11-13）。已在内部 SATA 盘的 ESP 部署并经 OpenCore 注入加载，单盘读写、热插拔、超时/TMF/复位恢复与睡眠/唤醒均已实机验证；多目标场景下两块盘各自发布、按 DevHandle 路由、写入策略隔离，读在途与写在途拔盘后的逐目标移除与句柄重绑，以及双目标短睡/长睡唤醒，均已实机验证。当前源码行为与诊断见 [DEBUG.md](DEBUG.md)，对外能力与验证边界见 [README.md](README.md)。
+状态：源码 0.20.12（2026-11-13）。已在内部 SATA 盘的 ESP 部署并经 OpenCore 注入加载，单盘读写、热插拔、超时/TMF/复位恢复与睡眠/唤醒均已实机验证；多目标场景下两块盘各自发布、按 DevHandle 路由、写入按目标归因，读在途与写在途拔盘后的逐目标移除与句柄重绑，以及双目标短睡/长睡唤醒，均已实机验证。当前源码行为与诊断见 [DEBUG.md](DEBUG.md)，对外能力与验证边界见 [README.md](README.md)。
 
 ## 1. 目标与范围
 
 ### 1.1 目标硬件与平台
 
 - HBA：Broadcom/Avago SAS3008，PCI `0x1000:0x0097`，MPI 2.5，12 Gb/s SAS3；固件 `09.00.00.00`，`IOCCapabilities` 含 `INTEGRATED_RAID`。
-- 测试盘：PCCOOLER SSD T200 240 GB（468,862,128 × 512 B），exFAT 卷 `testdisk`；扩容器验证用 Adaptec AEC-82885T 加单背板。多目标验证时同一背板上另有 TOSHIBA MG04SCA60EE 6 TB（11,721,045,168 × 512 B，SSP，属于 ZFS 阵列 `main_data`），只读、不写。
+- 测试盘：PCCOOLER SSD T200 240 GB（468,862,128 × 512 B），exFAT 卷 `testdisk`；扩容器验证用 Adaptec AEC-82885T 加单背板。双目标、在途 I/O 与 PM 的实机结论来自此前同一背板上的第二块 SSP 盘（TOSHIBA MG04SCA60EE 6 TB），该盘现已移除，不再参与测试；当前配置为单块 SATA 盘。
 - 平台：macOS Tahoe 26.7.2（`25G332`、`Darwin 25.6.0`），x86_64，MSI X570 测试机；IOKit kext，基于 MacKernelSDK 构建。
 - 硬件事实：BAR0 是 I/O，MMIO 在 BAR1/BAR2（配置偏移 `0x14`）；地址随启动重新分配，不硬编码。
 
@@ -16,7 +16,7 @@
 ### 1.2 范围
 
 1. 自研 `IOService`（provider = `IOPCIDevice`）实现 HBA：PCI 使能、BAR 映射、IOC 复位与初始化、队列、中断、事件订阅与 ACK。
-2. 把每个合格独立盘（STP/SATA 或 SSP）经系统 `IOBlockStorageDriver` 发布为原生整盘 `IOMedia`，并维护每个目标的身份、几何与媒体生命周期；写入权限按目标、按显式规则授予以外一律只读。
+2. 把每个合格独立盘（STP/SATA 或 SSP）经系统 `IOBlockStorageDriver` 发布为原生整盘 `IOMedia`，并维护每个目标的身份、几何与媒体生命周期；所有已发布目标均可写，写入计数按目标统计。
 3. 块 I/O：READ/WRITE(10)/(16)、SYNCHRONIZE CACHE、FUA、auto sense、超时与 TMF 恢复、热插拔；UNMAP 仅在探测到支持且通过限制校验后启用。
 4. 电源与停机：睡眠/唤醒、`systemWillShutdown` 的静默路径。
 5. 诊断：IORegistry 属性与可选故障注入 boot-args。
@@ -24,7 +24,7 @@
 ### 1.3 不做
 
 - IR/RAID 逻辑卷及其成员管理、SES 机箱管理、SMP passthrough、固件升级、启动盘引导。
-- 多 LUN、多路径、SAS/SSP 盘的写路径。
+- 多 LUN、多路径、SAS/SSP 盘写入的实机验证。
 - NVMe/PCIe/Tri-Mode、SAS2（`mps`/`0x0072`）、GEN35/SEA 分支。
 - Apple Silicon、dext/DriverKit、多队列与性能调优、FreeBSD user ioctl 兼容层。
 - 继承 `IOSCSIParallelInterfaceController`（§3 路线 B），仅保留为后续评估。
@@ -82,7 +82,7 @@ mpr/
 | IR 成员过滤 | 已实现，未在阵列上验证 | 拒绝卷、成员盘、热备与扩容成员；当前固件虽带 IR 能力但无卷样本 |
 | 移除与恢复 | 已验证（双目标；含在途读/写在途拔盘） | 逐目标 TARGET_RESET → 命令排空 → REMOVE_DEVICE 实机触发：被拔盘立即离线、另一目标继续服务、在途请求以设备错误返回、不重放；TMF 级联与有界 IOC 复位另有注入验证 |
 | 热插拔与媒体生命周期 | 已验证（双目标，背板） | 拔盘即离线、另一目标不受影响；插回需 PortEnable 重发现（8 s/45 s 两次有界复位，期间另一盘短暂下线），按 SAS 地址复用槽位、盘号不变 |
-| 睡眠/唤醒、停机静默 | 已验证（双目标，含长睡眠） | 睡眠前逐可写目标 flush；唤醒后两盘在 25 秒内恢复、盘号不变、`MPRPowerState=on`；未就绪目标按 1 秒节奏重试而不计入失败；唤醒总在首次拓扑读取前重建控制器，配置页/事件与 PortEnable 回复有看门狗计时的稳定窗口，不再产生管理超时、协议故障与 fault-driven 复位；每次唤醒仅有一次 S3 后必需的计划内重建（`MPRResetCount` +1），`MPRStickyFaultCount` / `MPRFaultRecoveries` 不变 |
+| 睡眠/唤醒、停机静默 | 已验证（双目标，含长睡眠） | 睡眠前逐已发布目标 flush；唤醒后两盘在 25 秒内恢复、盘号不变、`MPRPowerState=on`；未就绪目标按 1 秒节奏重试而不计入失败；唤醒总在首次拓扑读取前重建控制器，配置页/事件与 PortEnable 回复有看门狗计时的稳定窗口，不再产生管理超时、协议故障与 fault-driven 复位；每次唤醒仅有一次 S3 后必需的计划内重建（`MPRResetCount` +1），`MPRStickyFaultCount` / `MPRFaultRecoveries` 不变 |
 | 多 LUN、多路径、SES/SMP、NVMe/Tri-Mode | 未实现 | 见 §1.3 |
 
 ## 5. 里程碑状态
@@ -111,7 +111,7 @@ mpr/
 
 - 主机侧：`tools/test_protocol.cpp` 用独立基准字节与独立 chain 解码器验证协议层（136,593 条断言、2,000 个确定性 SGL 用例，含故意拒绝用例），启用 ASan/UBSan；`tools/validate-build-inputs.py` 校验 LF 行尾、bundle 与运行版本一致、所有编译单元均纳入 Xcode 工程。
 - 构建/加载：`tools/build-noxcode.sh` 产出 `MPR.kext`，校验 kmod 入口、bundle 类型、驱动内部符号与 plist 后 ad hoc 签名；注入内部 ESP 后核对 ESP 上 `Info.plist`、`kmutil showloaded` 与 `MPRBuild` 三处版本一致。交叉编译的 Mach-O 目标不等于链接、签名、可加载。
-- 实机：单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。双目标时另验证两盘 LBA0 与高 LBA 读一致性、可写盘写后回读、以及 `MPRTargetNWriteCount` 只落在可写目标。睡眠/唤醒必须有旧版与当前版的 `MPRResetCount` 前后对照，并同时核对 `MPRResetInitiator`、`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending`、`MPRWakeRebuildState`、`MPRProbeRetries` 与两盘 online 时间；短睡与长睡都要测，单看「online」或单看一次复位都不能判定唤醒路径是否改善。物理拔盘与在途 I/O 已有双目标实机结论，仅当改动触及移除、句柄重绑或媒体生命周期路径时才需重跑；只改电源或探测链时以既有证据为准，不要求重复现场拔盘。
+- 实机：单盘 1 GiB 级顺序读两次一致性、写后回读逐字节一致、UNMAP 后卷可重挂、物理拔插与在途拔盘、注入超时后的 TMF/复位级联、睡眠/唤醒；扩容器下同样验证有界读写与 UNMAP。双目标时另验证两盘 LBA0 与高 LBA 读一致性、可写盘写后回读、以及 `MPRTargetNWriteCount` 按目标归因。睡眠/唤醒必须有旧版与当前版的 `MPRResetCount` 前后对照，并同时核对 `MPRResetInitiator`、`MPRStickyFaultCount`、`MPRFaultRecoveries`、`MPRProtocolRecoveryPending`、`MPRWakeRebuildState`、`MPRProbeRetries` 与两盘 online 时间；短睡与长睡都要测，单看「online」或单看一次复位都不能判定唤醒路径是否改善。物理拔盘与在途 I/O 已有双目标实机结论，仅当改动触及移除、句柄重绑或媒体生命周期路径时才需重跑；只改电源或探测链时以既有证据为准，不要求重复现场拔盘。
 - 长跑：以命令数预算代替墙钟时间，关注按操作次数累积的驱动问题（回复帧、SMID、事件 ACK、属性字典、恢复循环退化），不是介质耐久性。串行命令原型曾以约 345 万条命令、90 分钟通过（p99 无漂移、`MPRResetCount` 不增长、属性数量稳定、参考区哈希不变）；当前异步调度版本尚未重跑。
 - 破坏性写仅限现场重新核对身份的测试盘，写窗口事后逐字节还原；`IORegistry` 的"在线"属性不能替代字节数与回读内容。
 

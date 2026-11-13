@@ -3131,7 +3131,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.20.11");
+    setProperty("MPRBuild", "0.20.12");
     setProperty("MPRFeatures",
                 "async-pool,ieee-sgl-chain,read-write16,cache16,unmap-limits,"
                 "stable-identity,raid-filter,auto-sense,tmf,remove-device,pm-quiesce");
@@ -3195,7 +3195,6 @@ MPRController::start(IOService *provider)
         /* A disk that is readable only through a timeout's fallback poll
          * cannot support idle hotplug. IRQ, subscription and PortEnable
          * success are mandatory before publishing a media object. */
-        loadWritePolicy();
         if (eventsReady && discoverTopology() && fTargetCount != 0) {
             /* Publish every eligible target; a target that cannot be probed
              * stays unpublished and is retried by the hotplug worker. */
@@ -3365,7 +3364,7 @@ MPRController::quiescePower(void)
         for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
             MPRTargetSlot *slot = &fTargets[i];
             if (slot->handle == 0 || !slot->present || !slot->probeValid ||
-                slot->readOnly || slot->offlinePending) continue;
+                slot->offlinePending) continue;
             if (!selectTarget(slot->handle)) continue;
             IOReturn one = scsiSynchronizeCache(0, 0, 29, true);
             char name[48];

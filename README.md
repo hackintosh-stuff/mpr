@@ -1,6 +1,6 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.20.11.
+Date: 2026-11-13. Driver version: 0.20.12.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes every eligible
@@ -22,20 +22,14 @@ and replug, including unplug with I/O in flight; reply-timeout injection through
 ABORT_TASK, LUN RESET, TARGET RESET and controller reset; sleep/wake; and
 shutdown.
 
-With two targets on the expander (the SATA test disk and a 6 TB SAS disk that
-belongs to a ZFS array) the driver publishes one nub per target with its own
-geometry, INQUIRY identity and completion ownership, and routes every command by
-DevHandle. Access is fail-closed: a target is read-only unless an explicit
-`MPRWritableDevices` rule matches its ATA model and serial, and an SSP device is
-always read-only, so the array member cannot receive a write. On the running
-system the array member's read-only media was reported as such, raw reads at LBA
-0 and at 5.6 TB matched across passes and across a reboot, and every completed
-write was attributed to the writable target while the array member's write count
-stayed zero.
+With two targets on the expander the driver publishes one nub per target with
+its own geometry, INQUIRY identity and completion ownership, and routes every
+command by DevHandle. Every published target is writable; the driver keeps no
+per-device write allowlist. Write accounting is per target, so each completed
+write is attributable to the device that received it.
 
 Pulling either disk while the other stays published was also exercised, with a
-read in flight on the array member and with a write in flight on the writable
-disk. The dropped target is retired with TARGET_RESET, a drain of its aborted
+read in flight on one target and with a write in flight on the other. The dropped target is retired with TARGET_RESET, a drain of its aborted
 commands and SAS IO Unit Control REMOVE_DEVICE, all naming that handle; its
 medium goes offline, the other target keeps serving I/O, and the request in
 flight fails with a device error instead of completing silently. A returned disk
@@ -47,8 +41,8 @@ seconds to about 25 s, during which the other targets are briefly offline. The
 exFAT volume that was being written verified clean after the pull.
 
 Sleep and wake with both targets attached is exercised. Sleep flushes each
-writable target; wake brings both media back at their own disk numbers in under
-25 s, with the array member's leading 8 MiB digest unchanged. A disk that is
+published target; wake brings both media back at their own disk numbers in under
+25 s with byte-exact readback on both. A disk that is
 still becoming ready is retried in place instead of being counted as a failed
 probe. The wake rebuilds the controller before the first topology read and
 gives config/event and PortEnable replies a bounded settling budget, so fabric
@@ -56,8 +50,9 @@ settling produces no protocol fault and no extra IOC reset. One planned
 controller rebuild per wake remains mandatory after S3; the power-state and
 fault counters behind these claims are listed in [DEBUG.md](DEBUG.md).
 
-Not covered: SAS/SSP write paths, multipath, multiple LUNs, enclosure services,
-long duration or concurrent stress, and throughput tuning are out of scope.
+Not covered: SAS/SSP write paths are not verified on hardware; multipath,
+multiple LUNs, enclosure services, long duration or concurrent stress, and
+throughput tuning are out of scope.
 The long-run result recorded in [PLAN.md](PLAN.md) belongs to an earlier
 serial-command prototype, not to the current asynchronous scheduler.
 Wire-format and large-LBA cases are checked on the host, not on this hardware.
@@ -83,6 +78,8 @@ Wire-format and large-LBA cases are checked on the host, not on this hardware.
 - Per-target media offline/online lifecycle, guarded TARGET_RESET / drain /
   REMOVE_DEVICE with handle-reuse checks, and bounded full-controller recovery
   as the fallback when a removal or a definite probe failure cannot be proved.
+- Every published target is writable, with no per-device allowlist or
+  write-protection state; write accounting stays per target.
 - Three-way probe classification (ok / not-ready / failed) with one bounded
   per-target retry budget: a device answering NOT READY, UNIT ATTENTION or BUSY
   is retried without consuming the failure budget or triggering an IOC reset.

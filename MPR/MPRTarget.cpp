@@ -280,7 +280,6 @@ MPRController::readSasIOUnitPage0(void)
                 slot->probeValid = false;
                 slot->identityValid = false;
                 slot->removalRequested = false;
-                slot->readOnly = true;
                 setProperty("MPRTargetReuseState", "handle-reassigned");
             } else {
                 /* A disk that returns after REMOVE_DEVICE gets a new firmware
@@ -318,7 +317,6 @@ MPRController::readSasIOUnitPage0(void)
                     memset(slot, 0, sizeof(*slot));
                     slot->nub = reusedNub;
                     slot->handle = handle;
-                    slot->readOnly = true;
                 }
             }
         }
@@ -370,7 +368,6 @@ MPRController::readSasIOUnitPage0(void)
     setProperty("MPRTargetCount", (unsigned long long)fTargetCount, 32);
     publishTargetProperties();
     /* Every eligible target stays in the table; publication is per target.
-     * An unmatched identity is read-only, so a ZFS member is never writable.
      * The selected handle's own device page is a cross-check, not a gate: one
      * unreadable page must not keep the other targets unpublished. */
     if (selected != 0 && !readSasDevicePage0(selected)) {
@@ -554,53 +551,6 @@ MPRController::probeStableIdentity(void)
     if (fTargetIdentityValid) setProperty("MPRStableIdentity", fTargetIdentity);
     else removeProperty("MPRStableIdentity");
     return fTargetIdentityValid && !fProtocolRecoveryPending;
-}
-
-bool
-MPRController::loadWritePolicy(void)
-{
-    fWriteRuleCount = 0;
-    fTargetModel[0] = 0;
-    fTargetSerial[0] = 0;
-    fTargetReadOnly = true;
-    for (UInt32 i = 0; i < kMPRMaxWriteRules; i++) {
-        fWriteRuleModel[i][0] = 0;
-        fWriteRuleSerial[i][0] = 0;
-    }
-    OSArray *rules = OSDynamicCast(OSArray, getProperty("MPRWritableDevices"));
-    if (rules != NULL) {
-        for (UInt32 i = 0;
-             i < rules->getCount() && fWriteRuleCount < kMPRMaxWriteRules; i++) {
-            OSDictionary *rule = OSDynamicCast(OSDictionary, rules->getObject(i));
-            if (rule == NULL) continue;
-            OSString *model = OSDynamicCast(OSString, rule->getObject("Model"));
-            OSString *serial = OSDynamicCast(OSString, rule->getObject("Serial"));
-            if (model == NULL || serial == NULL) continue;
-            strlcpy(fWriteRuleModel[fWriteRuleCount], model->getCStringNoCopy(),
-                    sizeof(fWriteRuleModel[0]));
-            strlcpy(fWriteRuleSerial[fWriteRuleCount], serial->getCStringNoCopy(),
-                    sizeof(fWriteRuleSerial[0]));
-            fWriteRuleCount++;
-        }
-    }
-    setProperty("MPRWriteRuleCount", (unsigned long long)fWriteRuleCount, 8);
-    return true;
-}
-
-bool
-MPRController::isWritableIdentity(const char *model, const char *serial) const
-{
-    /* An unidentified target is never writable. A wildcard serial would make
-     * every disk writable, so only concrete serial rules can grant access. */
-    if (model == NULL || serial == NULL || serial[0] == 0) return false;
-    for (UInt32 i = 0; i < fWriteRuleCount; i++) {
-        if (fWriteRuleSerial[i][0] == 0 ||
-            strcmp(fWriteRuleSerial[i], "*") == 0) continue;
-        bool modelMatch = strcmp(fWriteRuleModel[i], "*") == 0 ||
-                          strcmp(fWriteRuleModel[i], model) == 0;
-        if (modelMatch && strcmp(fWriteRuleSerial[i], serial) == 0) return true;
-    }
-    return false;
 }
 
 MPRTargetSlot *
@@ -916,8 +866,6 @@ MPRController::publishTargetProperties(void)
         setProperty(name, (unsigned long long)slot->probeRetries, 32);
         snprintf(name, sizeof(name), "MPRTarget%uOnline", (unsigned)i);
         setProperty(name, slot->online);
-        snprintf(name, sizeof(name), "MPRTarget%uReadOnly", (unsigned)i);
-        setProperty(name, slot->readOnly);
         snprintf(name, sizeof(name), "MPRTarget%uBlocks", (unsigned)i);
         setProperty(name, (unsigned long long)slot->capacityBlocks, 64);
         snprintf(name, sizeof(name), "MPRTarget%uBlockSize", (unsigned)i);
@@ -1113,11 +1061,6 @@ MPRController::probeTarget(MPRTargetSlot *slot)
     strlcpy(slot->model, fTargetModel[0] != 0 ? fTargetModel : fProduct,
             sizeof(slot->model));
     strlcpy(slot->serial, fTargetSerial, sizeof(slot->serial));
-    /* Only a SATA/STP disk with an explicit identity rule may be writable.
-     * SSP targets such as the ZFS array member are always read-only, even if
-     * a rule would otherwise match a stale identity. */
-    bool sataTarget = (slot->deviceInfo & MPI2_SAS_DEVICE_INFO_SATA_DEVICE) != 0;
-    slot->readOnly = !sataTarget || !isWritableIdentity(slot->model, slot->serial);
     slot->unmapEnabled = fUnmapEnabled;
     slot->unmapLimits = fUnmapLimits;
     slot->nativeFua = fNativeFuaSupported;
@@ -1150,9 +1093,9 @@ MPRController::publishTarget(MPRTargetSlot *slot)
         fPagePhys == 0 || fDataPhys == 0 || fDataBytes == 0) return false;
     if (slot->nub != NULL) {
         /* The nub stayed attached while the medium was offline. Re-point it at
-         * this target's current handle, policy and geometry, and let the
-         * unlocked worker deliver OFFLINE -> ONLINE around the transition. */
-        slot->nub->setController(this, slot->handle, slot->readOnly);
+         * this target's current handle and geometry, and let the unlocked
+         * worker deliver OFFLINE -> ONLINE around the transition. */
+        slot->nub->setController(this, slot->handle);
         slot->onlinePending = true;
         setTargetRemovalState(slot, "live");
         publishTargetProperties();
@@ -1164,7 +1107,7 @@ MPRController::publishTarget(MPRTargetSlot *slot)
         nub->release();
         return false;
     }
-    nub->setController(this, slot->handle, slot->readOnly);
+    nub->setController(this, slot->handle);
     if (!nub->attach(this)) {
         nub->release();
         return false;
@@ -1213,13 +1156,10 @@ MPRController::ensureTargetsPublished(void)
         }
         published++;
     }
-    /* Point the controller's default handle at a writable target when one
-     * exists; the legacy synchronous helpers use it. Per-request routing never
+    /* Point the controller's default handle at the first published target;
+     * the legacy synchronous helpers use it. Per-request routing never
      * depends on this default. */
     UInt16 defaultHandle = 0;
-    for (UInt32 i = 0; i < kMPRMaxTargets && defaultHandle == 0; i++)
-        if (fTargets[i].nub != NULL && !fTargets[i].readOnly)
-            defaultHandle = fTargets[i].handle;
     for (UInt32 i = 0; i < kMPRMaxTargets && defaultHandle == 0; i++)
         if (fTargets[i].nub != NULL) defaultHandle = fTargets[i].handle;
     fAttachedDevHandle = defaultHandle;
