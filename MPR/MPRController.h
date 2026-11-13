@@ -254,6 +254,9 @@ private:
     UInt32                     fRemovalFailures;
     UInt32                     fFaultRecoveries;
     UInt32                     fIdleScanTicks;
+    /* Watchdog ticks after a wake during which the IOC may legitimately still
+     * report a non-operational doorbell. */
+    UInt32                     fResumeGraceTicks;
     /* A disk that leaves the fabric behind an expander is not necessarily
      * rediscovered when it returns: without SMP there is no per-phy reset, so
      * the IOC only re-runs discovery on PortEnable. These count the age of the

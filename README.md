@@ -1,6 +1,6 @@
 # MPR — Fusion-MPT SAS3 (SAS3008) kext for macOS
 
-Date: 2026-11-13. Driver version: 0.20.6.
+Date: 2026-11-13. Driver version: 0.20.8.
 
 MPR is an IOKit block-storage driver for the LSI/Broadcom SAS3008
 (`PCI 0x1000:0x0097`, MPI 2.5) on x86_64 macOS. It publishes every eligible
@@ -46,10 +46,12 @@ resets (8 s and 45 s after the removal) to re-run fabric discovery; each takes
 seconds to about 25 s, during which the other targets are briefly offline. The
 exFAT volume that was being written verified clean after the pull.
 
-Not covered: sleep and wake with two targets behind the expander; SAS/SSP write
-paths, multipath, multiple LUNs, enclosure services, long duration or concurrent
-stress, and throughput tuning are out of scope. Wire-format and large-LBA cases
-are checked on the host, not on this hardware.
+Not covered: SAS/SSP write paths, multipath, multiple LUNs, enclosure services,
+long duration or concurrent stress, and throughput tuning are out of scope.
+Wire-format and large-LBA cases are checked on the host, not on this hardware.
+Sleep and wake with both targets attached was exercised: sleep flushes the
+writable target, and wake brings both media back at their own disk numbers in
+about 20 s, one bounded reset included while the fabric and the disks come up.
 
 ## Capabilities
 

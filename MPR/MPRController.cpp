@@ -3015,6 +3015,7 @@ MPRController::start(IOService *provider)
     fRemovalFailures = 0;
     fFaultRecoveries = 0;
     fIdleScanTicks = 0;
+    fResumeGraceTicks = 0;
     fRemovedMediaCount = 0;
     fRemovedAgeTicks = 0;
     fRediscoveryResets = 0;
@@ -3107,7 +3108,7 @@ MPRController::start(IOService *provider)
     setProperty("MPRMMIOLength", (unsigned long long)length, 64);
     setProperty("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     setProperty("MPRStage", "read-write");
-    setProperty("MPRBuild", "0.20.6");
+    setProperty("MPRBuild", "0.20.8");
     setProperty("MPRFeatures",
                 "async-pool,ieee-sgl-chain,read-write16,cache16,unmap-limits,"
                 "stable-identity,raid-filter,auto-sense,tmf,remove-device,pm-quiesce");
@@ -3381,7 +3382,13 @@ MPRController::resumePower(void)
     bool ready = !fStopping && fPowerQuiesced && fPCIDevice != NULL &&
         fPCIDevice->setMemoryEnable(true) && fPCIDevice->setBusMasterEnable(true);
     if (ready) ready = resetAndReinitialize();
-    if (ready) ready = ensureTargetsPublished();
+    /* The fabric needs a moment after the IOC reset on wake: the expander and
+     * the disks renegotiate their links, and probing them immediately made the
+     * first probe fail and cost an extra reset. */
+    if (ready) {
+        IOSleep(1500);
+        ready = ensureTargetsPublished();
+    }
     /* Every medium that was published before sleep takes OFFLINE -> ONLINE
      * around this rebuild, whatever its identity: a disk inserted while asleep
      * must not be attached to the old medium. */
@@ -3393,6 +3400,9 @@ MPRController::resumePower(void)
     }
     fSuspended = false;
     fPowerQuiesced = false;
+    /* The IOC can report a non-operational doorbell for a moment after wake;
+     * that is a settling state, not a fault that needs its own reset. */
+    fResumeGraceTicks = 4;
     IOSimpleLockLock(fReplyLock);
     fHotplugPending = true;
     IOSimpleLockUnlock(fReplyLock);
@@ -4001,7 +4011,9 @@ void
 MPRController::watchdogTimeout(IOTimerEventSource *sender)
 {
     if (fStopping) return;
-    if (!fStarting && !fReinitInProgress && !fSuspended && fRegs != NULL) {
+    if (fResumeGraceTicks != 0) fResumeGraceTicks--;
+    if (!fStarting && !fReinitInProgress && !fSuspended && fRegs != NULL &&
+        fResumeGraceTicks == 0) {
         UInt32 state = readReg(MPI2_DOORBELL_OFFSET) & MPI2_IOC_STATE_MASK;
         setProperty("MPRWatchdogIOCState", (unsigned long long)state, 32);
         if (state != MPI2_IOC_STATE_OPERATIONAL)
@@ -4180,13 +4192,14 @@ MPRController::hotplugThread(void)
             if (slot->handle == 0 || !slot->present) continue;
             dirty = true;
             if (!slot->probeValid) {
-                if (slot->probeFailures >= 3) continue;
+                if (slot->probeFailures >= 4) continue;
                 if (!probeTarget(slot)) {
                     slot->probeFailures++;
                     slot->failureCount++;
-                    /* One failed probe is retried in place; repeated failure
-                     * is what justifies an IOC reset. */
-                    if (slot->probeFailures >= 2) probeFailed = true;
+                    /* The first two failures are retried in place; repeated
+                     * failure is what justifies an IOC reset. A wake needs the
+                     * extra attempt because the fabric is still settling. */
+                    if (slot->probeFailures >= 3) probeFailed = true;
                     else retry = true;
                     continue;
                 }
@@ -4371,6 +4384,9 @@ done:
         IOSimpleLockUnlock(fReplyLock);
     }
     setProperty("MPRHotplugState", state);
+    /* A wake that the worker had to finish must not leave the power state
+     * claiming recovery is still pending. */
+    if (!fSuspended && live != 0) setProperty("MPRPowerState", "on");
     setProperty("MPRMediaPresent", fMediaPresent);
     setProperty("MPRDeviceOffline", fDeviceOffline);
     setProperty("MPRMediaGeneration", (unsigned long long)fMediaGeneration, 32);

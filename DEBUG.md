@@ -1,6 +1,6 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.20.6.
+Date: 2026-11-13. Driver version: 0.20.8.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
@@ -226,10 +226,16 @@ after DMA stop is proved.
 
 Wake restores PCI access, rebuilds queues/events/topology, re-enumerates and
 re-probes every present target, then reopens acceptance; each medium takes
-OFFLINE -> ONLINE around that rebuild. A failed wake retires media and requests
-bounded recovery. `systemWillShutdown` follows the same quiesce path.
-Sleep/wake and shutdown are qualified on the directly attached disk only; they
-have not been repeated with several targets behind an expander.
+OFFLINE -> ONLINE around that rebuild. The fabric needs a moment to settle, so
+the wake path waits 1.5 s after the IOC reset before probing, tolerates three
+probe failures in place, and ignores a non-operational doorbell for four
+watchdog ticks, because after wake the IOC can report standby while it comes up.
+A disk that is still spinning up can outlast that budget; the bounded reset then
+runs and the media come back through it. When recovery completes the worker sets
+`MPRPowerState` to `on`, so a wake that needed it does not keep reporting
+`wake-recovery-pending`. `systemWillShutdown` follows the same quiesce path.
+Sleep/wake and shutdown are qualified on the directly attached disk and with two
+targets behind the expander.
 
 Stop waits for the I/O and completion workers outside the transport lock,
 then tears down DMA. Scheduler/transport locks remain alive until final
