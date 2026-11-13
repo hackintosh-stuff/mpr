@@ -133,4 +133,32 @@ mprRaidConfigContains(const uint8_t *page, uint32_t actual,
     return true;
 }
 
+/* Same peripheral/flat/extended-flat LUN encodings as FreeBSD
+ * mpr_sas.h::mprsas_set_lun. The address key is private host state; only its
+ * low 16 bits are a firmware handle. Never put the key in an MPI DevHandle. */
+static inline uint64_t mprTargetKey(uint16_t handle, uint32_t lun)
+{ return ((uint64_t)lun << 16) | handle; }
+static inline bool mprEncodeLun(uint8_t out[8], uint32_t lun)
+{
+    for (unsigned i = 0; i < 8; ++i) out[i] = 0;
+    if (lun <= 255) out[1] = (uint8_t)lun;
+    else if (lun <= 0x3fff) { out[0] = 0x40 | (uint8_t)(lun >> 8); out[1] = (uint8_t)lun; }
+    else if (lun <= 0xffffff) {
+        out[0] = 0xd2; out[1] = (uint8_t)(lun >> 16);
+        out[2] = (uint8_t)(lun >> 8); out[3] = (uint8_t)lun;
+    } else return false;
+    return true;
+}
+static inline bool mprDecodeLun(const uint8_t in[8], uint32_t *lun)
+{
+    if (!in || !lun) return false;
+    unsigned end = 2;
+    if (in[0] == 0) *lun = in[1];
+    else if ((in[0] & 0xc0) == 0x40) *lun = ((uint32_t)(in[0] & 0x3f) << 8) | in[1];
+    else if (in[0] == 0xd2) { *lun = ((uint32_t)in[1] << 16) | ((uint32_t)in[2] << 8) | in[3]; end = 4; }
+    else return false;
+    for (unsigned i = end; i < 8; ++i) if (in[i]) return false;
+    return true;
+}
+
 #endif

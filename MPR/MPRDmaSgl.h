@@ -140,7 +140,8 @@ mprBuildNvmeSgl(uint8_t *request, uint32_t requestBytes, uint32_t sglOffset,
     /* The firmware directly translates small, inline IEEE lists. This also
      * keeps probe/configuration-sized I/O working without a PRP allocation. */
     if (segmentCount <= (requestBytes - sglOffset) / 16 &&
-        (segments[0].address & 4095) + expectedBytes <= 5 * 4096)
+        (segments[0].address & 4095) + expectedBytes <= 5 * 4096 &&
+        (expectedBytes <= 4 * 4096 || segments[0].length >= expectedBytes - 4 * 4096))
         return mprBuildIeeeSgl(request, requestBytes, sglOffset, segments,
             segmentCount, expectedBytes, NULL, 0, 0, 0, 0, result);
     if (requestBytes - sglOffset < 32 || !prpStorage || !prpAddress ||

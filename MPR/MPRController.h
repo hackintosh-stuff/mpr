@@ -13,9 +13,11 @@
 #include <libkern/c++/OSMetaClass.h>
 #include "MPRScsi.h"
 #include "MPRPerformance.h"
+#include "MPRControlABI.h"
 
 class IOPCIDevice;
 class MPRBlockDev;
+class IOUserClient;
 class IOTimerEventSource;
 struct IOBlockStorageDeviceExtent;
 struct IOStorageCompletion;
@@ -45,7 +47,7 @@ struct MPRReplySlot
     UInt16          smid;
     UInt8           kind;       /* 1 = address, 2 = fast success, 3 = reset abort */
     UInt8           reserved;
-    UInt8           reply[64];
+    UInt8           reply[kMPRControlMaxReply];
 };
 
 enum { kMPREventAckQueueDepth = 64 };
@@ -68,6 +70,10 @@ struct MPRCommandOwner {
     UInt8 function;
     UInt16 handle;
     UInt32 epoch;
+    UInt32 lun;
+    UInt64 targetIdentity;
+    UInt32 targetGeneration;
+    UInt8 targetKind;
 };
 
 /* A probe pass ends in one of three states. A device that is still becoming
@@ -107,6 +113,21 @@ enum MPRTargetKind { kMPRTargetSas, kMPRTargetRaidVolume, kMPRTargetNvme };
 
 struct MPRTargetSlot {
     MPRTargetKind kind;
+    UInt32 lun;
+    enum { kPathLimit = 8 };
+    struct Path {
+        UInt16 handle, flags;
+        UInt32 info, maxTransfer;
+        UInt8 resetTimeout;
+    } paths[kPathLimit];
+    UInt32 pathCount;
+    bool managementOnly;
+    UInt8 peripheralType;
+    UInt8 protectionType;
+    bool protectionUnsupported;
+    bool tlrEnabled;
+    bool solidState, rotationKnown;
+    UInt64 key(void) const { return mprTargetKey(handle, lun); }
     UInt32 maxTransferBytes;
     UInt8 resetTimeoutSeconds;
     bool hiddenByRaid;
@@ -164,6 +185,42 @@ private:
     UInt16 fMpiVersion;
     bool fNvmeProtocol, fAtomicRequests;
     UInt32 fNvmeDsmCommands;
+    UInt8 fIocFactsSnapshot[128];
+    IOBufferMemoryDescriptor *fControlBuffer;
+    UInt64 fControlPhys;
+    UInt32 fControlBufferBytes;
+    bool fControlBufferPrepared, fControlDmaBusy;
+    bool fManagementEnabled, fMaintenanceMode;
+    UInt32 fShutdownSsuPolicy;
+    bool fFirmwareDownloadActive, fFirmwareDownloadPoisoned;
+    UInt8 fFirmwareImageType;
+    UInt32 fFirmwareTotal, fFirmwareOffset;
+    UInt64 fFirmwareToken;
+    bool shutdownDevices(void);
+    bool applyScsiTargetPolicy(UInt8 *frame, MPRTargetSlot *slot);
+    struct DiagnosticBuffer {
+        IOBufferMemoryDescriptor *memory;
+        UInt64 address;
+        UInt32 bytes, uniqueId, epoch;
+        bool prepared, owned, valid;
+    } fDiagnostic[3];
+    MPRControlEvent fControlEvents[kMPRControlEventCount];
+    UInt64 fControlEventSequence;
+    UInt32 fControlEventMask[4];
+    IOReturn controlDispatch(const MPRControlInput &input, const UInt8 *request,
+                             const UInt8 *dataOut, MPRControlOutput *output);
+    IOReturn controlPassthrough(const MPRControlInput &input, const UInt8 *request,
+                                const UInt8 *dataOut, MPRControlOutput *output);
+    IOReturn controlDiagnostic(const MPRControlInput &input, const UInt8 *request,
+                               MPRControlOutput *output);
+    bool allocateControlBuffer(UInt32 bytes);
+    void freeControlBuffers(bool dmaStopped);
+    void recordControlEventLocked(UInt16 event, UInt32 context,
+                                   const UInt8 *payload, UInt32 bytes);
+    void releaseDiagnosticEventLocked(const UInt8 *reply, UInt32 bytes);
+    bool submitControlFrame(UInt32 flags, UInt32 high, UInt32 timeout,
+                             UInt8 *reply, UInt8 *kind);
+
     UInt32           fMaxChainDepth;
     UInt32           fChainFrameBytes;
     bool             fPowerQuiesced;
@@ -181,7 +238,7 @@ private:
     IOReturn beginAsyncBarrier(void);
     void   endAsyncBarrier(void);
     void   setAsyncAcceptance(bool enabled);
-    bool   quiescePower(void);
+    bool   quiescePower(bool shutdown = false);
     bool   resumePower(void);
 
     IOPCIDevice      *fPCIDevice;
@@ -400,6 +457,12 @@ private:
 
     /* SCSI IO completion tracking. */
     UInt32                     fAttachedDevHandle;
+    UInt32                     fAttachedLun;
+    UInt64 currentTargetKey(void) const { return mprTargetKey((UInt16)fAttachedDevHandle, fAttachedLun); }
+    bool discoverLogicalUnits(UInt32 token);
+    bool finalizeTargetPaths(UInt32 token);
+    UInt32 fTargetGenerationSerial;
+    UInt32 nextTargetGeneration(void);
 
     /* Target table. Model and serial are the probed identity published in
      * IORegistry; they no longer gate write access. */
@@ -458,7 +521,7 @@ private:
     bool   commandDmaSafe(UInt32 smid);
     void   cancelUnpostedCommand(UInt32 smid);
     bool   drainTaskManagedCommands(UInt16 handle, UInt16 taskMid,
-                                    bool wholeTarget);
+                                    bool wholeTarget, UInt32 lun = UINT32_MAX);
     bool   beginManagementRequest(UInt32 smid);
     bool   finishManagementRequest(UInt32 smid, UInt32 timeoutMs,
                                     UInt8 *reply, UInt8 *kind);
@@ -483,7 +546,7 @@ private:
                           UInt32 *actualBytes, UInt16 *iocStatus = NULL);
     bool   mergeTarget(MPRTargetKind kind, UInt16 handle, UInt64 address,
                         UInt32 info, UInt16 flags, UInt32 token,
-                        UInt32 maxTransfer = 0, UInt8 resetTimeout = 0);
+                        UInt32 maxTransfer = 0, UInt8 resetTimeout = 0, UInt32 lun = 0);
     bool   scanAdditionalTargets(UInt32 token, UInt32 *selected);
     bool   readAdditionalTarget(MPRTargetSlot *slot, bool *present, UInt64 *address);
     bool   checkOtherTargetKinds(UInt16 handle, MPRTargetKind expected, bool *occupied);
@@ -497,10 +560,10 @@ private:
     bool   checkTargetIdentity(void);
     bool   isNativeFuaSupported(void) const { return fNativeFuaSupported; }
     IOReturn synchronizeCacheNow(UInt64 block, UInt64 nblks, bool barrier,
-                                 UInt32 expectedGeneration, UInt16 handle);
+                                 UInt32 expectedGeneration, UInt64 handle);
     IOReturn unmapBlocksNow(const IOBlockStorageDeviceExtent *extents,
                             UInt32 extentsCount, UInt32 expectedGeneration,
-                            UInt16 handle);
+                            UInt64 handle);
 
     bool   postScsiIo(UInt32 smid);
     bool   scsiTur(void);
@@ -531,7 +594,7 @@ private:
     void   beginProbeStage(void);
     void   noteProbeStatus(IOReturn status);
     void   recordProbeResult(MPRTargetSlot *slot, MPRProbeResult result);
-    bool   selectTarget(UInt16 handle);
+    bool   selectTarget(UInt64 handle);
     MPRTargetSlot *allocTargetSlot(void);
     void   requestTargetRemoval(MPRTargetSlot *slot);
     void   invalidateTarget(MPRTargetSlot *slot);
@@ -574,7 +637,7 @@ private:
     IOReturn issueNvmeDsm(const IOBlockStorageDeviceExtent *extents,
                           UInt32 count, UInt32 smid);
     bool   sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid,
-                        UInt16 handle, UInt16 *iocStatus = NULL);
+                        UInt16 handle, UInt16 *iocStatus = NULL, UInt32 lun = 0);
     bool   recoverTimedOutCommand(UInt32 smid);
     bool   resetAndReinitialize(void);
 
@@ -587,21 +650,26 @@ public:
     virtual IOReturn setPowerState(unsigned long stateNumber,
                                    IOService *whatDevice) APPLE_KEXT_OVERRIDE;
     virtual void systemWillShutdown(IOOptionBits specifier) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn newUserClient(task_t task, void *securityId, UInt32 type,
+        OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
+    bool managementEnabled(void) const { return fManagementEnabled && !fStopping; }
+    IOReturn controlRequest(const UInt8 *input, UInt32 inputSize, UInt8 *output,
+                            UInt32 outputSize, UInt32 *produced);
 
     /* Multi-target discovery. */
-    MPRTargetSlot *findTarget(UInt16 handle);
+    MPRTargetSlot *findTarget(UInt64 handle);
     UInt32 targetCount(void) const { return fTargetCount; }
-    UInt32 getBlockSizeForHandle(UInt16 handle) {
+    UInt32 getBlockSizeForHandle(UInt64 handle) {
         MPRTargetSlot *slot = findTarget(handle);
         return slot != NULL ? slot->blockSize : 0;
     }
-    UInt64 getCapacityForHandle(UInt16 handle) {
+    UInt64 getCapacityForHandle(UInt64 handle) {
         MPRTargetSlot *slot = findTarget(handle);
         return slot != NULL ? slot->capacityBlocks : 0;
     }
     /* A published target is one whose current device was probed and whose
      * medium has not been retired; a bare topology entry is not media. */
-    bool isMediaPresentForHandle(UInt16 handle) {
+    bool isMediaPresentForHandle(UInt64 handle) {
         MPRTargetSlot *slot = findTarget(handle);
         return slot != NULL && slot->present && slot->probeValid;
     }
@@ -611,16 +679,16 @@ public:
     IOReturn submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
                                UInt64 block, UInt64 nblks, bool fua,
                                const IOStorageCompletion *completion,
-                               UInt16 devHandle = 0);
+                               UInt64 devHandle = 0);
     IOReturn readBlocks(IOMemoryDescriptor *buffer, UInt64 block,
                         UInt64 nblks, UInt64 *actualBytes);
     IOReturn transferBlocks(bool write, IOMemoryDescriptor *buffer,
                             UInt64 block, UInt64 nblks, bool fua,
                             UInt64 *actualBytes);
     IOReturn synchronizeCache(UInt64 block, UInt64 nblks, bool barrier,
-                              UInt16 handle);
+                              UInt64 handle);
     IOReturn unmapBlocks(const IOBlockStorageDeviceExtent *extents,
-                         UInt32 extentsCount, UInt16 handle);
+                         UInt32 extentsCount, UInt64 handle);
     UInt64   getCapacityBlocks(void) const { return fCapacityBlocks; }
     bool     isDeviceOffline(void) const { return fDeviceOffline; }
     bool     isMediaPresent(void) const { return fMediaPresent; }
@@ -630,15 +698,15 @@ public:
     char    *getRevisionString(void) { return fRevision; }
     /* Identity strings are per target: every published disk has its own
      * INQUIRY response, not the response of whichever target was probed last. */
-    char    *getVendorStringForHandle(UInt16 handle) {
+    char    *getVendorStringForHandle(UInt64 handle) {
         MPRTargetSlot *slot = findTarget(handle);
         return slot != NULL ? slot->vendor : fVendor;
     }
-    char    *getProductStringForHandle(UInt16 handle) {
+    char    *getProductStringForHandle(UInt64 handle) {
         MPRTargetSlot *slot = findTarget(handle);
         return slot != NULL ? slot->product : fProduct;
     }
-    char    *getRevisionStringForHandle(UInt16 handle) {
+    char    *getRevisionStringForHandle(UInt64 handle) {
         MPRTargetSlot *slot = findTarget(handle);
         return slot != NULL ? slot->revision : fRevision;
     }

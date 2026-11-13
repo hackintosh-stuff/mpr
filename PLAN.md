@@ -1,9 +1,10 @@
 # PLAN — Fusion-MPT SAS3 / Tri-Mode driver for macOS
 
-Status: source 0.23.0 (2026-11-13). The exact FreeBSD PCI table, MPI 2.6,
-GEN35/SEA, IR volume and PCIe NVMe paths are implemented. This source-only change
-has host protocol and cross-compilation evidence, not native link/sign/load or
-new hardware evidence. All runtime results and completed milestones retained
+Status: source 0.24.0 (2026-11-14). The exact FreeBSD PCI table, MPI 2.6,
+GEN35/SEA, IR volume and PCIe NVMe paths are implemented, together with per-LUN
+routing, EEDP/TLR, native administrator control, diagnostic buffers, bounded path
+selection and shutdown device commands. Evidence is compilation/source review,
+not current tests, native link/sign/load or new hardware evidence. All runtime results and completed milestones retained
 below belong to the documented 0.21.0/earlier SAS3008 baseline. No deployment or
 running-version inspection was performed for this change.
 
@@ -56,7 +57,7 @@ capacity, current device node), never a remembered `diskN`.
 1. A purpose-built `IOService` (provider = `IOPCIDevice`) that implements the HBA:
    PCI enable, BAR mapping, IOC reset and initialization, queues, interrupts,
    event subscription and acknowledgement.
-2. Eligible SAS/SATA disks, IR logical volumes and PCIe NVMe LUN-0 targets (up to
+2. Eligible SAS/SATA disks, IR logical volumes and PCIe NVMe logical units (up to
    64 typed target slots) published through the system
    `IOBlockStorageDriver` as its own whole-disk `IOMedia`, with per-target
    identity, geometry and medium lifetime; every published target is writable and
@@ -69,14 +70,16 @@ capacity, current device node), never a remembered `diskN`.
 
 ### 1.3 Out of scope
 
-- RAID creation/reconfiguration, raw member/spare access, SES enclosure services,
-  SMP passthrough, firmware update and booting from this driver's disks.
-- Multiple LUNs / additional NVMe namespaces, multipath, SAS2 (`mps`/`0x0072`)
-  and unrelated MegaRAID (`mrsas`) IDs; SEA non-secure modes are refused.
-- Hardware qualification of newly matched controllers, RAID volumes and PCIe
-  NVMe paths is not established by host checks or object cross-compilation.
-- Apple Silicon, dext/DriverKit, multi-queue/MSI-X expansion, a FreeBSD user
-  ioctl compatibility layer.
+- Native tape/optical class drivers, SCSI target mode, cross-controller MPIO/ALUA,
+  load balancing, and automatic identity merging across different SAS port WWIDs.
+- FreeBSD CAM target numbering / automatic firmware DPM mapping writes and binary
+  ioctl compatibility. Native location/identity and IOUserClient APIs are used.
+- Arbitrary queue-register writes, persistent user DMA/queue registration, and
+  bidirectional SCSI passthrough; vendor-specific management GUIs are not supplied.
+- SAS2 (`mps`), unrelated MegaRAID (`mrsas`), SEA non-secure modes, Apple Silicon,
+  dext/DriverKit, booting from this driver, hardware multi-queue and signed release.
+- Hardware qualification is not implied by compilation; existing runtime evidence
+  belongs to the earlier SAS3008 baseline.
 - Subclassing `IOSCSIParallelInterfaceController` (route B in §3); kept only as a
   later evaluation.
 
@@ -97,8 +100,9 @@ Directory layout:
 mpr/
   README.md  DEBUG.md  PLAN.md  AGENTS.md  NOTICE
   MPR/                               (MPRController, MPRBlockDev, MPRAsync, MPRTarget,
+                                      MPRControl.cpp, MPRUserClient.cpp, MPRControlABI.h, MPRUserClient.h,
                                       MPRCompletion.h, MPRDmaSgl.h, MPRPerformance.h,
-                                      MPRScsi.h, MPI/mpi2_min.h, MPI/mpi2_target.h, MPI/mpi26_devices.h,
+                                      MPRScsi.h, MPI/mpi2_min.h, MPI/mpi2_target.h, MPI/mpi26_devices.h, MPI/mpi2_mgmt.h,
                                       Info.plist)
   MPR.xcodeproj/                     (project entry point)
   tools/build-noxcode.sh             (Command Line Tools build entry point)
@@ -136,7 +140,7 @@ suspend/resume returns `EINVAL`, so the power path has to be written here.
 
 The status column separates source implementation from recorded hardware
 measurements. *Current* in the retained baseline rows means the 0.21.0 measurement
-set, not a load-test of 0.23.0. *Baseline* means an earlier build. *Implemented*
+set, not a load-test of 0.24.0. *Baseline* means an earlier build. *Implemented*
 means code exists without new hardware evidence.
 
 | Capability | Status | Boundary |
@@ -165,9 +169,9 @@ means code exists without new hardware evidence.
 | M3 single-disk read-only | independent-disk discovery, identity and capacity, read-only nub, large sequential read consistency | done |
 | M4 read/write and recovery | WRITE, cache flush/FUA, UNMAP, sense, timeout/TMF/reset | done; the fault-injected soak stopped short (§6), the serial-command prototype's 90-minute run is in §7 |
 | M5 topology, hotplug and PM | nub add/remove, handle-reuse isolation, safe stop, sleep/wake | complete on the baseline build (direct attach and the dual-target backplane, including a pull with I/O in flight); the 0.21.0 baseline re-qualified sleep/wake only |
-| M6 diagnostic tooling (optional) | standalone `IOUserClient`/tool, statistics export | not done; IORegistry properties and boot arguments are used instead |
+| M6 diagnostic tooling | native IOUserClient and mprctl.py, facts/targets/events/diagnostic buffers | implemented; administrator and boot-option gated, hardware unverified |
 | Performance data path | client DMA, bounded command pool, ready-first harvest and refill, batched single-ring replies with wakeups | done on one target: native build/link/sign/load, read-only correctness, A/B latency and throughput against the preceding build, one TMF escalation, a small write and flush cycle, two sleep/wake cycles, four recovery variants; UNMAP, physical replug, dual target and shutdown not re-run |
-| M7 later | RAID management, SES, multiple hardware queues, boot disk, signed release; route B / dext evaluation | outside the current scope |
+| M7 later | OS-native non-block classes, cross-controller path policy, multiple hardware queues, boot disk and signed release | not implemented |
 
 ## 6. Not yet done
 
@@ -177,10 +181,9 @@ means code exists without new hardware evidence.
   reads topology, so it is no longer triggered by a config-page timeout or a
   spin-up probe; `MPRStickyFaultCount`, `MPRFaultRecoveries` and
   `MPRProtocolRecoveryPending` stay unchanged across the wake.
-- Diagnostics and retry for failures in the tail of a reset: a PortEnable or
-  initialization failure is still recorded only as a generic
-  `MPRReinitState=failed`, and recovery depends on the protocol-fault path forcing
-  another reset. Per-stage failure points and in-place retry are missing.
+- Reset-tail failures now distinguish IOC Facts, queue initialization, page
+  allocation, event subscription and PortEnable. Recovery still uses the bounded
+  controller-reset path; no unbounded in-place retry loop is introduced.
 - Side effect of task-management requests on this expander (recorded, not fixed, by
   decision): a TMF that really reaches the target (ABORT/LUN/TARGET) is always
   accompanied by a SAS removal report (`MPRTopoRemovalHits` 1:1), and the
@@ -208,13 +211,17 @@ means code exists without new hardware evidence.
 - A different-capacity disk, regression across macOS versions, signing and release.
 - A minimal route B subclass build and load check, only if that route is chosen.
 
-## 7. How the work is verified
+## 7. Recorded baseline verification procedures
+
+The hardware procedures retained below belong to the earlier baseline. They are
+not scheduled or authorized by the current source-only task. Current execution
+is limited to host protocol checks, offline CLI validation and object compilation.
 
 - Host side: `tools/test_protocol.cpp` validates the protocol layer against
   independent golden bytes and an independent chain decoder (2,000 deterministic
   SGL cases, credit/SMID boundaries, out-of-order completion prefixes). It builds
   with ASan/UBSan and `-Wall -Wextra -Werror` on the target system's compiler and
-  runs 158,638 assertions. `tools/validate-build-inputs.py` checks LF line endings,
+  runs 355,563 assertions. `tools/validate-build-inputs.py` checks LF line endings,
   agreement between bundle, runtime and CLI versions, and that every translation
   unit is part of the Xcode project.
 - Build and load: `tools/build-noxcode.sh` produces `MPR.kext`, verifies the kmod

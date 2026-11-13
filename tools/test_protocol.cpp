@@ -12,6 +12,7 @@
 #include "../MPR/MPRCompletion.h"
 #include "../MPR/MPRDmaSgl.h"
 #include "../MPR/MPRPerformance.h"
+#include "../MPR/MPRControlABI.h"
 #include "../MPR/MPI/mpi26_devices.h"
 
 #include <algorithm>
@@ -513,8 +514,88 @@ static void nvmePrpTests()
                             prp.data(), listAddress, prp.size(), &result));
 }
 
+static void managementAndLunTests()
+{
+    MPRControlInput in = {};
+    in.version = kMPRControlVersion; in.operation = kMPRControlInfo;
+    CHECK(mprControlInputValid(in, sizeof(in), sizeof(MPRControlOutput)));
+    const auto valid = [](const MPRControlInput &x) {
+        return mprControlInputValid(x, sizeof(x) + uint64_t(x.requestBytes) + x.dataOutBytes,
+                                    sizeof(MPRControlOutput) + uint64_t(x.dataInBytes));
+    };
+    for (unsigned op = 0; op <= kMPRControlDiagUnregister + 1; ++op) {
+        in.operation = op;
+        CHECK(valid(in) == (op >= kMPRControlInfo && op <= kMPRControlDiagUnregister));
+    }
+    in.operation = kMPRControlPassthrough;
+    in.requestBytes = 96; in.dataOutBytes = 65536; in.dataInBytes = 0;
+    CHECK(valid(in));
+    CHECK(!mprControlInputValid(in, 64 + 96 + 65535, 416));
+    CHECK(!mprControlInputValid(in, UINT64_MAX, 416));
+    in.dataInBytes = kMPRControlMaxData;
+    CHECK(valid(in));
+    CHECK(!mprControlInputValid(in, 64 + 96 + 65536, 416 + uint64_t(in.dataInBytes) - 1));
+    in.dataInBytes++; CHECK(!valid(in)); in.dataInBytes = 0;
+    for (unsigned bit = 0; bit < 32; ++bit) {
+        in.flags = 1U << bit; CHECK(valid(in) == (bit == 0));
+    }
+    in.flags = 0;
+    const uint32_t timeouts[] = {0, 1, 99, 100, 1000, 300000, 300001, UINT32_MAX};
+    for (auto timeout : timeouts) {
+        in.timeoutMs = timeout;
+        CHECK(valid(in) == (!timeout || (timeout >= 100 && timeout <= 300000)));
+    }
+    in.timeoutMs = 0;
+    in.version = 2; CHECK(!valid(in)); in.version = 1;
+    in.reserved = 1; CHECK(!valid(in)); in.reserved = 0;
+    for (unsigned i = 0; i < 2; ++i) { in.reserved2[i] = 1; CHECK(!valid(in)); in.reserved2[i] = 0; }
+    in.requestBytes = 257; CHECK(!valid(in)); in.requestBytes = 256; CHECK(valid(in));
+    in.dataOutBytes = kMPRControlMaxData + 1; CHECK(!valid(in));
+    in.dataOutBytes = kMPRControlMaxData; CHECK(valid(in));
+    CHECK(!mprControlInputValid(in, 64 + 256 + uint64_t(in.dataOutBytes), UINT64_MAX));
+    CHECK(mprControlReadOnlyCdb(0x12)); CHECK(mprControlReadOnlyCdb(0x88));
+    CHECK(!mprControlReadOnlyCdb(0x8A)); CHECK(!mprControlReadOnlyCdb(0x42));
+    CHECK(!mprControlReadOnlyCdb(0x04)); CHECK(!mprControlReadOnlyCdb(0x3B));
+    uint8_t lun[8]; uint32_t decoded = 0;
+    const uint32_t edges[] = {0, 1, 255, 256, 16383, 16384, 65535, 0xFFFFFE, 0xFFFFFF};
+    for (uint32_t number : edges) {
+        CHECK(mprEncodeLun(lun, number));
+        CHECK(mprDecodeLun(lun, &decoded) && decoded == number);
+        CHECK(uint16_t(mprTargetKey(0x1234, number)) == 0x1234);
+        CHECK((mprTargetKey(0x1234, number) >> 16) == number);
+    }
+    CHECK(!mprEncodeLun(lun, 0x1000000));
+    CHECK(!mprDecodeLun(nullptr, &decoded)); CHECK(!mprDecodeLun(lun, nullptr));
+    for (uint32_t number = 0; number < 65536; ++number) {
+        CHECK(mprEncodeLun(lun, number));
+        CHECK(mprDecodeLun(lun, &decoded) && decoded == number);
+        lun[7] = 1; CHECK(!mprDecodeLun(lun, &decoded));
+    }
+    CHECK(mprEncodeLun(lun, 0x123456));
+    const uint8_t extended[8] = {0xD2, 0x12, 0x34, 0x56, 0, 0, 0, 0};
+    CHECK(std::memcmp(lun, extended, 8) == 0);
+    lun[0] = 0x80; CHECK(!mprDecodeLun(lun, &decoded));
+    std::vector<uint8_t> frame(128, 0xA7), prp(4096, 0xB6);
+    // Five-page IEEE translation requires enough data in the first segment,
+    // not merely enough address space before its first physical page boundary.
+    MPRDmaSegment split[] = {{0x100000, 512}, {0x200000, 17408}};
+    MPRSglResult result = {};
+    CHECK(!mprBuildNvmeSgl(frame.data(), 128, 96, split, 2, 17920,
+                            prp.data(), 0x300000, 4096, &result));
+    CHECK(frame[96] == 0xA7 && prp[0] == 0xB6);
+    split[1].address = 0x100200; // physically contiguous pieces are representable
+    CHECK(mprBuildNvmeSgl(frame.data(), 128, 96, split, 2, 17920,
+                           prp.data(), 0x300000, 4096, &result));
+    CHECK(result.chainsUsed == 1 && frame[127] == 0x88);
+    split[0].length = 2048; split[1].length = 15872; split[1].address = 0x200000;
+    CHECK(mprBuildNvmeSgl(frame.data(), 128, 96, split, 2, 17920,
+                           prp.data(), 0x300000, 4096, &result));
+    CHECK(result.chainsUsed == 0 && frame[127] == 0x40);
+}
+
 int main()
 {
+    managementAndLunTests();
     nvmePrpTests();
     performanceLimitTests();
     cdbTests();

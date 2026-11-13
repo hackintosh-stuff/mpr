@@ -26,7 +26,7 @@ struct MPRAsyncRequest {
     IOStorageCompletion completion;
     UInt64 sequence, turn, block, blocks, total, issued, completed, firstErrorOffset;
     UInt32 generation, targetGeneration, inFlight, blockSize;
-    UInt16 devHandle;
+    UInt64 devHandle; /* host key = (LUN << 16) | firmware handle */
     IOReturn status;
     bool occupied, initialized, prepared, finished, write, fua;
 };
@@ -434,7 +434,7 @@ IOReturn
 MPRController::submitAsyncBlocks(bool write, IOMemoryDescriptor *buffer,
                                  UInt64 block, UInt64 nblks, bool fua,
                                  const IOStorageCompletion *completion,
-                                 UInt16 devHandle)
+                                 UInt64 devHandle)
 {
     if (!buffer || !completion || !completion->action) return kIOReturnBadArgument;
     MPRAsyncState *state = fAsync;
@@ -535,7 +535,7 @@ MPRController::endAsyncBarrier(void)
 
 IOReturn
 MPRController::synchronizeCache(UInt64 block, UInt64 nblks, bool barrier,
-                                UInt16 handle)
+                                UInt64 handle)
 {
     /* The fence orders this client's earlier writes; the generation proves the
      * command still names the medium those writes were accepted for. */
@@ -550,7 +550,7 @@ MPRController::synchronizeCache(UInt64 block, UInt64 nblks, bool barrier,
 
 IOReturn
 MPRController::unmapBlocks(const IOBlockStorageDeviceExtent *extents,
-                           UInt32 extentsCount, UInt16 handle)
+                           UInt32 extentsCount, UInt64 handle)
 {
     MPRTargetSlot *slot = findTarget(handle);
     const UInt32 generation = slot != NULL ? slot->generation : 0;
@@ -771,7 +771,8 @@ MPRController::asyncWorker(void)
                 progress = true;
                 continue;
             }
-            request->DevHandle = job->devHandle;
+            request->DevHandle = (UInt16)job->devHandle;
+            (void)mprEncodeLun(request->LUN, (UInt32)(job->devHandle >> 16));
             request->Function = MPI2_FUNCTION_SCSI_IO_REQUEST;
             request->SenseBufferLowAddress = (UInt32)senseAddress(smid);
             request->SenseBufferLength = 96;
@@ -800,7 +801,7 @@ MPRController::asyncWorker(void)
                         cancelUnpostedCommand(smid);
                         job->status = kIOReturnNoResources;
                         MPR_DEBUG_LOG("MPR: NVMe mapped fallback/PRP unavailable handle=0x%04x bytes=%u\n",
-                                      job->devHandle, (unsigned)window.bytes);
+                                      (unsigned)(UInt16)job->devHandle, (unsigned)window.bytes);
                         progress = true;
                         continue;
                     }
@@ -876,7 +877,7 @@ MPRController::asyncWorker(void)
                         flushSlot->offlinePending || mediaRemovalPending()) {
                         job.status = kIOReturnNoMedia;
                     } else if (!flushSlot->nativeFua) {
-                        job.status = selectTarget(flushSlot->handle) ?
+                        job.status = selectTarget(flushSlot->key()) ?
                             scsiSynchronizeCache(0, 0, 29, true) : kIOReturnNoMedia;
                     } // Native FUA was already set on each WRITE CDB.
                 }

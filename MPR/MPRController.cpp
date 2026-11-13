@@ -16,6 +16,7 @@
 #include "MPRCompletion.h"
 #include "MPRDmaSgl.h"
 #include "MPI/mpi26_devices.h"
+#include "MPI/mpi2_mgmt.h"
 
 #define super IOService
 OSDefineMetaClassAndStructors(MPRController, IOService)
@@ -285,14 +286,27 @@ MPRController::postOwnedRequestLocked(UInt32 smid, UInt32 flags, UInt32 high)
     UInt8 *frame = base + (UInt64)smid * fRequestFrameSize;
     MPRCommandOwner *owner = &fCommandOwners[smid];
     owner->function = frame[3];
+    owner->lun = 0;
+    if (frame[3] == MPI2_FUNCTION_SCSI_IO_REQUEST ||
+        frame[3] == MPI2_FUNCTION_RAID_SCSI_IO_PASSTHROUGH)
+        (void)mprDecodeLun(((MPRScsiIoRequest *)frame)->LUN, &owner->lun);
+    else if (frame[3] == MPI2_FUNCTION_NVME_ENCAPSULATED) {
+        UInt32 nsid = 0; memcpy(&nsid, frame + 0x24, sizeof(nsid));
+        if (nsid) owner->lun = nsid - 1;
+    }
     owner->handle = 0;
     if (frame[3] == MPI2_FUNCTION_SCSI_IO_REQUEST ||
         frame[3] == MPI2_FUNCTION_SCSI_TASK_MGMT ||
         frame[3] == MPI2_FUNCTION_SATA_PASSTHROUGH ||
-        frame[3] == MPI2_FUNCTION_NVME_ENCAPSULATED)
+        frame[3] == MPI2_FUNCTION_NVME_ENCAPSULATED ||
+        frame[3] == MPI2_FUNCTION_RAID_SCSI_IO_PASSTHROUGH)
         owner->handle = (UInt16)((UInt16)frame[0] | ((UInt16)frame[1] << 8));
     else if (frame[3] == MPI2_FUNCTION_SAS_IO_UNIT_CONTROL)
         owner->handle = (UInt16)((UInt16)frame[4] | ((UInt16)frame[5] << 8));
+    MPRTargetSlot *target = findTarget(mprTargetKey(owner->handle, owner->lun));
+    owner->targetIdentity = target ? target->sasAddress : 0;
+    owner->targetGeneration = target ? target->generation : 0;
+    owner->targetKind = target ? (UInt8)target->kind : 0;
     owner->epoch = fTransportEpoch;
     owner->state = kMPRCommandPosted;
     fReplySlots[smid].valid = 0;
@@ -319,7 +333,8 @@ MPRController::storeCommandReplyLocked(UInt32 smid, UInt8 kind,
         recordProtocolFaultLocked(kMPRProtocolUnexpectedCompletion, smid);
         return false;
     }
-    bool valid = kind == 2 ? owner->function == MPI2_FUNCTION_SCSI_IO_REQUEST
+    bool valid = kind == 2 ? (owner->function == MPI2_FUNCTION_SCSI_IO_REQUEST ||
+                              owner->function == MPI2_FUNCTION_RAID_SCSI_IO_PASSTHROUGH)
         : kind == 4 ? owner->function == MPI2_FUNCTION_NVME_ENCAPSULATED
         : kind == 1 && reply != NULL && bytes >= 4 &&
           reply[3] == owner->function;
@@ -344,6 +359,10 @@ MPRController::storeCommandReplyLocked(UInt32 smid, UInt8 kind,
             valid = nvme->EncapsulatedCommandLength == 64 &&
                     (nvme->ErrorResponseCount == 0 || nvme->ErrorResponseCount == 16);
         }
+    }
+    if (valid && kind == 1 && owner->function == MPI2_FUNCTION_RAID_SCSI_IO_PASSTHROUGH) {
+        valid = bytes >= MPR_SCSIIO_REPLY_MIN_BYTES &&
+            mprControlLe16(reply) == owner->handle;
     }
     if (valid && kind == 1 && owner->function == MPI2_FUNCTION_SATA_PASSTHROUGH) {
         valid = bytes >= sizeof(MPRSataPassthroughReply) &&
@@ -496,6 +515,13 @@ MPRController::resetProtocolState(void)
     memset(fManagementBusy, 0, sizeof(fManagementBusy));
     memset(fTmfBusy, 0, sizeof(fTmfBusy));
     ++fTransportEpoch;
+    fControlDmaBusy = false;
+    fFirmwareDownloadActive = fFirmwareDownloadPoisoned = false;
+    fFirmwareTotal = fFirmwareOffset = 0; fFirmwareToken = 0;
+    for (unsigned type = 0; type < 3; ++type) {
+        fDiagnostic[type].owned = false;
+        fDiagnostic[type].valid = false;
+    }
     for (UInt32 smid = 0; smid < MPR_REQUEST_FRAMES; ++smid) {
         bool runtime = (smid >= 10 && smid <= 25) || mprIsAsyncSmid(smid) ||
                        smid == 29 || smid == 30;
@@ -971,6 +997,9 @@ MPRController::getIOCFacts(void)
     /* The doorbell reply is little-endian 16-bit words; x86_64 needs no swap,
      * but copy through the union so the packed structure stays aligned. */
     memcpy(&facts, answer.words, sizeof(facts));
+    bzero(fIocFactsSnapshot, sizeof(fIocFactsSnapshot));
+    memcpy(fIocFactsSnapshot, &facts, sizeof(facts) < sizeof(fIocFactsSnapshot)
+        ? sizeof(facts) : sizeof(fIocFactsSnapshot));
 
     MPR_DEBUG_PROP("MPRFactsMsgVersion",        (unsigned long long)facts.MsgVersion, 16);
     MPR_DEBUG_PROP("MPRFactsMsgLength",         (unsigned long long)facts.MsgLength, 8);
@@ -1520,6 +1549,9 @@ MPRController::processReplyQueue(void)
                         } else if (smid != 0) {
                             recordProtocolFaultLocked(kMPRProtocolUnexpectedCompletion, smid);
                         }
+                        if (eventBytes <= bytes - sizeof(MPREventNotifyReply))
+                            recordControlEventLocked(event->Event, event->EventContext,
+                                reply + sizeof(MPREventNotifyReply), eventBytes);
                         if (eventBytes > bytes - sizeof(MPREventNotifyReply)) {
                             recordProtocolFaultLocked(kMPRProtocolEventLength, smid);
                         } else if (event->Event == MPI2_EVENT_SAS_TOPOLOGY_CHANGE_LIST &&
@@ -1559,6 +1591,8 @@ MPRController::processReplyQueue(void)
                             sendEventAck(event->Event, event->EventContext);
                         }
                     }
+                } else if (smid == 0 && reply[3] == MPI2_FUNCTION_DIAG_BUFFER_POST) {
+                    releaseDiagnosticEventLocked(reply, bytes);
                 } else {
                     storeCommandReplyLocked(smid, 1, reply, bytes);
                     memset(fLastReply, 0, sizeof(fLastReply));
@@ -1791,6 +1825,8 @@ MPRController::sendEventNotification(void)
     mprClearEventBit(request->EventMasks, MPI2_EVENT_IR_CONFIGURATION_CHANGE_LIST);
     mprClearEventBit(request->EventMasks, MPI2_EVENT_IR_PHYSICAL_DISK);
     mprClearEventBit(request->EventMasks, MPI2_EVENT_IR_VOLUME);
+    for (unsigned word = 0; word < 4; ++word)
+        request->EventMasks[word] &= ~fControlEventMask[word];
     if (fNvmeProtocol) {
         mprClearEventBit(request->EventMasks, MPI2_EVENT_PCIE_DEVICE_STATUS_CHANGE);
         mprClearEventBit(request->EventMasks, MPI2_EVENT_PCIE_ENUMERATION);
@@ -1801,11 +1837,7 @@ MPRController::sendEventNotification(void)
     MPR_DEBUG_PROP("MPREventMask1", (unsigned long long)request->EventMasks[1], 32);
     MPR_DEBUG_PROP("MPREventMask2", (unsigned long long)request->EventMasks[2], 32);
     MPR_DEBUG_PROP("MPREventMask3", (unsigned long long)request->EventMasks[3], 32);
-    MPR_DEBUG_PROP("MPREventMaskCheck",
-                (request->EventMasks[0] == 0x2F3F7FFBU &&
-                 request->EventMasks[1] == (fNvmeProtocol ? (0xFFDFFFFCU & ~(7U << 16)) : 0xFFDFFFFCU) &&
-                 request->EventMasks[2] == 0xFFFFFFFFU &&
-                 request->EventMasks[3] == 0xFFFFFFFFU) ? "ok" : "mismatch");
+    MPR_DEBUG_PROP("MPREventMaskCheck", "mandatory-plus-client-mask");
 
     postDefaultRequest(2);
     if (!finishManagementRequest(2, MPR_REPLY_TIMEOUT_MS, replyBuf, &replyKind)) {
@@ -1948,6 +1980,42 @@ mprFillIeeeSge(UInt8 *sge, UInt64 address, UInt32 length)
 }
 
 bool
+MPRController::applyScsiTargetPolicy(UInt8 *frame, MPRTargetSlot *slot)
+{
+    MPRScsiIoRequest *request = (MPRScsiIoRequest *)frame;
+    if (slot) {
+        request->Control = (request->Control & ~MPI2_SCSIIO_CONTROL_TLR_MASK) |
+                           (slot->tlrEnabled ? MPI2_SCSIIO_CONTROL_TLR_ON : 0);
+        const UInt8 opcode = request->CDB[0];
+        const bool read = opcode == 0x28 || opcode == 0x88 || opcode == 0xA8;
+        const bool write = opcode == 0x2A || opcode == 0x8A || opcode == 0xAA;
+        if ((read || write) && slot->protectionType) {
+            const UInt32 protectionBlockSize = fProbeInProgress && slot->key() == currentTargetKey()
+                ? fBlockSize : slot->blockSize;
+            if (slot->protectionUnsupported || !protectionBlockSize ||
+                !(fIocCapabilities & MPI2_IOCFACTS_CAPABILITY_EEDP)) {
+                return false;
+            }
+            UInt16 flags = read ? MPI2_SCSIIO_EEDPFLAGS_CHECK_REMOVE_OP : MPI2_SCSIIO_EEDPFLAGS_INSERT_OP;
+            flags |= MPI2_SCSIIO_EEDPFLAGS_CHECK_GUARD;
+            /* Type 3 has no address reference check. Type 1 increments/checks
+             * the low 32 bits of the logical block address on every block. */
+            if (slot->protectionType == 1)
+                flags |= MPI2_SCSIIO_EEDPFLAGS_INC_PRI_REFTAG | MPI2_SCSIIO_EEDPFLAGS_CHECK_REFTAG;
+            if (fChipFlags & kMPRChipGen35) flags |= MPI25_SCSIIO_EEDPFLAGS_APPTAG_DISABLE_MODE;
+            request->EEDPFlags = flags;
+            request->EEDPBlockSize = protectionBlockSize;
+            UInt32 reference = opcode == 0x88 || opcode == 0x8A
+                ? (UInt32)mprReadBe64(request->CDB + 2) : mprReadBe32(request->CDB + 2);
+            memcpy(request->CDB + 20, &reference, sizeof(reference));
+            request->CDB[26] = request->CDB[27] = 0xff;
+            request->CDB[1] = (request->CDB[1] & 0x1f) | 0x20;
+        }
+    }
+    return true;
+}
+
+bool
 MPRController::postScsiIo(UInt32 smid)
 {
     if (fReplyLock == NULL || smid == 0 || smid >= 128) return false;
@@ -1963,9 +2031,20 @@ MPRController::postScsiIo(UInt32 smid)
     if (handle == 0) handle = (UInt16)fAttachedDevHandle;
     /* Fast-path capability is the target's, not the controller's: a descriptor
      * type chosen from another target would be rejected or misrouted. */
-    MPRTargetSlot *slot = findTarget(handle);
-    bool fastPath = slot != NULL ? slot->fastPath : fFastPathEnabled;
     MPRScsiIoRequest *request = (MPRScsiIoRequest *)frame;
+    UInt32 lun = 0;
+    if ((!mprIsAsyncSmid(smid) && !mprEncodeLun(request->LUN, fAttachedLun)) ||
+        !mprDecodeLun(request->LUN, &lun)) {
+        cancelUnpostedCommand(smid); return false;
+    }
+    MPRTargetSlot *slot = findTarget(mprTargetKey(handle, lun));
+    if (!applyScsiTargetPolicy(frame, slot)) {
+        cancelUnpostedCommand(smid); return false;
+    }
+    bool fastPath = slot != NULL ? slot->fastPath : fFastPathEnabled;
+    /* Like FreeBSD mpr_check_pcie_native_sgl, leave >MDTS SCSI transfers
+     * in IEEE form so firmware can split them. Native encapsulated requests
+     * and ordinary asynchronous windows are independently bounded by MDTS. */
     if (slot && slot->kind == kMPRTargetNvme && !mprIsAsyncSmid(smid) && request->DataLength &&
         (!slot->maxTransferBytes || request->DataLength <= slot->maxTransferBytes)) {
         const UInt64 offset = (((UInt64)fRequestFrameSize * fRequestCount + 4095) & ~4095ULL) +
@@ -2193,9 +2272,14 @@ MPRController::scsiInquiry(void)
         MPR_DEBUG_PROP("MPRScsiProbeFailure", "INQUIRY data buffer unavailable");
         return false;
     }
-    if ((data[0] & 0xE0) != 0 || (data[0] & 0x1F) != 0 || data[4] < 31) {
-        MPR_DEBUG_PROP("MPRScsiProbeFailure", "not a connected direct-access disk");
+    if ((data[0] & 0xE0) != 0 || data[4] < 31) {
+        MPR_DEBUG_PROP("MPRScsiProbeFailure", "logical-unit-not-connected");
         return false;
+    }
+    MPRTargetSlot *inquiryTarget = findTarget(currentTargetKey());
+    if (inquiryTarget) {
+        inquiryTarget->peripheralType = data[0] & 0x1F;
+        inquiryTarget->managementOnly = inquiryTarget->peripheralType != 0;
     }
     mprCopyField(vendor, data + 8, 8);
     mprCopyField(product, data + 16, 16);
@@ -2305,6 +2389,19 @@ MPRController::scsiReadCapacity16(void)
           (unsigned long long)(lastLba + 1), (unsigned int)blockSize);
     if (blockSize == 0 || lastLba == 0xFFFFFFFFFFFFFFFFULL) {
         return false;
+    }
+    MPRTargetSlot *capacityTarget = findTarget(currentTargetKey());
+    if (capacityTarget) {
+        capacityTarget->protectionType = (data[12] & 1) ? (UInt8)(((data[12] >> 1) & 7) + 1) : 0;
+        capacityTarget->protectionUnsupported = capacityTarget->protectionType != 0 &&
+            (!(fIocCapabilities & MPI2_IOCFACTS_CAPABILITY_EEDP) ||
+             (capacityTarget->protectionType != 1 && capacityTarget->protectionType != 3));
+        if (capacityTarget->protectionUnsupported) {
+            MPR_DEBUG_LOG("MPR: protected LUN refused handle=0x%04x lun=%u type=%u EEDP=%u\n",
+                capacityTarget->handle, (unsigned)capacityTarget->lun, capacityTarget->protectionType,
+                (fIocCapabilities & MPI2_IOCFACTS_CAPABILITY_EEDP) != 0);
+            return false;
+        }
     }
     fBlockSize = blockSize;
     fCapacityBlocks = lastLba + 1;
@@ -2927,10 +3024,15 @@ MPRController::probeCapacity(void)
         MPR_DEBUG_PROP("MPRCapacityProbeState", "failed-buffer-unavailable");
         return false;
     }
+    MPRTargetSlot *capacityTarget = findTarget(currentTargetKey());
+    if (capacityTarget) {
+        capacityTarget->protectionUnsupported = false;
+        capacityTarget->protectionType = 0;
+    }
     ok = scsiReadCapacity16();
     if (ok) {
         MPR_DEBUG_PROP("MPRCapacityKind", "rc16");
-    } else if (!fProtocolRecoveryPending) {
+    } else if (!fProtocolRecoveryPending && !(capacityTarget && capacityTarget->protectionUnsupported)) {
         /* A SATA bridge rejects the 16-byte CDB with ILLEGAL REQUEST. That is
          * an expected fallback, not a failed disk: only the RC10 outcome may
          * classify this stage, so discard the RC16 status first. */
@@ -3136,6 +3238,24 @@ MPRController::init(OSDictionary *properties)
     fMpiVersion = 0x0205;
     fNvmeProtocol = fAtomicRequests = false;
     fNvmeDsmCommands = 0;
+    bzero(fIocFactsSnapshot, sizeof(fIocFactsSnapshot));
+    fControlBuffer = NULL; fControlPhys = 0; fControlBufferBytes = 0;
+    fControlBufferPrepared = fControlDmaBusy = false;
+    int management = 0, maintenance = 0, ssu = 1;
+    (void)PE_parse_boot_argn("mpr_management", &management, sizeof(management));
+    (void)PE_parse_boot_argn("mpr_maintenance", &maintenance, sizeof(maintenance));
+    (void)PE_parse_boot_argn("mpr_ssu", &ssu, sizeof(ssu));
+    fMaintenanceMode = maintenance != 0;
+    fManagementEnabled = management != 0 || fMaintenanceMode;
+    fFirmwareDownloadActive = fFirmwareDownloadPoisoned = false;
+    fFirmwareImageType = 0; fFirmwareTotal = fFirmwareOffset = 0; fFirmwareToken = 0;
+    fShutdownSsuPolicy = ssu >= 0 && ssu <= 3 ? (UInt32)ssu : 1;
+    bzero(fDiagnostic, sizeof(fDiagnostic));
+    bzero(fControlEvents, sizeof(fControlEvents));
+    fControlEventSequence = 0;
+    /* Initially record mandatory subscribed events. Optional mask bits are
+     * explicitly enabled by the privileged management client. */
+    memset(fControlEventMask, 0, sizeof(fControlEventMask));
     fPowerQuiesced = false;
     fIOLock = NULL;
     fReplyLock = NULL;
@@ -3144,6 +3264,7 @@ MPRController::init(OSDictionary *properties)
     fReplyBatches = fReplyDescriptors = fReplyMaxBatch = fReplyIndexWrites = 0;
     fPostLock = NULL;
     fIocCapabilities = fMaxDeviceHandle = fTargetDeviceInfo = 0;
+    fTargetGenerationSerial = 0;
     fTargetDeviceFlags = 0;
     fTargetSasAddress = 0;
     fHasExpander = false;
@@ -3224,6 +3345,7 @@ MPRController::start(IOService *provider)
     fLastEventContext = 0;
     fEventSeen[0] = fEventSeen[1] = fEventSeen[2] = fEventSeen[3] = 0;
     fAttachedDevHandle = 0;
+    fAttachedLun = 0;
     fLastReplySmid = 0xFFFF;
     fLastReplyKind = 0;
     fScsiSuccess = 0;
@@ -3394,7 +3516,7 @@ MPRController::start(IOService *provider)
     MPR_DEBUG_PROP("MPRMMIOLength", (unsigned long long)length, 64);
     MPR_DEBUG_PROP("MPRPCIID", (unsigned long long)pci->configRead32(0), 32);
     MPR_DEBUG_PROP("MPRStage", "read-write");
-    MPR_DEBUG_PROP("MPRBuild", "0.23.0");
+    MPR_DEBUG_PROP("MPRBuild", "0.24.0");
     MPR_DEBUG_PROP("MPRFeatures",
                 "async-direct-dma,credit-depth,ready-refill,reply-batch-wakeup,"
                 "ieee-sgl-chain,read-write16,cache16,unmap-limits,"
@@ -3572,6 +3694,7 @@ MPRController::stop(IOService *provider)
         fPagePhys = fDataPhys = 0;
         fDataBytes = 0;
         freeQueueMemory();
+        freeControlBuffers(true);
         MPR_DEBUG_PROP("MPRStopDMAState", "stopped");
     } else if (fQueueBuffer != NULL || fReplyBuffer != NULL ||
                fRequestBuffer != NULL || fPageBuffer != NULL ||
@@ -3614,7 +3737,7 @@ MPRController::stop(IOService *provider)
 /* Sleep/shutdown must quiesce all accepted work before the PCI provider
  * removes power. setPowerState runs on the PM thread, not the reply workloop. */
 bool
-MPRController::quiescePower(void)
+MPRController::quiescePower(bool shutdown)
 {
     if (fSuspended) return fPowerQuiesced;
     setAsyncAcceptance(false);
@@ -3630,8 +3753,8 @@ MPRController::quiescePower(void)
         for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
             MPRTargetSlot *slot = &fTargets[i];
             if (slot->handle == 0 || !slot->present || !slot->probeValid ||
-                slot->offlinePending) continue;
-            if (!selectTarget(slot->handle)) continue;
+                slot->managementOnly || slot->offlinePending) continue;
+            if (!selectTarget(slot->key())) continue;
             IOReturn one = scsiSynchronizeCache(0, 0, 29, true);
             char name[48];
             snprintf(name, sizeof(name), "MPRTarget%uFlushStatus", (unsigned)i);
@@ -3645,6 +3768,11 @@ MPRController::quiescePower(void)
     }
     MPR_DEBUG_PROP("MPRPowerFlushStatus", (unsigned long long)(UInt32)flush, 32);
     MPR_DEBUG_PROP("MPRPowerFlushCount", (unsigned long long)flushed, 32);
+    if (shutdown && fence == kIOReturnSuccess && flush == kIOReturnSuccess &&
+        !fProtocolRecoveryPending && !fStopping && !fMaintenanceMode) {
+        bool clean = shutdownDevices();
+        MPR_DEBUG_PROP("MPRShutdownDevices", clean ? "complete" : "incomplete");
+    }
     fSuspended = true;
     teardownInterrupts();
     bool stopped = fRegs != NULL && diagReset();
@@ -3752,7 +3880,7 @@ MPRController::setPowerState(unsigned long stateNumber, IOService *whatDevice)
 void
 MPRController::systemWillShutdown(IOOptionBits specifier)
 {
-    if (!fStopping && fIOLock != NULL) quiescePower();
+    if (!fStopping && fIOLock != NULL) quiescePower(true);
     super::systemWillShutdown(specifier);
 }
 
@@ -4010,6 +4138,14 @@ MPRController::validateScsiCompletion(UInt32 smid, UInt8 kind,
         }
         const MPRScsiIoReply *reply = (const MPRScsiIoReply *)replyBuf;
         const UInt16 ioc = reply->IOCStatus & MPI2_IOCSTATUS_MASK;
+        MPRTargetSlot *completionTarget = findTarget(mprTargetKey(
+            fCommandOwners[smid].handle, fCommandOwners[smid].lun));
+        if (completionTarget && (reply->SCSIState & MPI2_SCSI_STATE_RESPONSE_INFO_VALID) &&
+            (reply->ResponseInfo & MPI2_SCSI_RI_MASK_REASONCODE) == 2) {
+            completionTarget->tlrEnabled = false;
+            MPR_DEBUG_LOG("MPR: TLR disabled after invalid frame handle=0x%04x lun=%u\n",
+                          completionTarget->handle, (unsigned)completionTarget->lun);
+        }
         transferred = reply->TransferCount;
         MPR_DEBUG_PROP("MPRLastIOSmid", (unsigned long long)smid, 16);
         MPR_DEBUG_PROP("MPRLastIOIOCStatus", (unsigned long long)ioc, 16);
@@ -4188,7 +4324,7 @@ IOReturn
 MPRController::issueNvmeDsm(const IOBlockStorageDeviceExtent *extents,
                             UInt32 count, UInt32 smid)
 {
-    MPRTargetSlot *target = findTarget((UInt16)fAttachedDevHandle);
+    MPRTargetSlot *target = findTarget(currentTargetKey());
     if (!target || target->kind != kMPRTargetNvme || !fNvmeProtocol ||
         !extents || !count || count > 32 || smid != 30 || smid >= fRequestCount ||
         !fRequestBuffer || !fSenseBuffer || !fReplyLock || fStopping ||
@@ -4225,7 +4361,7 @@ MPRController::issueNvmeDsm(const IOBlockStorageDeviceExtent *extents,
     request->Flags = 1; /* MPI26_NVME_FLAGS_WRITE, I/O submission queue */
     request->DataLength = bytes;
     request->Command[0] = 0x09; /* NVME_OPC_DATASET_MANAGEMENT */
-    mprSglStore32(request->Command + 4, 1); /* NSID: LUN zero + 1 */
+    mprSglStore32(request->Command + 4, target->lun + 1); /* FreeBSD: NSID = LUN + 1 */
     mprSglStore32(request->Command + 24, (UInt32)(fRequestPhys + offset));
     mprSglStore32(request->Command + 28, (UInt32)((fRequestPhys + offset) >> 32));
     mprSglStore32(request->Command + 40, count - 1);
@@ -4266,7 +4402,7 @@ MPRController::issueNvmeDsm(const IOBlockStorageDeviceExtent *extents,
 
 bool
 MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid,
-                            UInt16 handle, UInt16 *iocStatus)
+                            UInt16 handle, UInt16 *iocStatus, UInt32 lun)
 {
     /* A task-management request names its target explicitly: resetting or
      * aborting through the controller's default handle would hit a different,
@@ -4303,7 +4439,9 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid,
     request->DevHandle = handle;
     request->Function = MPI2_FUNCTION_SCSI_TASK_MGMT;
     request->TaskType = taskType;
-    MPRTargetSlot *target = findTarget(handle);
+    if (taskType != MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET)
+        (void)mprEncodeLun(request->LUN, lun);
+    MPRTargetSlot *target = findTarget(mprTargetKey(handle, lun));
     const bool pcieReset = target && target->kind == kMPRTargetNvme &&
                           taskType == MPI2_SCSITASKMGMT_TASKTYPE_TARGET_RESET;
     request->MsgFlags = pcieReset ? MPI26_SCSITASKMGMT_MSGFLAGS_PROTOCOL_LVL_RST_PCIE
@@ -4355,7 +4493,7 @@ MPRController::sendTaskMgmt(UInt8 taskType, UInt16 taskMid, UInt32 smid,
 
 bool
 MPRController::drainTaskManagedCommands(UInt16 handle, UInt16 taskMid,
-                                        bool wholeTarget)
+                                        bool wholeTarget, UInt32 lun)
 {
     /* A TMF reply does not consume the original SCSI reply. Do not recycle
      * its SMID or sense/data mapping until that completion has been observed. */
@@ -4367,7 +4505,8 @@ MPRController::drainTaskManagedCommands(UInt16 handle, UInt16 taskMid,
             const MPRCommandOwner *owner = &fCommandOwners[id];
             if ((owner->function == MPI2_FUNCTION_SCSI_IO_REQUEST ||
                  owner->function == MPI2_FUNCTION_NVME_ENCAPSULATED) &&
-                owner->handle == handle && (wholeTarget || id == taskMid) &&
+                owner->handle == handle && (lun == UINT32_MAX || owner->lun == lun) &&
+                (wholeTarget || id == taskMid) &&
                 (owner->state == kMPRCommandPosted ||
                  owner->state == kMPRCommandQuarantined)) pending = true;
         }
@@ -4399,14 +4538,27 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
      * the command owner before the SMID is frozen, so every escalation level
      * names that target instead of the controller's current default. */
     UInt16 handle = 0;
+    UInt32 lun = 0, targetGeneration = 0;
+    UInt64 targetIdentity = 0;
+    UInt8 targetKind = 0;
     IOSimpleLockLock(fReplyLock);
     if (smid < 128 &&
         (fCommandOwners[smid].function == MPI2_FUNCTION_SCSI_IO_REQUEST ||
          fCommandOwners[smid].function == MPI2_FUNCTION_NVME_ENCAPSULATED))
+    {
         handle = fCommandOwners[smid].handle;
+        lun = fCommandOwners[smid].lun;
+        targetIdentity = fCommandOwners[smid].targetIdentity;
+        targetGeneration = fCommandOwners[smid].targetGeneration;
+        targetKind = fCommandOwners[smid].targetKind;
+    }
     IOSimpleLockUnlock(fReplyLock);
     if (handle == 0) handle = (UInt16)fAttachedDevHandle;
-    MPRTargetSlot *slot = findTarget(handle);
+    MPRTargetSlot *slot = findTarget(mprTargetKey(handle, lun));
+    const bool sameBinding = slot && targetIdentity && slot->sasAddress == targetIdentity &&
+        slot->generation == targetGeneration && (UInt8)slot->kind == targetKind;
+    if (!sameBinding)
+        MPR_DEBUG_LOG("MPR: stale command binding; skip device TMF, require IOC DMA-stop smid=%u\n", (unsigned)smid);
     if (slot != NULL) {
         slot->failureCount++;
         publishTargetProperties();
@@ -4426,7 +4578,7 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
         MPR_DEBUG_PROP("MPRTmfInjectedFail", (unsigned long long)injectFail, 8);
     }
 
-    for (i = 0; i < 3 && !recovered; i++) {
+    for (i = 0; sameBinding && i < 3 && !recovered; i++) {
         if (injectFail > i) {
             IOSleep(50);
             continue;
@@ -4434,8 +4586,8 @@ MPRController::recoverTimedOutCommand(UInt32 smid)
         /* A reply that carries an error still proves the firmware accepted the
          * request; the drain is what proves the command is gone. Without a
          * reply, the next escalation level is tried. */
-        if (sendTaskMgmt(levels[i], (UInt16)smid, MPR_SM_TMF_BASE + i, handle) &&
-            drainTaskManagedCommands(handle, (UInt16)smid, i != 0)) {
+        if (sendTaskMgmt(levels[i], (UInt16)smid, MPR_SM_TMF_BASE + i, handle, NULL, lun) &&
+            drainTaskManagedCommands(handle, (UInt16)smid, i != 0, i == 2 ? UINT32_MAX : lun)) {
             recovered = true;
         } else {
             IOSleep(50);
@@ -4612,6 +4764,13 @@ MPRController::hotplugThread(void)
         IOSimpleLockUnlock(fReplyLock);
         goto done;
     }
+    if (fFirmwareDownloadActive && !fProtocolRecoveryPending) {
+        fHotplugPending = true;
+        retry = true;
+        state = "firmware-download-in-progress";
+        IOSimpleLockUnlock(fReplyLock);
+        goto done;
+    }
     fRemovalPending = false;
     retryRequested = fHotplugRetryRequested;
     fHotplugRetryRequested = false;
@@ -4691,7 +4850,7 @@ MPRController::hotplugThread(void)
     if (!resetNeeded && !fProtocolRecoveryPending) {
         for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
             MPRTargetSlot *slot = &fTargets[i];
-            if (slot->handle == 0 || !slot->present) continue;
+            if (slot->handle == 0 || !slot->present || (slot->managementOnly && slot->peripheralType == 0)) continue;
             dirty = true;
             if (!slot->probeValid) {
                 if (slot->probeRetries >= kMPRMaxProbeRetries) continue;
@@ -4716,6 +4875,7 @@ MPRController::hotplugThread(void)
                     continue;
                 }
             }
+            if (slot->managementOnly || fMaintenanceMode) continue;
             const bool freshNub = (slot->nub == NULL);
             if (!publishTarget(slot)) {
                 slot->failureCount++;
@@ -4959,6 +5119,7 @@ MPRController::resetAndReinitialize(void)
     fLastReplyKind = 0;
     fFrozenSmid = fTimedOutSmid = 0;
     fAttachedDevHandle = 0;
+    fAttachedLun = 0;
     fCapacityBlocks = 0;
     fBlockSize = 0;
 
@@ -4969,9 +5130,11 @@ MPRController::resetAndReinitialize(void)
         recordProtocolFault(kMPRProtocolInterruptUnavailable, 0);
         goto finished;
     }
-    if (!initializeController() || !initializeQueues()) goto finished;
-    if (!allocatePageBuffer() || !sendEventNotification() || !sendPortEnable())
-        goto finished;
+    if (!initializeController()) { state = "IOC-facts-failed"; goto finished; }
+    if (!initializeQueues()) { state = "queue-init-failed"; goto finished; }
+    if (!allocatePageBuffer()) { state = "page-buffer-failed"; goto finished; }
+    if (!sendEventNotification()) { state = "event-subscription-failed"; goto finished; }
+    if (!sendPortEnable()) { state = "port-enable-failed"; goto finished; }
     /* Discovery can lag the reset reply: poll a bounded number of times and
      * let the worker publish whatever the successful snapshot contains. */
     for (UInt32 retry = 0; retry < 5 && !fStopping; retry++) {

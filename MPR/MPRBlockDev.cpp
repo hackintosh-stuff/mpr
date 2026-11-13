@@ -6,7 +6,7 @@
 #define super IOBlockStorageDevice
 OSDefineMetaClassAndStructors(MPRBlockDev, IOBlockStorageDevice)
 
-static char kMPRDeviceInfo[] = "MPR SAS3 STP/SATA";
+static char kMPRDeviceInfo[] = "MPR Fusion-MPT logical unit";
 
 bool
 MPRBlockDev::init(OSDictionary *properties)
@@ -122,7 +122,7 @@ MPRBlockDev::stop(IOService *provider)
 }
 
 void
-MPRBlockDev::setController(MPRController *controller, UInt16 handle)
+MPRBlockDev::setController(MPRController *controller, UInt64 handle)
 {
     if (fControllerLock == NULL) return;
     if (controller != NULL) controller->retain();
@@ -134,7 +134,8 @@ MPRBlockDev::setController(MPRController *controller, UInt16 handle)
     if (previous != NULL) previous->release();
     if (controller != NULL) {
         refreshIdentity();
-        MPR_DEBUG_PROP("MPRBlockDevHandle", (unsigned long long)fDevHandle, 16);
+        MPR_DEBUG_PROP("MPRBlockDevHandle", (unsigned long long)(UInt16)fDevHandle, 16);
+        MPR_DEBUG_PROP("MPRBlockDevLUN", (unsigned long long)(fDevHandle >> 16), 32);
     }
 }
 

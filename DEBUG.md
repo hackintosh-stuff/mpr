@@ -1,12 +1,12 @@
 # DEBUG — implementation notes for MPR
 
-Date: 2026-11-13. Driver version: 0.23.0.
+Date: 2026-11-14. Driver version: 0.24.0.
 
 This document describes source behavior and diagnostics. What has been
 qualified at runtime, and what has not, is in [README.md](README.md); scope and
 remaining work are in [PLAN.md](PLAN.md). Diagnostic output is opt-in; see
-section 7. Version 0.23.0 is source-implemented and checked with host regressions
-and cross-compilation; there is no new native link/sign/load or hardware result.
+section 7. The current source has compilation evidence only, not a current test,
+native link/sign/load or hardware result.
 The runtime measurements retained below belong to 0.21.0 and the older baseline,
 not this version or the newly matched families.
 
@@ -43,7 +43,7 @@ small inline IEEE lists can be translated by firmware. Synchronous commands
 have 32 resident 4 KiB PRP pages appended to the request pool on NVMe-capable
 controllers; their lifetime is the pool's existing DMA-safe lifetime.
 
-Advertised UNMAP becomes native NVMe DSM for LUN zero / namespace one
+Advertised UNMAP becomes native NVMe DSM for the selected LUN / namespace LUN+1
 (`mprsas_build_nvme_unmap`). Its descriptors occupy SMID 30's resident page;
 packed MPI structures have compile-time offset/size checks. PCIe success replies
 are accepted only for an outstanding NVMe encapsulated command; address replies
@@ -62,6 +62,103 @@ Opt-in diagnostics include `MPRNegotiatedMPI`, `MPRGen35`, `MPRSeaIOC`,
 `MPRNativePrpCommands` and `MPRNvmeDsmCommands`. Logs identify refusal/skip,
 config failure, identity changes, TMF flags/timeouts and DSM failures. Successful
 I/O is counted, not printed per command; everything uses `mpr_debug=1`.
+
+## Logical units, protection and paths
+
+`mprEncodeLun`/`mprDecodeLun` implement the same peripheral, flat and extended-flat
+24-bit encodings as `mprsas_set_lun`. An internal 64-bit address key combines
+LUN and the 16-bit firmware handle; only the handle goes into MPI DevHandle.
+REPORT LUNS validates the complete returned list, rejects truncation beyond the
+64-entry table and preserves prior LUNs on a temporary reporting failure. A
+LUN-zero anchor can enumerate a device whose actual block units begin above
+zero. Each nub, asynchronous job, cache operation, DSM and task-management
+command carries its own LUN. Removing a nonzero LUN never sends physical
+REMOVE_DEVICE or TARGET_RESET. Namespace selection is `NSID = LUN + 1`.
+
+Read Capacity 16 protection metadata selects EEDP type 1 or 3 only when IOC Facts
+advertises EEDP. READ uses CHECK_REMOVE, WRITE uses INSERT; type 1 additionally
+checks/increments reference tags, and GEN35 applies application-tag-disable.
+Unsupported type/capability combinations fail before block publication and do
+not fall back to unprotected RC10. The submission policy is shared by block I/O
+and administrative SCSI. Probing uses staged geometry without overwriting the
+previous geometry before the medium-change comparison. Supported sequential
+SSP targets enable TLR after supported-page discovery; invalid-frame feedback
+disables it. No native tape device class is created.
+
+A topology scan collects up to eight paths per `(kind, firmware WWID, LUN)` before
+selecting an active handle. It prefers the old path when present, so enumeration
+order does not churn media generations. A lost active path switches only after a
+complete snapshot and a new probe; in-flight failed operations are not replayed.
+A reused handle never authorizes resetting/removing its new owner. Monotonic
+controller-wide target cookies prevent a recycled table slot from validating an
+old queued request. Posted commands snapshot WWID/kind/cookie; a stale binding
+skips device TMF and requires controller-level DMA-stop recovery instead.
+The source does not merge different SAS port addresses solely by a guessed
+serial number, provide cross-controller/ALUA policy, or promise stable diskN.
+
+## Native management ABI
+
+`MPRControlABI.h`, `MPRUserClient` and `MPRControl.cpp` adapt the useful mechanisms
+of `mpr_ioctl.h`/`mpr_user.c` to an IOUserClient structure call. This is not binary
+compatibility with FreeBSD user utilities. Root privilege is checked both on
+connection and on every method invocation. `mpr_management=1` is required;
+`mpr_maintenance=1` additionally prevents block-media publication. Device/media,
+array and firmware mutations require maintenance plus an acknowledgement flag.
+Metadata probes still run in maintenance, but no disk is mounted/published.
+
+The input is a 64-byte pointer-free header, followed by a bounded MPI request
+prefix and outgoing payload. The output is a 416-byte header/reply/sense record
+followed by actual incoming bytes. Bounds are 256-byte request/reply, 96-byte
+sense, 16 MiB per management direction, 64 KiB SCSI/NVMe payload, 128 retained
+events with 128 payload bytes each, and three diagnostic buffers up to 4 MiB each.
+User input is copied once before validation; no caller-owned physical pointer,
+SGE, sense address, NVMe PRP/MPTR or live diagnostic DMA mapping is trusted.
+A current transport epoch is mandatory for state-dependent operations. Target
+operations require matching WWID/generation; explicitly acknowledged RAID-member
+passthrough in maintenance re-reads membership and SAS identity without publishing
+the member as a disk. Uncertain writes/firmware segments are not retried.
+
+The transport mutex serializes control with discovery and recovery. Operations
+that issue requests use the existing async fence and reserved management SMID 1;
+TMF uses the high-priority path. SCSI completions, sense, NVMe CQE and actual
+transfer lengths are propagated rather than equating IOC acceptance with command
+success. CONFIG/RAID use rebuilt legacy simple SGEs; MPI2.5+ SCSI/SATA/SMP/firmware
+and diagnostic CLI use IEEE64 elements. SMP has separate request/response SGEs.
+NVMe data uses bounded PRPs. Queue-registration/persistent-DMA opcodes and arbitrary
+operational-register writes are refused; only scratchpads are writable.
+
+Firmware download segments carry `imageOffset`, `totalImageBytes`, `lastSegment`
+and a shared nonzero `downloadToken` (argument1). The driver enforces contiguous
+offsets, type, total, epoch and token. A failed/ambiguous transaction is poisoned
+until controller reset; periodic discovery and unrelated control requests stay
+paused between segments. Information/event snapshots and explicit reset remain
+available. No implicit reset/activation is performed by the CLI.
+Firmware upload permits a size query and bounded offset reads. Image validity,
+board compatibility and signature policy remain firmware responsibilities.
+
+Diagnostic post ownership outlives its command reply. Buffers remain prepared
+until a checked release response/event or a proved IOC stop. Reads/unregister
+require the registered uniqueId (`generation` field) and released ownership;
+pointers are detached under the reply lock before VM release. Reset clears
+ownership and invalidates old contents; close never guesses DMA has stopped.
+Diagnostic registration uses a 100-byte descriptor (uniqueId, extendedType,
+three reserved bytes and 23 product words), with `bufferType`/`bufferBytes` as
+arguments. Query exposes allocated/owned/valid state. A read uses argument1 as
+byte offset and readBytes as length. Release and unregister are separate operations.
+
+The event history is a bounded snapshot ring, independent of command EVENT_ACK.
+Readers carry nextSequence and receive a gap flag if older entries were overwritten.
+Additional event subscriptions cannot disable the driver's required events.
+Controller facts, PCI configuration, targets/path/protection metadata and register
+reads are accessible without debug logs. `mprctl.py list/info/targets/events/request`
+selects one registry ID, handles epoch acquisition and JSON/hex encoding, and can
+serialize packets without hardware access. It does not implement a vendor RAID UI.
+
+Shutdown first uses the normal logical-unit flush barrier, then the reference IR
+shutdown RAID_ACTION and bounded SATA SSU policy. SSD/rotational-specific policies
+require a known VPD rotation value; unknown media are touched only by policy 3. The kernel retains unknown DMA
+ownership even when a shutdown or management command times out. Sleep keeps its
+separate flush/quiesce path and does not send the shutdown-only commands.
 
 ## 1. Concurrency and ordering
 
@@ -206,11 +303,10 @@ device page fields are refreshed. A handle the firmware stops listing becomes a
 removal candidate; a handle that reappears cancels that decision and, because the
 medium behind it may be a different disk, advances that slot's generation.
 
-GET_NEXT_HANDLE also returns SCSI Enclosure Processor (SEP/SES) devices attached
-to an expander. They carry SSP end-device bits but are not block disks, so
-candidates with `MPI2_SAS_DEVICE_INFO_SEP` are excluded from both the disk
-count and the standalone-target count. Without this exclusion an enclosure
-processor counts as a disk and is probed as if it were one.
+GET_NEXT_HANDLE also returns SEP/SES and other connected endpoints. They remain
+in the transport table for administrative SCSI/SEP requests. INQUIRY classifies
+non-direct-access devices as management-only; capacity and block-read probes are
+not sent to tape or enclosure endpoints, and no IOMedia is published for them.
 
 On IR-capable firmware, RAID Configuration Page 0 excludes members, hot spares
 and expansion members from physical-disk publication. RAID Volume Pages 0/1
@@ -504,12 +600,17 @@ names are not macOS requirements.
 | Queue resources | `mpr_resize_queues`, high-priority command pool | Facts-constrained geometry, reserved management/TMF/ACK resources |
 | SCSI data contract | `mprsas_action_scsiio` plus CAM disk policy | READ/WRITE(10)/(16), exact block transfers, bounded sense, SYNC(10)/(16), FUA fallback |
 | Thin provisioning | CAM disk and UNMAP policy | B0/B2 capability probe, input validation, bounded descriptor and block batching |
-| Discovery | SAS config pages and discovery events | GET_NEXT_HANDLE enumeration merged into a per-handle table; SEP/SES devices excluded; every eligible target published |
+| Discovery | SAS config pages and discovery events | Typed GET_NEXT_HANDLE + REPORT LUNS; non-block endpoints retained for management; direct-access LUNs published |
 | IR membership protection | IR config handling, RAID_COMPONENT filtering | RAID Configuration Page0 hides physical members/spares; Volume Pages0/1 publish usable logical volumes |
-| Persistent identity | SATA IDENTIFY, SCSI identifiers | Per-target ATA model+serial or validated VPD identifier, capacity/block-size comparison, per-target media generations |
+| Persistent identity | SATA IDENTIFY, SCSI identifiers | WWID/kind/LUN plus ATA/VPD identity; staged geometry comparison, monotonic cookies and native location |
 | Target removal | `mprsas_prepare_remove`, `mprsas_remove_device` | Per-target guarded TARGET_RESET/drain/REMOVE_DEVICE naming the removed handle, with handle-reuse checks and bounded fallback |
 | Recovery | abort/LUN/target/IOC reset and watchdog | TMF escalation for the failed command's handle, ownership proof, no replay of uncertain writes, IOC state monitoring |
 | Sleep and shutdown | FreeBSD suspend/resume return EINVAL; separate shutdown path | Native IOKit PM with per-target flush and wake revalidation |
+| EEDP/TLR | `mprsas_action_scsiio`, RC16 discovery | Type1/type3 protection flags, shared submit policy, sequential SSP TLR feedback |
+| Logical units and paths | `mprsas_set_lun`, discovery/mapping | REPORT LUNS, host address keys, per-LUN DSM/TMF, bounded firmware-WWID path selection; not CAM/DPM or ALUA compatibility |
+| Native control | `mpr_user.c`, `mpr_ioctl.h` | Root/boot-gated pointer-free IOUserClient; rebuilt DMA; facts/config/RAID/firmware/SCSI/SATA/NVMe/SMP/SEP/CLI primitives |
+| Diagnostics | Diagnostic buffer post/release and event log | Checked retained DMA ownership, unique IDs, released-only read, bounded event snapshots |
+| Shutdown devices | `mprsas_ir_shutdown` | Logical-unit flush, IR notification, bounded SATA SSU policy |
 | Builds | OS-specific build system | All driver translation units in the CLI and Xcode builds |
 
 The PCI/generation, IR and NVMe implementation now covers the exact families in
@@ -531,30 +632,34 @@ The batching/empty-drain policy also uses the local Linux
 implementation is not copied into the kext. Its per-vector queues are not
 simulated by multiple threads competing for this driver's one ring.
 
-## 9. Host-side checks
+## 9. Build evidence and limits
 
-`tools/test_protocol.cpp` contains golden CDB/VPD/sense tests and an independent
-IEEE chain decoder with 2,000 deterministic SGL cases. The performance helper
-coverage includes requested-depth clamping, insufficient credits/queue entries,
-SMID separation and reset-time lower limits, signed wide-arithmetic resource
-oracles, and all completion permutations for a partially failing four-chunk
-request. The suite is built with ASan/UBSan at `-O1 -Wall -Wextra -Werror` on
-WSL GCC and passes 158,829 assertions over its 2,000
-deterministic SGL cases, including native PRP boundaries and MPI NVMe wire layouts.
-It does not simulate IOKit mapping, IRQ interleaving or
-real DMA-stop evidence.
+The current six driver translation units are syntax/object-compiled against
+MacKernelSDK for x86_64 macOS. Python CLI source is syntax-compiled without
+loading IOKit. Compilation does not prove kernel ABI/link/load compatibility,
+DMA behavior, storage correctness, or any newly added hardware capability.
+No current test execution or native link/sign/load result is claimed here.
 
-`tools/validate-build-inputs.py` checks LF text, plist/runtime/CLI/Xcode version
-consistency and inclusion of all four driver translation units in the Xcode
-project. It also checks host-test source line endings. Its successful result is
-not a C++ compilation or a kernel ABI/link validation.
+`tools/test_protocol.cpp` remains the repository's host-only protocol suite;
+its historical results are not results for this source. The existing build-input
+validator checks line endings, versions and Xcode source membership, not runtime
+behavior. `tools/build-noxcode.sh` includes all driver translation units by glob;
+the Xcode source phase explicitly includes MPRControl and MPRUserClient. Native
+link/sign/deployment remain separate steps, not implied by cross-compiled objects.
 
-`tools/build-noxcode.sh` compiles the four translation units with the
-MacKernelSDK headers, links them with `ld -kext`, checks the kmod entry points
-and bundle type, rejects unresolved driver-internal symbols and signs the bundle
-ad hoc. The earlier 0.21.0 resulting kext supplied the recorded ESP measurements. Every
-symbol it leaves undefined was checked against the kernel collections on that
-machine; `___chkstk_darwin` is the only one not listed there, and the same
-reference was present in the previously qualified build. The Xcode project entry
-point cannot be exercised on this machine because only the Command Line Tools
-are installed, so that build path is unverified.
+## Current host validation boundary
+
+The existing host suite now includes the native management header/length/flag
+contract, exhaustive 16-bit LUN encoding/decoding and native-PRP residual/page
+boundaries. The recorded host result is 355,563 assertions plus 2,000
+deterministic SGL cases, under ASan/UBSan. The Python CLI is checked through its
+offline encoder/decoder; no native IOKit connection is opened by these checks.
+Six driver sources compile to x86_64 Mach-O objects. Driver-symbol closure is
+a separate object-level check, not a native kext link, signature or load result.
+No hardware tests are scheduled or performed by this source change.
+
+Hidden RAID members are not inserted into the publication table for raw access.
+Maintenance-mode requests can use generation zero plus the exact WWID; the
+driver re-reads SAS/PCIe Device Page0, validates presence/access/type and uses
+PCIe Page2 MDTS for NVMe members before submitting. This path uses private
+command metadata only and does not create an IOMedia.

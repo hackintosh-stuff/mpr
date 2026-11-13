@@ -1,10 +1,11 @@
 # MPR — Fusion-MPT SAS3 / Tri-Mode kext for macOS
 
-Date: 2026-11-13. Driver version: 0.23.0.
+Date: 2026-11-14. Driver version: 0.24.0.
 
 MPR is an IOKit block-storage driver for LSI/Broadcom MPI 2.5/2.6 Fusion-MPT
 controllers on x86_64 macOS. Eligible SAS/SATA disks, firmware IR RAID volumes
-and PCIe NVMe targets each publish a LUN-0 whole-disk `IOMedia` through
+and discovered direct-access logical units on PCIe NVMe targets each publish
+their own whole-disk `IOMedia` through
 `IOBlockStorageDriver`.
 
 ## Supported hardware
@@ -30,13 +31,16 @@ available with `mpr_debug=1`.
 
 ## Status
 
-Version 0.23.0 adds the wider PCI/generation paths, IR volume publication and
-PCIe NVMe transport, PRP and DSM handling. Validation in this change is limited
-to host protocol regressions and x86_64 Mach-O object cross-compilation against
-MacKernelSDK. It has not been natively linked/signed, deployed or load-tested.
+The source implements multi-LUN/namespace routing, protected-disk I/O, bounded
+controller-local path selection and a native administrator control interface in
+addition to the SAS/IR/NVMe data paths. Current evidence is source review and
+cross-compilation of the six driver translation units against MacKernelSDK.
+There is no current native link/sign/load result or hardware qualification.
+Host-only ASan/UBSan protocol checks, offline CLI packet checks and build-input
+validation have been executed. No hardware tests are scheduled or performed.
 
 All runtime measurements below belong to the previously documented SAS3008
-build 0.21.0, not 0.23.0 or any newly matched hardware. The running machine was
+build 0.21.0, not 0.24.0 or any newly matched hardware. The running machine was
 not queried or changed during this source-only work.
 
 Qualified on 0.21.0: read-only block I/O including requests larger than
@@ -148,6 +152,11 @@ Wire-format and large-LBA cases are checked on the host, not on this hardware.
   shutdown; unconditional controller rebuild before the first topology read on
   wake, with a watchdog-timed settling window for config/event and PortEnable
   replies, then per-target revalidation.
+- REPORT LUNS, per-LUN command/flush/TMF ownership and namespace-aware NVMe DSM.
+- Type-1/type-3 EEDP, TLR for supported sequential-access targets, native
+  management-only endpoint classification and identity-checked path selection.
+- Administrator control, diagnostic buffer ownership, event history and
+  maintenance-isolated firmware/RAID operations; IR shutdown and SATA SSU.
 - Diagnostic output is silent by default: adding `mpr_debug=1` to boot-args
   enables both the kernel log lines and all IORegistry properties.
 
@@ -157,19 +166,71 @@ work are in [PLAN.md](PLAN.md).
 
 ## Scope
 
-Each published target is a LUN-0 whole disk with its own medium. Discovery,
-probing, removal and recovery are per target: a handle names one firmware
-address, and the driver keeps the target kind, WWID, stable identity and medium
-generation that address was probed for, so a reused handle is never treated as
-the same disk.
+Each published direct-access LUN has its own geometry, stable identity and
+media generation. REPORT LUNS supports peripheral, flat and extended-flat SAM
+addresses; NVMe DSM maps LUN to NSID = LUN + 1. The bounded table holds 64 logical
+targets, including management-only anchors. Tape/enclosure/other connected SCSI
+endpoints remain available for administrator passthrough, not as block disks.
 
-Array creation/reconfiguration and raw access to RAID members, multipath,
-multi-LUN/extra NVMe namespaces, SES/SMP management, firmware flashing and
-FreeBSD user ioctl compatibility remain outside this driver. IR volume deletion
-never sends physical REMOVE_DEVICE; member disks newly claimed by firmware are
-retired without target reset or REMOVE_DEVICE. Unknown/reused handles fail closed. IOKit may still bounce through internal memory, so direct
-client mapping is not a guarantee that every platform performs zero copies; the
-legacy synchronous bulk/probe path keeps staging.
+Up to eight firmware handles for the same `(kind, WWID, LUN)` share one logical
+target within a controller. A complete discovery snapshot retains a present
+active path or selects a surviving path, invalidates its old media generation
+and re-probes before publication. This is discovery-driven failover, not
+cross-controller MPIO/ALUA, round-robin load balancing or uncertain-write replay.
+Different SAS-port addresses are not automatically equated without a common
+firmware identity. Native WWID/LUN locations do not guarantee a fixed BSD disk
+number across boots or write FreeBSD CAM target-ID mappings into firmware DPM.
+
+EEDP covers supported type-1/type-3 protected READ/WRITE commands; unsupported
+protection formats are refused rather than exposed through an unprotected
+READ CAPACITY fallback. Supported sequential-access endpoints can use TLR via
+the control interface. Native macOS tape/optical class drivers, a SCSI target
+mode, FreeBSD binary ioctl compatibility, Apple Silicon and hardware multi-queue
+are not implemented. SCSI bidirectional/raw persistent-DMA commands and arbitrary
+queue-register writes are deliberately not exposed by the native control ABI.
+
+## Administrator control
+
+`tools/mprctl.py` uses the native `IOUserClient`, not a FreeBSD ioctl emulation.
+Management is disabled by default. `mpr_management=1` enables an administrator-
+only connection for information, targets, events, configuration reads, read-only
+SCSI/SATA/NVMe/SMP and enclosure requests, and controlled diagnostics/reset.
+`mpr_debug=1` is independent: it enables logs and diagnostic IORegistry properties.
+
+`mpr_maintenance=1` also enables management but suppresses all block-media
+publication. Raw operations that can change media, arrays or firmware require
+that maintenance boot AND the CLI's explicit `--allow-mutation` option. The CLI
+requires an explicit `--registry-id` for acknowledged state-changing requests;
+target-specific requests additionally carry the current WWID and generation.
+The driver generates every DMA address and refuses stale transport epochs.
+No utility changes boot arguments, deploys a kext, mounts a volume or reboots.
+
+The native interface includes configuration pages, RAID actions/member
+passthrough, firmware upload/segmented download, SCSI/SATA/NVMe/SMP passthrough,
+SEP enclosure control, diagnostic CLI, register reads, scratchpad writes,
+controller reset/rescan, event masks/history and diagnostic buffer management.
+These are protocol primitives, not a vendor-specific array-management GUI.
+
+```sh
+python3 tools/mprctl.py list
+sudo python3 tools/mprctl.py info --registry-id <registry-id>
+sudo python3 tools/mprctl.py targets --registry-id <registry-id>
+sudo python3 tools/mprctl.py events --registry-id <registry-id> --after <sequence>
+sudo python3 tools/mprctl.py request request.json --registry-id <registry-id>
+```
+
+A request JSON uses an `operation` (default `passthrough`), a named MPI `function`
+or `requestHex`, and optional `dataOutFile`/`dataOutHex`, `readBytes`, `timeoutMs`,
+`wwid`, `generation` and function-specific fields. Epoch is queried when omitted;
+it is never silently refreshed and retried after an operation fails. Paths in a
+JSON specification are relative to that JSON file. `--encode-only packet.bin`
+serializes without opening IOKit; `--data-output file` saves the returned payload.
+Detailed fields, bounds and source references are in [DEBUG.md](DEBUG.md).
+
+Shutdown flushes published logical units, notifies IR firmware of shutdown, and
+optionally sends SATA START STOP UNIT. `mpr_ssu` follows the reference policy:
+0 disables SSU, 1 selects identified SSDs (default), 2 selects rotational disks,
+3 selects all eligible SATA disks. Sleep does not send the shutdown notification.
 
 ## Performance configuration
 

@@ -25,7 +25,7 @@ private:
     void refreshIdentity(void);
     bool           fLastMediaPresent;
     /* Each nub belongs to one target; all published targets are writable. */
-    UInt16         fDevHandle;
+    UInt64         fDevHandle;
 
 public:
     virtual bool init(OSDictionary *properties) APPLE_KEXT_OVERRIDE;
@@ -33,7 +33,7 @@ public:
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 
-    void setController(MPRController *controller, UInt16 handle = 0);
+    void setController(MPRController *controller, UInt64 handle = 0);
     IOReturn notifyMediaState(UInt32 state);
 
     virtual IOReturn doEjectMedia(void) APPLE_KEXT_OVERRIDE;

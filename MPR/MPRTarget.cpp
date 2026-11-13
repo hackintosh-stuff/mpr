@@ -194,126 +194,103 @@ MPRController::readSasDevicePage0(UInt32 devHandle, UInt32 *outDeviceInfo)
     return true;
 }
 
+UInt32
+MPRController::nextTargetGeneration(void)
+{
+    if (fTargetGenerationSerial == UINT32_MAX) {
+        recordProtocolFault(kMPRTargetMalformedReply, 0);
+        return UINT32_MAX; // Never wrap into a cookie held by an old request.
+    }
+    return ++fTargetGenerationSerial;
+}
+
 bool
 MPRController::mergeTarget(MPRTargetKind kind, UInt16 handle, UInt64 address,
                            UInt32 info, UInt16 flags, UInt32 token,
-                           UInt32 maxTransfer, UInt8 resetTimeout)
+                           UInt32 maxTransfer, UInt8 resetTimeout, UInt32 lun)
 {
-    if (!handle || handle == 0xFFFF || !address) return false;
-    MPRTargetSlot *old = findTarget(handle);
-    const bool changed = !old || !old->present || old->kind != kind || old->sasAddress != address;
-    /* Identity is (transport kind, WWID), not the firmware handle. After a
-     * controller reset the IOC can hand the same device a different handle,
-     * and two devices can swap handles; matching by handle first would then
-     * publish one disk twice and orphan the other's medium. */
+    UInt8 wireLun[8];
+    if (!handle || handle == 0xFFFF || !address || !mprEncodeLun(wireLun, lun)) return false;
     MPRTargetSlot *slot = NULL;
-    for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
-        if (fTargets[i].handle != 0 && fTargets[i].kind == kind &&
-            fTargets[i].sasAddress == address) {
-            slot = &fTargets[i];
-            break;
+    for (UInt32 i = 0; i < kMPRMaxTargets; ++i)
+        if (fTargets[i].sasAddress == address && fTargets[i].kind == kind && fTargets[i].lun == lun) {
+            slot = &fTargets[i]; break;
         }
+    if (!slot) {
+        slot = allocTargetSlot();
+        if (!slot) { MPR_DEBUG_PROP("MPRTopologyFailure", "too-many-logical-targets"); return false; }
+        MPRBlockDev *nub = slot->nub;
+        bzero(slot, sizeof(*slot)); slot->nub = nub;
+        slot->kind = kind; slot->sasAddress = address; slot->lun = lun;
+        slot->handle = handle; slot->generation = nextTargetGeneration();
     }
-    if (slot != NULL && slot->scanToken == token) {
-        /* The same device is listed twice in one snapshot, which a reset
-         * can leave behind. Adopt it once instead of creating a second
-         * medium for one disk. */
-        MPR_DEBUG_PROP("MPRTopologyDuplicate", "same-kind-and-wwid");
-        return true;
+    if (slot->scanToken != token) {
+        slot->scanToken = token; slot->pathCount = 0;
     }
-    if (slot != NULL) {
-        if (slot->handle != handle) {
-            /* Same disk, new firmware address: rebind in place. Queued I/O
-             * carries the old handle, so it must fail rather than reach
-             * whatever else that handle now names. */
-            slot->generation++;
-            slot->handle = handle;
-            MPR_DEBUG_PROP("MPRTargetReuseState", "handle-moved-same-device");
-        }
-    } else {
-        slot = findTarget(handle);
-        if (slot != NULL) {
-            /* The handle now names a different device. The old binding is
-             * dropped here; its commands and medium are invalidated before
-             * the new device is probed. */
-            if (slot->nub != NULL) slot->offlinePending = true;
-            slot->online = false;
-            slot->onlinePending = false;
-            slot->generation++;
-            slot->probeValid = false;
-            slot->identityValid = false;
-            slot->removalRequested = false;
-            MPR_DEBUG_PROP("MPRTargetReuseState", "handle-reassigned");
-        } else {
-            /* A disk that returns after REMOVE_DEVICE gets a new firmware
-             * handle; reuse the retired slot of the same SAS address when
-             * one exists, so its nub and IOMedia come back instead of
-             * leaking a slot and creating a second medium. */
-            MPRTargetSlot *retired = NULL;
-            for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
-                MPRTargetSlot *candidate = &fTargets[i];
-                if (candidate->handle == 0 && candidate->nub != NULL &&
-                    candidate->kind == kind && candidate->sasAddress == address) {
-                    retired = candidate;
-                    break;
-                }
+    for (UInt32 i = 0; i < slot->pathCount; ++i)
+        if (slot->paths[i].handle == handle) return true;
+    if (slot->pathCount == MPRTargetSlot::kPathLimit) {
+        MPR_DEBUG_PROP("MPRTopologyFailure", "too-many-paths-per-logical-target"); return false;
+    }
+    MPRTargetSlot::Path &path = slot->paths[slot->pathCount++];
+    path.handle = handle; path.info = info; path.flags = flags;
+    path.maxTransfer = maxTransfer; path.resetTimeout = resetTimeout;
+    /* Only collect here. Do not change a live handle merely because GET_NEXT
+     * happens to enumerate its standby path before the active path. */
+    return !fProtocolRecoveryPending;
+}
+
+bool
+MPRController::finalizeTargetPaths(UInt32 token)
+{
+    UInt32 selected[kMPRMaxTargets];
+    for (UInt32 i = 0; i < kMPRMaxTargets; ++i) {
+        MPRTargetSlot &slot = fTargets[i]; selected[i] = UINT32_MAX;
+        if (slot.scanToken != token || !slot.pathCount) continue;
+        selected[i] = 0;
+        for (UInt32 p = 0; p < slot.pathCount; ++p)
+            if (slot.paths[p].handle == slot.handle) { selected[i] = p; break; }
+        for (UInt32 j = 0; j < i; ++j)
+            if (selected[j] != UINT32_MAX && fTargets[j].lun == slot.lun &&
+                fTargets[j].paths[selected[j]].handle == slot.paths[selected[i]].handle) {
+                MPR_DEBUG_PROP("MPRTopologyFailure", "handle-has-conflicting-identities"); return false;
             }
-            if (retired != NULL) {
-                slot = retired;
-                slot->handle = handle;
-                slot->probeValid = false;
-                slot->identityValid = false;
-                slot->generation++;
-                slot->removalRequested = false;
-                slot->onlinePending = false;
-                setTargetRemovalState(slot, "reinserted");
-            } else {
-                slot = allocTargetSlot();
-                if (slot == NULL) {
-                    MPR_DEBUG_PROP("MPRTopologyFailure", "too-many-targets");
-                    return false;
-                }
-                /* A recycled slot can still own the nub of its previous
-                 * device; that nub is re-pointed when this target is
-                 * published. */
-                MPRBlockDev *reusedNub = slot->nub;
-                memset(slot, 0, sizeof(*slot));
-                slot->nub = reusedNub;
-                slot->handle = handle;
-            }
+    }
+    /* A newly enumerated identity may occupy an old handle. Retire the old
+     * binding without resetting/removing the replacement. Monotonic cookies
+     * make already accepted old requests fail even if table slots are recycled. */
+    for (UInt32 i = 0; i < kMPRMaxTargets; ++i) {
+        MPRTargetSlot &old = fTargets[i];
+        if (selected[i] != UINT32_MAX || !old.handle) continue;
+        for (UInt32 j = 0; j < kMPRMaxTargets; ++j) {
+            if (selected[j] == UINT32_MAX || old.lun != fTargets[j].lun ||
+                old.handle != fTargets[j].paths[selected[j]].handle) continue;
+            invalidateTarget(&old); old.present = false; old.removalRequested = false;
+            old.handle = 0; setTargetRemovalState(&old, "handle-reassigned"); break;
         }
     }
-    slot->handle = handle;
-    slot->kind = kind;
-    slot->hiddenByRaid = false;
-    slot->maxTransferBytes = maxTransfer;
-    slot->resetTimeoutSeconds = resetTimeout;
-    slot->deviceInfo = info;
-    slot->flags = flags;
-    slot->sasAddress = address;
-    slot->fastPath = kind == kMPRTargetNvme
-        ? (flags & MPI26_PCIEDEV0_FLAGS_ENABLED_FAST_PATH) != 0 &&
-          (flags & MPI26_PCIEDEV0_FLAGS_FAST_PATH_CAPABLE) != 0
-        : kind == kMPRTargetSas &&
-          (flags & MPI25_SAS_DEVICE0_FLAGS_ENABLED_FAST_PATH) != 0 &&
-          (flags & MPI25_SAS_DEVICE0_FLAGS_FAST_PATH_CAPABLE) != 0;
-    slot->scanToken = token;
-    if (!slot->present) {
-        /* Listed again after being dropped: this is a new medium behind a
-         * possibly identical identity, so its generation advances and its
-         * probe budget starts over. */
-        slot->present = true;
-        slot->removalRequested = false;
-        slot->probeRetries = 0;
-        slot->probeState = kMPRProbeOk;
-        if (!slot->probeValid) slot->generation++;
-        if (slot->nub != NULL) slot->onlinePending = false;
+    for (UInt32 i = 0; i < kMPRMaxTargets; ++i) {
+        if (selected[i] == UINT32_MAX) continue;
+        MPRTargetSlot &slot = fTargets[i];
+        const MPRTargetSlot::Path &path = slot.paths[selected[i]];
+        const bool changed = !slot.present || slot.handle != path.handle;
+        if (changed) {
+            invalidateTarget(&slot); slot.probeRetries = 0; slot.probeState = kMPRProbeOk;
+            MPR_DEBUG_LOG("MPR: select path kind=%u WWID=%016llx LUN=%u handle=0x%04x -> 0x%04x paths=%u\n",
+                (unsigned)slot.kind, (unsigned long long)slot.sasAddress, (unsigned)slot.lun,
+                slot.handle, path.handle, (unsigned)slot.pathCount);
+        }
+        slot.handle = path.handle; slot.deviceInfo = path.info; slot.flags = path.flags;
+        slot.maxTransferBytes = path.maxTransfer; slot.resetTimeoutSeconds = path.resetTimeout;
+        slot.present = true; slot.hiddenByRaid = false; slot.removalRequested = false;
+        slot.fastPath = slot.kind == kMPRTargetNvme
+            ? (path.flags & MPI26_PCIEDEV0_FLAGS_ENABLED_FAST_PATH) &&
+              (path.flags & MPI26_PCIEDEV0_FLAGS_FAST_PATH_CAPABLE)
+            : slot.kind == kMPRTargetSas &&
+              (path.flags & MPI25_SAS_DEVICE0_FLAGS_ENABLED_FAST_PATH) &&
+              (path.flags & MPI25_SAS_DEVICE0_FLAGS_FAST_PATH_CAPABLE);
     }
-    if (changed)
-        MPR_DEBUG_LOG("MPR: target kind=%u handle=0x%04x WWID=%016llx flags=0x%04x MDTS=%u reset=%us\n",
-            (unsigned)kind, handle, (unsigned long long)address, flags,
-            (unsigned)maxTransfer, resetTimeout);
-    return true;
+    return !fProtocolRecoveryPending;
 }
 
 static bool mprRaidVolumeUsable(const UInt8 *page, UInt32 bytes)
@@ -439,6 +416,82 @@ MPRController::readAdditionalTarget(MPRTargetSlot *slot, bool *present, UInt64 *
 }
 
 bool
+MPRController::discoverLogicalUnits(UInt32 token)
+{
+    const UInt32 allocation = 8 + 8 * kMPRMaxTargets;
+    UInt32 luns[kMPRMaxTargets];
+    for (UInt32 i = 0; i < kMPRMaxTargets; ++i) {
+        MPRTargetSlot *base = &fTargets[i];
+        if (!base->handle || base->lun || base->scanToken != token || !base->present ||
+            base->kind == kMPRTargetRaidVolume ||
+            (base->kind == kMPRTargetSas && (base->deviceInfo & MPI2_SAS_DEVICE_INFO_SATA_DEVICE))) continue;
+        if (!allocateResidentBuffers()) return false;
+        fAttachedDevHandle = base->handle;
+        fAttachedLun = 0;
+        fFastPathEnabled = base->fastPath;
+        UInt8 cdb[12] = {0xA0};
+        mprWriteBe32(cdb + 6, allocation);
+        IOReturn status = kIOReturnNotReady;
+        UInt32 actual = 0;
+        bool ok = issueScsiCommand(cdb, sizeof(cdb), MPI2_SCSIIO_CONTROL_READ,
+                                   NULL, allocation, 8, &status, &actual, true);
+        if (!ok) {
+            if (fProtocolRecoveryPending) return false;
+            /* Unsupported REPORT LUNS keeps the legacy LUN-zero path. A
+             * temporary NOT READY must not discard previously known LUNs. */
+            for (UInt32 j = 0; j < kMPRMaxTargets; ++j)
+                if (fTargets[j].handle != 0 && fTargets[j].lun &&
+                    fTargets[j].kind == base->kind && fTargets[j].sasAddress == base->sasAddress)
+                {
+                    UInt32 lun = fTargets[j].lun;
+                    for (UInt32 p = 0; p < base->pathCount; ++p) {
+                        const MPRTargetSlot::Path &path = base->paths[p];
+                        if (!mergeTarget(base->kind, path.handle, base->sasAddress, path.info,
+                            path.flags, token, path.maxTransfer, path.resetTimeout, lun)) return false;
+                    }
+                }
+            MPR_DEBUG_PROP("MPRReportLunsStatus", (unsigned long long)(UInt32)status, 32);
+            continue;
+        }
+        const UInt8 *data = (const UInt8 *)fDataBuffer->getBytesNoCopy();
+        if (actual < 8) return false;
+        UInt32 bytes = mprReadBe32(data);
+        if ((bytes & 7) || bytes > actual - 8 || bytes / 8 > kMPRMaxTargets) {
+            MPR_DEBUG_PROP("MPRTopologyFailure", "REPORT-LUNS-truncated-or-malformed"); return false;
+        }
+        UInt32 count = 0;
+        for (UInt32 off = 8; off < bytes + 8; off += 8) {
+            UInt32 lun = 0;
+            if (!mprDecodeLun(data + off, &lun)) {
+                MPR_DEBUG_PROP("MPRSkippedLunAddress", "unsupported-SAM-address-method"); continue;
+            }
+            bool duplicate = false;
+            for (UInt32 j = 0; j < count; ++j) if (luns[j] == lun) duplicate = true;
+            if (!duplicate) luns[count++] = lun;
+        }
+        bool zeroPresent = false;
+        for (UInt32 j = 0; j < count; ++j) {
+            if (!luns[j]) { zeroPresent = true; continue; }
+            for (UInt32 p = 0; p < base->pathCount; ++p) {
+                const MPRTargetSlot::Path &path = base->paths[p];
+                if (!mergeTarget(base->kind, path.handle, base->sasAddress, path.info,
+                    path.flags, token, path.maxTransfer, path.resetTimeout, luns[j])) return false;
+            }
+        }
+        /* Retain an addressable LUN-zero anchor even when it is not a disk;
+         * it owns physical removal and future REPORT LUNS, not an IOMedia. */
+        if (!zeroPresent) {
+            base->managementOnly = true;
+            if (base->nub && base->online) { base->online = false; base->offlinePending = true; }
+        } else if (base->managementOnly && base->peripheralType == 0) {
+            base->managementOnly = false; base->probeValid = false;
+        }
+    }
+    fAttachedLun = 0;
+    return true;
+}
+
+bool
 MPRController::readSasIOUnitPage0(void)
 {
     UInt8 page[kMPRTargetConfigBytes];
@@ -509,7 +562,6 @@ MPRController::readSasIOUnitPage0(void)
         if ((info & 7) != MPI2_SAS_DEVICE_INFO_END_DEVICE ||
             (info & (MPI2_SAS_DEVICE_INFO_SATA_DEVICE | MPI2_SAS_DEVICE_INFO_STP_TARGET |
                      MPI2_SAS_DEVICE_INFO_SSP_TARGET)) == 0 ||
-            (info & (MPI2_SAS_DEVICE_INFO_ATAPI_DEVICE | MPI2_SAS_DEVICE_INFO_SEP)) != 0 ||
             page[0x17] != 0 ||
             (flags & MPI2_SAS_DEVICE0_FLAGS_DEVICE_PRESENT) == 0 ||
             (flags & (MPI2_SAS_DEVICE0_FLAGS_UNSUPPORTED_DEVICE |
@@ -525,7 +577,12 @@ MPRController::readSasIOUnitPage0(void)
         candidates++;
         selected = handle;
     }
-    if (!finished || !scanAdditionalTargets(token, &selected)) return false;
+    if (!finished || !scanAdditionalTargets(token, &selected) || !finalizeTargetPaths(token) ||
+        !discoverLogicalUnits(token) || !finalizeTargetPaths(token)) return false;
+    selected = 0;
+    for (UInt32 i = 0; i < kMPRMaxTargets; ++i)
+        if (fTargets[i].scanToken == token && !fTargets[i].lun && fTargets[i].present)
+            selected = fTargets[i].handle;
 
     /* Every handle the firmware stopped listing is a removal candidate. The
      * medium stays invalid until the guarded TARGET_RESET/REMOVE_DEVICE
@@ -559,6 +616,7 @@ MPRController::readSasIOUnitPage0(void)
         MPR_DEBUG_REMOVE("MPRSasDevicePageState");
     }
     fAttachedDevHandle = selected;
+    fAttachedLun = 0;
     fLinkUpPhys = links;
     fHasExpander = expander;
     fDiscoveredDiskCount = disks;
@@ -730,15 +788,15 @@ MPRController::probeStableIdentity(void)
                                                   "vpd80", key, 36 + serialBytes);
         }
     }
-    MPRTargetSlot *identitySlot = findTarget((UInt16)fAttachedDevHandle);
+    MPRTargetSlot *identitySlot = findTarget(currentTargetKey());
     if (!fTargetIdentityValid && !fProtocolRecoveryPending && identitySlot &&
         identitySlot->kind != kMPRTargetSas && identitySlot->sasAddress != 0) {
         bool present = false; UInt64 address = 0;
         if (readAdditionalTarget(identitySlot, &present, &address) && present &&
             address == identitySlot->sasAddress) {
-            snprintf(fTargetIdentity, sizeof(fTargetIdentity), "%s-%016llx",
+            snprintf(fTargetIdentity, sizeof(fTargetIdentity), "%s-%016llx-lun%u",
                 identitySlot->kind == kMPRTargetRaidVolume ? "raid-wwid" : "nvme-wwid",
-                (unsigned long long)address);
+                (unsigned long long)address, (unsigned)identitySlot->lun);
             fTargetIdentityValid = true;
         }
     }
@@ -749,11 +807,11 @@ MPRController::probeStableIdentity(void)
 }
 
 MPRTargetSlot *
-MPRController::findTarget(UInt16 handle)
+MPRController::findTarget(UInt64 handle)
 {
     if (handle == 0) return NULL;
     for (UInt32 i = 0; i < kMPRMaxTargets; i++)
-        if (fTargets[i].handle == handle) return &fTargets[i];
+        if (fTargets[i].handle != 0 && fTargets[i].key() == handle) return &fTargets[i];
     return NULL;
 }
 
@@ -763,7 +821,25 @@ MPRController::probeScsiIdentity(void)
     if (fProtocolRecoveryPending || !allocatePageBuffer()) return false;
     bool ready = scsiTur();
     MPR_DEBUG_PROP("MPRTurStatus", ready ? "ok" : "failed");
-    bool ok = !fProtocolRecoveryPending && scsiInquiry() && probeStableIdentity();
+    bool ok = !fProtocolRecoveryPending && scsiInquiry();
+    MPRTargetSlot *target = findTarget(currentTargetKey());
+    if (ok && target && target->managementOnly) {
+        UInt8 pages[256]; UInt32 actual = 0;
+        target->tlrEnabled = false;
+        if (target->peripheralType == 1 && target->kind == kMPRTargetSas &&
+            (target->deviceInfo & MPI2_SAS_DEVICE_INFO_SSP_TARGET) &&
+            (fIocCapabilities & MPI2_IOCFACTS_CAPABILITY_TLR) &&
+            scsiInquiryVpd(0, pages, sizeof(pages), &actual)) {
+            for (UInt32 i = 4; i < actual; ++i)
+                if (pages[i] == 0x90) target->tlrEnabled = true;
+        }
+        memcpy(target->vendor, fVendor, sizeof(target->vendor));
+        memcpy(target->product, fProduct, sizeof(target->product));
+        memcpy(target->revision, fRevision, sizeof(target->revision));
+        target->probeValid = !fProtocolRecoveryPending;
+        return target->probeValid;
+    }
+    if (ok) ok = probeStableIdentity();
     MPR_DEBUG_PROP("MPRScsiProbeState", ok ? "ok" : "failed");
     return ok;
 }
@@ -795,7 +871,7 @@ MPRController::probeTargetCapabilities(void)
         fUnmapEnabled = mprParseUnmapLimits(limits, limitBytes, provisioning,
                                            provisioningBytes, &fUnmapLimits);
     }
-    MPRTargetSlot *capabilityTarget = findTarget((UInt16)fAttachedDevHandle);
+    MPRTargetSlot *capabilityTarget = findTarget(currentTargetKey());
     if (fUnmapEnabled && capabilityTarget && capabilityTarget->kind == kMPRTargetNvme &&
         capabilityTarget->maxTransferBytes) {
         UInt32 descriptors = capabilityTarget->maxTransferBytes / 16;
@@ -813,6 +889,16 @@ MPRController::probeTargetCapabilities(void)
                              NULL, 64, 8, &status, &actual, true) && actual >= 8) {
             const UInt8 *mode = (const UInt8 *)fDataBuffer->getBytesNoCopy();
             fNativeFuaSupported = (mode[3] & 0x10) != 0;
+        }
+    }
+    if (capabilityTarget && capabilityTarget->kind == kMPRTargetSas &&
+        (capabilityTarget->deviceInfo & MPI2_SAS_DEVICE_INFO_SATA_DEVICE)) {
+        UInt8 characteristics[64]; UInt32 actual = 0;
+        capabilityTarget->solidState = capabilityTarget->rotationKnown = false;
+        if (scsiInquiryVpd(0xB1, characteristics, sizeof(characteristics), &actual) && actual >= 6) {
+            const UInt16 rate = mprReadBe16(characteristics + 4);
+            capabilityTarget->solidState = rate == 1;
+            capabilityTarget->rotationKnown = rate == 1 || (rate >= 0x401 && rate <= 0xFFFE);
         }
     }
     MPR_DEBUG_PROP("MPRNativeFuaSupported", fNativeFuaSupported);
@@ -888,7 +974,7 @@ MPRController::scsiUnmap(const IOBlockStorageDeviceExtent *extents,
         mprWriteBe32(params + 16 + 16 * i, (UInt32)count);
     }
     IOReturn status = kIOReturnNotReady;
-    MPRTargetSlot *target = findTarget((UInt16)fAttachedDevHandle);
+    MPRTargetSlot *target = findTarget(currentTargetKey());
     bool ok;
     if (target && target->kind == kMPRTargetNvme) {
         status = issueNvmeDsm(extents, extentsCount, smid);
@@ -908,7 +994,7 @@ MPRController::scsiUnmap(const IOBlockStorageDeviceExtent *extents,
 
 IOReturn
 MPRController::synchronizeCacheNow(UInt64 block, UInt64 nblks, bool barrier,
-                                   UInt32 expectedGeneration, UInt16 handle)
+                                   UInt32 expectedGeneration, UInt64 handle)
 {
     if (fIOLock == NULL) return kIOReturnNotReady;
     IOReturn status = kIOReturnNotReady;
@@ -936,7 +1022,7 @@ MPRController::synchronizeCacheNow(UInt64 block, UInt64 nblks, bool barrier,
 
 IOReturn
 MPRController::unmapBlocksNow(const IOBlockStorageDeviceExtent *extents, UInt32 extentsCount,
-                              UInt32 expectedGeneration, UInt16 handle)
+                              UInt32 expectedGeneration, UInt64 handle)
 {
     if (extentsCount == 0) return kIOReturnSuccess;
     if (extents == NULL) return kIOReturnBadArgument;
@@ -1018,7 +1104,7 @@ MPRController::allocTargetSlot(void)
 }
 
 bool
-MPRController::selectTarget(UInt16 handle)
+MPRController::selectTarget(UInt64 handle)
 {
     /* The management and synchronous-command chain is single-threaded under
      * fIOLock and therefore bound to one handle at a time. Selecting a target
@@ -1026,7 +1112,8 @@ MPRController::selectTarget(UInt16 handle)
      * not change the target table. */
     MPRTargetSlot *slot = findTarget(handle);
     if (slot == NULL || !slot->present || !slot->probeValid) return false;
-    fAttachedDevHandle = handle;
+    fAttachedDevHandle = slot->handle;
+    fAttachedLun = slot->lun;
     fCapacityBlocks = slot->capacityBlocks;
     fBlockSize = slot->blockSize;
     fTargetDeviceInfo = slot->deviceInfo;
@@ -1053,6 +1140,16 @@ MPRController::publishTargetProperties(void)
         MPRTargetSlot *slot = &fTargets[i];
         if (slot->handle == 0 && slot->nub == NULL) continue;
         char name[48], address[24];
+        snprintf(name, sizeof(name), "MPRTarget%uPathCount", (unsigned)i);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->pathCount, 32);
+        snprintf(name, sizeof(name), "MPRTarget%uLUN", (unsigned)i);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->lun, 32);
+        snprintf(name, sizeof(name), "MPRTarget%uProtectionType", (unsigned)i);
+        MPR_DEBUG_PROP(name, (unsigned long long)slot->protectionType, 8);
+        snprintf(name, sizeof(name), "MPRTarget%uTLR", (unsigned)i);
+        MPR_DEBUG_PROP(name, slot->tlrEnabled);
+        snprintf(name, sizeof(name), "MPRTarget%uManagementOnly", (unsigned)i);
+        MPR_DEBUG_PROP(name, slot->managementOnly);
         snprintf(name, sizeof(name), "MPRTarget%uKind", (unsigned)i);
         MPR_DEBUG_PROP(name, slot->kind == kMPRTargetRaidVolume ? "RAID-volume" :
                             slot->kind == kMPRTargetNvme ? "PCIe-NVMe" : "SAS-SATA");
@@ -1158,7 +1255,7 @@ MPRController::invalidateTarget(MPRTargetSlot *slot)
 {
     if (slot == NULL) return;
     slot->probeValid = false;
-    slot->generation++;
+    slot->generation = nextTargetGeneration();
     slot->onlinePending = false;
     if (slot->nub != NULL) {
         slot->online = false;
@@ -1203,6 +1300,7 @@ MPRController::probeTarget(MPRTargetSlot *slot)
      * belongs to the slot being probed and is copied back before the next
      * target uses the chain. */
     fAttachedDevHandle = slot->handle;
+    fAttachedLun = slot->lun;
     fTargetIdentityValid = false;
     fTargetIdentity[0] = 0;
     fTargetModel[0] = 0;
@@ -1230,6 +1328,10 @@ MPRController::probeTarget(MPRTargetSlot *slot)
     beginProbeStage();
     if (!probeScsiIdentity()) {
         stage = "scsi-identity";
+    } else if (slot->managementOnly) {
+        fProbeInProgress = false;
+        slot->probeValid = true;
+        return kMPRProbeOk;
     } else {
         beginProbeStage();
         if (!probeCapacity()) {
@@ -1284,7 +1386,7 @@ MPRController::probeTarget(MPRTargetSlot *slot)
     if (!slot->probeValid || changed) {
         /* A republished medium gets a new generation: I/O accepted for the old
          * one must never reach this device, even when its identity matches. */
-        slot->generation++;
+        slot->generation = nextTargetGeneration();
         slot->onlinePending = false;
         if (slot->nub != NULL) {
             if (slot->online) {
@@ -1304,15 +1406,19 @@ MPRController::probeTarget(MPRTargetSlot *slot)
 bool
 MPRController::publishTarget(MPRTargetSlot *slot)
 {
-    if (slot == NULL || slot->handle == 0 || !slot->present || !slot->probeValid ||
+    if (fMaintenanceMode || slot == NULL || slot->handle == 0 || !slot->present || !slot->probeValid ||
         slot->blockSize == 0 || slot->capacityBlocks == 0 ||
         fIOLock == NULL || fPageBuffer == NULL || fDataBuffer == NULL ||
         fPagePhys == 0 || fDataPhys == 0 || fDataBytes == 0) return false;
+    char location[64];
+    snprintf(location, sizeof(location), "%u-%016llx-%u", (unsigned)slot->kind,
+             (unsigned long long)slot->sasAddress, (unsigned)slot->lun);
     if (slot->nub != NULL) {
+        slot->nub->setLocation(location);
         /* The nub stayed attached while the medium was offline. Re-point it at
          * this target's current handle and geometry, and let the unlocked
          * worker deliver OFFLINE -> ONLINE around the transition. */
-        slot->nub->setController(this, slot->handle);
+        slot->nub->setController(this, slot->key());
         slot->onlinePending = true;
         setTargetRemovalState(slot, "live");
         publishTargetProperties();
@@ -1324,7 +1430,8 @@ MPRController::publishTarget(MPRTargetSlot *slot)
         nub->release();
         return false;
     }
-    nub->setController(this, slot->handle);
+    nub->setController(this, slot->key());
+    nub->setLocation(location);
     if (!nub->attach(this)) {
         nub->release();
         return false;
@@ -1351,9 +1458,10 @@ MPRController::ensureTargetsPublished(void)
 {
     UInt32 published = 0;
     bool allOk = true;
+    MPR_DEBUG_PROP("MPRPublicationMode", fMaintenanceMode ? "maintenance-no-block-media" : "block-media");
     for (UInt32 i = 0; i < kMPRMaxTargets; i++) {
         MPRTargetSlot *slot = &fTargets[i];
-        if (slot->handle == 0 || !slot->present) continue;
+        if (slot->handle == 0 || !slot->present || (slot->managementOnly && slot->peripheralType == 0)) continue;
         if (!slot->probeValid) {
             MPRProbeResult result = probeTarget(slot);
             recordProbeResult(slot, result);
@@ -1366,6 +1474,7 @@ MPRController::ensureTargetsPublished(void)
                 continue;
             }
         }
+        if (slot->managementOnly || fMaintenanceMode) continue;
         if (!publishTarget(slot)) {
             slot->failureCount++;
             allOk = false;
@@ -1376,10 +1485,11 @@ MPRController::ensureTargetsPublished(void)
     /* Point the controller's default handle at the first published target;
      * the legacy synchronous helpers use it. Per-request routing never
      * depends on this default. */
-    UInt16 defaultHandle = 0;
+    UInt64 defaultHandle = 0;
     for (UInt32 i = 0; i < kMPRMaxTargets && defaultHandle == 0; i++)
-        if (fTargets[i].nub != NULL) defaultHandle = fTargets[i].handle;
-    fAttachedDevHandle = defaultHandle;
+        if (fTargets[i].nub != NULL && fTargets[i].present && fTargets[i].probeValid) defaultHandle = fTargets[i].key();
+    fAttachedDevHandle = (UInt16)defaultHandle;
+    fAttachedLun = (UInt32)(defaultHandle >> 16);
     if (defaultHandle != 0) {
         MPRTargetSlot *slot = findTarget(defaultHandle);
         if (slot != NULL) {
@@ -1505,6 +1615,19 @@ MPRController::retireTarget(MPRTargetSlot *slot)
      * be in flight", which the caller escalates to a bounded IOC reset. */
     if (slot == NULL || slot->handle == 0 || !slot->removalRequested) return true;
     const UInt16 handle = slot->handle;
+    if (slot->lun != 0) {
+        if (!drainTaskManagedCommands(handle, 0, true, slot->lun)) {
+            setTargetRemovalState(slot, "LUN-commands-owned"); return false;
+        }
+        slot->removalRequested = false;
+        slot->present = slot->probeValid = slot->identityValid = false;
+        slot->online = slot->onlinePending = false;
+        if (slot->nub) slot->offlinePending = true;
+        slot->generation = nextTargetGeneration();
+        slot->handle = 0;
+        setTargetRemovalState(slot, "logical-unit-removed");
+        return true;
+    }
     bool present = false;
     UInt64 address = 0;
     bool known = targetDevicePresent(handle, &present, &address);
@@ -1600,7 +1723,7 @@ MPRController::retireTarget(MPRTargetSlot *slot)
     slot->present = false;
     slot->probeValid = false;
     slot->identityValid = false;
-    slot->generation++;
+    slot->generation = nextTargetGeneration();
     slot->onlinePending = false;
     if (slot->nub != NULL) {
         slot->online = false;
