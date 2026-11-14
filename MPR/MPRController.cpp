@@ -3242,7 +3242,7 @@ MPRController::init(OSDictionary *properties)
     fControlBuffer = NULL; fControlPhys = 0; fControlBufferBytes = 0;
     fControlBufferPrepared = fControlDmaBusy = false;
     int management = 0, maintenance = 0, ssu = 1;
-    (void)PE_parse_boot_argn("mpr_management", &management, sizeof(management));
+    (void)PE_parse_boot_argn("mpr_mgmt", &management, sizeof(management));
     (void)PE_parse_boot_argn("mpr_maintenance", &maintenance, sizeof(maintenance));
     (void)PE_parse_boot_argn("mpr_ssu", &ssu, sizeof(ssu));
     fMaintenanceMode = maintenance != 0;

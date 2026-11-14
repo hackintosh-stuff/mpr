@@ -309,7 +309,7 @@ class Connection:
     @staticmethod
     def check(status: int) -> None:
         if status:
-            raise RuntimeError(f'IOKit returned 0x{status:08x}; management requires administrator privilege and mpr_management=1')
+            raise RuntimeError(f'IOKit returned 0x{status:08x}; management requires administrator privilege and mpr_mgmt=1')
 
     def close(self) -> None:
         if self.handle:

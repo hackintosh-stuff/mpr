@@ -192,7 +192,7 @@ queue-register writes are deliberately not exposed by the native control ABI.
 ## Administrator control
 
 `tools/mprctl.py` uses the native `IOUserClient`, not a FreeBSD ioctl emulation.
-Management is disabled by default. `mpr_management=1` enables an administrator-
+Management is disabled by default. `mpr_mgmt=1` enables an administrator-
 only connection for information, targets, events, configuration reads, read-only
 SCSI/SATA/NVMe/SMP and enclosure requests, and controlled diagnostics/reset.
 `mpr_debug=1` is independent: it enables logs and diagnostic IORegistry properties.

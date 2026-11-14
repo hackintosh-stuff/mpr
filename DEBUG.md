@@ -101,7 +101,7 @@ serial number, provide cross-controller/ALUA policy, or promise stable diskN.
 `MPRControlABI.h`, `MPRUserClient` and `MPRControl.cpp` adapt the useful mechanisms
 of `mpr_ioctl.h`/`mpr_user.c` to an IOUserClient structure call. This is not binary
 compatibility with FreeBSD user utilities. Root privilege is checked both on
-connection and on every method invocation. `mpr_management=1` is required;
+connection and on every method invocation. `mpr_mgmt=1` is required;
 `mpr_maintenance=1` additionally prevents block-media publication. Device/media,
 array and firmware mutations require maintenance plus an acknowledgement flag.
 Metadata probes still run in maintenance, but no disk is mounted/published.
