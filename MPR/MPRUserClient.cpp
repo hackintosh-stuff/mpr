@@ -3,6 +3,7 @@
 #include "MPRControlABI.h"
 #include <kern/task.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include <string.h>
 #define super IOUserClient
 OSDefineMetaClassAndStructors(MPRUserClient, IOUserClient)
@@ -75,9 +76,23 @@ IOReturn MPRUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
         return kIOReturnNoMemory;
     }
     bzero(output, (size_t)outputSize);
+    /* Large structure arguments arrive as IOMemoryDescriptors. readBytes and
+     * writeBytes require a prepared (wired) descriptor; using an unprepared
+     * one panics in IOGeneralMemoryDescriptor::getPhysicalSegment. */
+    IOMemoryDescriptor *inDesc = a->structureInputDescriptor;
+    IOMemoryDescriptor *outDesc = a->structureOutputDescriptor;
+    IOReturn inReady = inDesc ? inDesc->prepare(kIODirectionOut) : kIOReturnSuccess;
+    IOReturn outReady = outDesc ? outDesc->prepare(kIODirectionIn) : kIOReturnSuccess;
+    if (inReady != kIOReturnSuccess || outReady != kIOReturnSuccess) {
+        if (inReady == kIOReturnSuccess && inDesc) inDesc->complete(kIODirectionOut);
+        if (outReady == kIOReturnSuccess && outDesc) outDesc->complete(kIODirectionIn);
+        IOFree(output, (vm_size_t)outputSize);
+        IOFree(input, (vm_size_t)inputSize);
+        return kIOReturnVMError;
+    }
     IOReturn result = kIOReturnSuccess;
-    if (a->structureInputDescriptor) {
-        if (a->structureInputDescriptor->readBytes(0, input, (IOByteCount)inputSize) != inputSize)
+    if (inDesc) {
+        if (inDesc->readBytes(0, input, (IOByteCount)inputSize) != inputSize)
             result = kIOReturnVMError;
     } else memcpy(input, a->structureInput, (size_t)inputSize);
     if (result == kIOReturnSuccess &&
@@ -92,8 +107,8 @@ IOReturn MPRUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
         IOLockUnlock(fCallLock);
     }
     if (result == kIOReturnSuccess && produced <= outputSize) {
-        if (a->structureOutputDescriptor) {
-            if (a->structureOutputDescriptor->writeBytes(0, output, produced) != produced)
+        if (outDesc) {
+            if (outDesc->writeBytes(0, output, produced) != produced)
                 result = kIOReturnVMError;
             a->structureOutputDescriptorSize = produced;
         } else {
@@ -101,6 +116,8 @@ IOReturn MPRUserClient::externalMethod(uint32_t selector, IOExternalMethodArgume
             a->structureOutputSize = produced;
         }
     } else if (result == kIOReturnSuccess) result = kIOReturnOverrun;
+    if (outDesc) outDesc->complete(kIODirectionIn);
+    if (inDesc) inDesc->complete(kIODirectionOut);
     IOFree(output, (vm_size_t)outputSize);
     IOFree(input, (vm_size_t)inputSize);
     return result;

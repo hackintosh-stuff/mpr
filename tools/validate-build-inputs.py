@@ -30,13 +30,13 @@ def main():
     version = info.get("CFBundleVersion")
     if not version or info.get("CFBundleShortVersionString") != version:
         errors.append("Info.plist bundle versions are missing or differ")
-    if info.get("CFBundleExecutable") != "MPR" or info.get("CFBundleIdentifier") != "com.ling.MPR":
+    if info.get("CFBundleExecutable") != "MPR" or info.get("CFBundleIdentifier") != "com.maz1.MPR":
         errors.append("Info.plist executable or identifier differs from the build entry points")
 
     build = (root / "tools/build-noxcode.sh").read_text(encoding="utf-8")
     for label, pattern in (
         ("CLI version", r"(?m)^VERSION=([^\s]+)$"),
-        ("kmod version", r'KMOD_EXPLICIT_DECL\(com\.ling\.MPR,\s*"([^"]+)"'),
+        ("kmod version", r'KMOD_EXPLICIT_DECL\(com\.maz1\.MPR,\s*"([^"]+)"'),
     ):
         values = re.findall(pattern, build)
         if values != [version]:

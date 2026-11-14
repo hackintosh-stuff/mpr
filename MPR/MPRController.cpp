@@ -3613,6 +3613,10 @@ MPRController::start(IOService *provider)
      * just-published disk immediately after registration. */
     changePowerStateTo(kMPRPowerOn);
     MPR_DEBUG_PROP("MPRPowerState", "on");
+    /* The administrator IOUserClient is opened by matching this controller's
+     * class, so the controller itself must be registered in the matching plane.
+     * Target nubs already register themselves when they are published. */
+    registerService();
     MPR_DEBUG_LOG("MPR start complete, irq=%u replyViaIrq=%u events=%u last=0x%04x\n",
           (unsigned int)fInterruptCount, (unsigned int)fReplyViaIrq,
           (unsigned int)fEventCount, (unsigned int)fLastEvent);

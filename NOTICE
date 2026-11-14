@@ -1,6 +1,6 @@
 MPR third-party source notice
 
-MPI wire definitions in MPR/MPI/mpi2_min.h and mpi2_target.h are
+MPI wire definitions in MPR/MPI/mpi2_min.h, mpi2_target.h, mpi26_devices.h and mpi2_mgmt.h are
 transcribed from the FreeBSD sys/dev/mpr/mpi headers. Their upstream
 Broadcom copyright and three-clause redistribution terms are retained
 below and in those files. The fixed reference source is identified in

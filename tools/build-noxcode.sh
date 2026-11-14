@@ -25,7 +25,7 @@ SDK=${MACKERNELSDK:-$ROOT/MacKernelSDK}
 
 NAME=MPR
 VERSION=0.24.0
-BUNDLE_ID=com.ling.MPR
+BUNDLE_ID=com.maz1.MPR
 
 echo "== Environment =="
 echo "root   : $ROOT"
@@ -60,7 +60,7 @@ extern "C" {
 extern kern_return_t _start(kmod_info_t *, void *);
 extern kern_return_t _stop(kmod_info_t *, void *);
 
-KMOD_EXPLICIT_DECL(com.ling.MPR, "0.24.0", _start, _stop);
+KMOD_EXPLICIT_DECL(com.maz1.MPR, "0.24.0", _start, _stop);
 
 __attribute__((visibility("hidden"))) kmod_start_func_t *_realmain = nullptr;
 __attribute__((visibility("hidden"))) kmod_stop_func_t  *_antimain = nullptr;

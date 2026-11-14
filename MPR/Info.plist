@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>MPR</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.ling.MPR</string>
+	<string>com.maz1.MPR</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -29,7 +29,7 @@
 		<key>MPRController</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.ling.MPR</string>
+			<string>com.maz1.MPR</string>
 			<key>IOClass</key>
 			<string>MPRController</string>
 			<key>IOProviderClass</key>
