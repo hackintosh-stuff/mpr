@@ -17,7 +17,7 @@ coverage, not hardware qualification for every card or firmware.
 
 | Family | Device IDs (vendor `0x1000`) | Evidence |
 |---|---|---|
-| SAS3004 / SAS3008 | `0x0096`, `0x0097` | SAS3008 has earlier-build hardware evidence; this version is not load-tested |
+| SAS3004 / SAS3008 | `0x0096`, `0x0097` | SAS3008 is the main device that has been tested on |
 | SAS3108 Fusion-MPT variants | `0x0090`, `0x0091`, `0x0094`, `0x0095` | Source implemented; hardware unverified |
 | SAS3216 / SAS3224 / SAS3316 / SAS3324 | `0x00c9`, `0x00c4`, `0x00c5`, `0x00c6`, `0x00c0`, `0x00c1` | Source implemented; hardware unverified |
 | GEN35: SAS3408/3416/3508/3516/3616/3708/3716 | `0x00af`, `0x00ac`, `0x00ad`, `0x00ae`, `0x00aa`, `0x00ab`, `0x00d1`, `0x00d2`, `0x00d0` | Source implemented; hardware unverified |
