@@ -1,7 +1,5 @@
 # MPR — Fusion-MPT SAS3 / Tri-Mode kext for macOS
 
-Date: 2026-11-14. Driver version: 0.24.0.
-
 MPR is an IOKit block-storage driver for LSI/Broadcom MPI 2.5/2.6 Fusion-MPT
 controllers on x86_64 macOS. Eligible SAS/SATA disks, firmware IR RAID volumes
 and discovered direct-access logical units on PCIe NVMe targets each publish
